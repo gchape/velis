@@ -1,7 +1,7 @@
 [project]
 name = "velis"
 version = "0.1.0"
-description = "In-memory store with pluggable codecs (WIP: WAL recovery, pub-sub, TTL, protocol layer)"
+description = "Lightweight in-memory store with pub-sub, TTL expiry and pluggable codecs"
 readme = "README.md"
 authors = [
     { name = "Giorgi Chapidze", email = "chapidze.giorgi@proton.me" }
@@ -12,6 +12,18 @@ dependencies = []
 [project.scripts]
 velis = "velis.__main__:main"
 
+[dependency-groups]
+dev = [
+    "ruff",
+    "ty",
+]
+
 [build-system]
 requires = ["uv_build>=0.13.7,<0.14.0"]
 build-backend = "uv_build"
+
+[tool.ruff]
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "ASYNC", "RUF"]

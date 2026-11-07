@@ -7,26 +7,25 @@ from collections.abc import Buffer
 
 from velis.codec.chain import CodecChain
 
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
 _NAME = re.compile(r"[a-z0-9]+(_[a-z0-9]+)*")
 _infos: dict[str, codecs.CodecInfo] = {}
 
 
-def _is_known(name: str) -> bool:
+def _validate(name: str) -> None:
+    if not _NAME.fullmatch(name):
+        raise ValueError(f"invalid codec name (want e.g. 'gzip_b64'): {name!r}")
     try:
         codecs.lookup(name)
     except LookupError:
-        return False
-    return True
+        return
+    raise ValueError(f"codec name already in use: {name!r}")
 
 
 def register(chain: CodecChain, encoding: str = "utf-8") -> CodecChain:
     name = chain.name
-    if not _NAME.fullmatch(name):
-        raise ValueError(f"invalid codec name (want e.g. 'gzip_b64'): {name!r}")
-    if _is_known(name):
-        raise ValueError(f"codec name already in use: {name!r}")
+    _validate(name)
 
     def encode(text: str, errors: str = "strict") -> tuple[bytes, int]:
         return chain.encode(text.encode(encoding, errors)), len(text)
@@ -35,7 +34,7 @@ def register(chain: CodecChain, encoding: str = "utf-8") -> CodecChain:
         return chain.decode(data := bytes(data)).decode(encoding, errors), len(data)
 
     _infos[name] = codecs.CodecInfo(encode, decode, name=name)
-    logger.info("registered codec %r (text encoding %s)", name, encoding)
+    log.info("registered codec %r (text encoding %s)", name, encoding)
     return chain
 
 

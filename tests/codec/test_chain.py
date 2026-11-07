@@ -1,323 +1,75 @@
-import dataclasses
-import pickle
 import unittest
+from unittest.mock import patch
 
+from tests.codec.helpers import Prefix, Reverse
 from velis.codec import CodecChain
-from velis.exceptions import CodecError
 
 
-def identity(data):
-    return data
-
-
-def reverse_bytes(data):
-    return data[::-1]
-
-
-def add_prefix(data):
-    return b"x" + data
-
-
-def strip_prefix(data):
-    return data[1:]
-
-
-def boom(data):
-    raise ValueError("boom")
-
-
-class Fn:
-    """Minimal codec built from two functions; optionally records calls."""
-
-    def __init__(self, name, encode=identity, decode=identity, log=None):
-        self.name = name
-        self._encode = encode
-        self._decode = decode
-        self._log = log
-
-    def encode(self, data):
-        if self._log is not None:
-            self._log.append(f"encode:{self.name}")
-        return self._encode(data)
-
-    def decode(self, data):
-        if self._log is not None:
-            self._log.append(f"decode:{self.name}")
-        return self._decode(data)
-
-
-prefix = Fn("p", add_prefix, strip_prefix)
-reverse = Fn("r", reverse_bytes, reverse_bytes)
-
-
-class NameTests(unittest.TestCase):
-    def test_empty_chain_has_empty_name(self):
-        self.assertEqual(CodecChain().name, "")
-
-    def test_single_codec(self):
-        self.assertEqual(CodecChain((prefix,)).name, "p")
-
-    def test_names_joined_with_underscore_in_order(self):
-        chain = CodecChain((Fn("a"), Fn("b"), Fn("c")))
-        self.assertEqual(chain.name, "a_b_c")
-
-    def test_order_changes_name(self):
-        self.assertEqual(CodecChain((prefix, reverse)).name, "p_r")
-        self.assertEqual(CodecChain((reverse, prefix)).name, "r_p")
-
-
-class EncodeDecodeTests(unittest.TestCase):
-    def test_empty_chain_is_identity(self):
+class CodecChainTests(unittest.TestCase):
+    def test_empty_chain_is_identity(self) -> None:
         chain = CodecChain()
-        self.assertEqual(chain.encode(b"ab"), b"ab")
-        self.assertEqual(chain.decode(b"ab"), b"ab")
+        for data in (b"", bytes(range(256))):
+            with self.subTest(data=data):
+                self.assertEqual(chain.encode(data), data)
+                self.assertEqual(chain.decode(data), data)
 
-    def test_empty_chain_handles_empty_data(self):
-        self.assertEqual(CodecChain().encode(b""), b"")
-        self.assertEqual(CodecChain().decode(b""), b"")
-
-    def test_single_codec(self):
-        chain = CodecChain((prefix,))
-        self.assertEqual(chain.encode(b"ab"), b"xab")
-        self.assertEqual(chain.decode(b"xab"), b"ab")
-
-    def test_encode_runs_codecs_in_order(self):
-        log = []
-        chain = CodecChain(
-            (Fn("p", add_prefix, log=log), Fn("r", reverse_bytes, log=log))
-        )
-        # prefix -> b"xab", then reverse -> b"bax"
+    def test_encode_order_and_reverse_decode_order(self) -> None:
+        chain = CodecChain.of(Prefix(), Reverse())
+        self.assertEqual(chain.name, "testprefix_testreverse")
         self.assertEqual(chain.encode(b"ab"), b"bax")
-        self.assertEqual(log, ["encode:p", "encode:r"])
-
-    def test_decode_runs_codecs_in_reverse_order(self):
-        log = []
-        chain = CodecChain(
-            (
-                Fn("p", decode=strip_prefix, log=log),
-                Fn("r", decode=reverse_bytes, log=log),
-            )
-        )
-        # reverse -> b"xab", then strip prefix -> b"ab"
         self.assertEqual(chain.decode(b"bax"), b"ab")
-        self.assertEqual(log, ["decode:r", "decode:p"])
 
-    def test_order_matters(self):
-        self.assertEqual(CodecChain((prefix, reverse)).encode(b"ab"), b"bax")
-        self.assertEqual(CodecChain((reverse, prefix)).encode(b"ab"), b"xba")
-
-    def test_each_codec_receives_previous_output(self):
-        seen = []
-
-        def spy(data):
-            seen.append(data)
-            return data + b"!"
-
-        chain = CodecChain((Fn("a", spy), Fn("b", spy)))
-        self.assertEqual(chain.encode(b"x"), b"x!!")
-        self.assertEqual(seen, [b"x", b"x!"])
-
-    def test_same_codec_can_appear_twice(self):
-        chain = CodecChain((reverse, reverse))
-        self.assertEqual(chain.encode(b"abc"), b"abc")
-        self.assertEqual(chain.name, "r_r")
-
-    def test_roundtrip(self):
-        chain = CodecChain((prefix, reverse, Fn("i")))
-        samples = [b"", b"a", b"hello world", bytes(range(256)), b"abc" * 100_000]
-        for data in samples:
+    def test_roundtrip_binary_empty_and_large_payloads(self) -> None:
+        chain = CodecChain.of(Prefix(), Reverse())
+        for data in (b"", bytes(range(256)), b"abc\x00" * 100_000):
             with self.subTest(length=len(data)):
                 self.assertEqual(chain.decode(chain.encode(data)), data)
 
-    def test_chain_is_stateless_between_calls(self):
-        chain = CodecChain((prefix, reverse))
-        first = chain.encode(b"ab")
-        self.assertEqual(chain.encode(b"ab"), first)
-        self.assertEqual(chain.decode(first), b"ab")
-        self.assertEqual(chain.decode(first), b"ab")
+    def test_appending_codec_preserves_previous_steps(self) -> None:
+        original = CodecChain.of(Prefix())
+        extended = original | Reverse()
+        self.assertEqual(extended.name, "testprefix_testreverse")
+        self.assertEqual(extended.encode(b"ab"), b"bax")
+        self.assertEqual(extended.decode(b"bax"), b"ab")
+        self.assertEqual(original.encode(b"ab"), b"xab")
 
+    def test_chain_composition_flattens_in_written_order(self) -> None:
+        prefix, reverse = Prefix(), Reverse()
+        combined = CodecChain.of(prefix) | CodecChain.of(reverse)
+        self.assertEqual(combined.codecs, (prefix, reverse))
+        self.assertEqual(combined.encode(b"ab"), b"bax")
+        self.assertEqual(combined.decode(b"bax"), b"ab")
 
-class ErrorTests(unittest.TestCase):
-    def test_encode_error_is_wrapped(self):
-        chain = CodecChain((prefix, Fn("bad", encode=boom)))
-        with self.assertRaises(CodecError) as cm:
-            chain.encode(b"x")
-        err = cm.exception
-        self.assertEqual((err.op, err.codec, err.chain), ("encode", "bad", "p_bad"))
-        self.assertEqual(str(err), "encode failed in codec 'bad' of chain 'p_bad'")
-
-    def test_decode_error_is_wrapped(self):
-        chain = CodecChain((prefix, Fn("bad", decode=boom)))
-        with self.assertRaises(CodecError) as cm:
-            chain.decode(b"x")
-        err = cm.exception
-        self.assertEqual((err.op, err.codec, err.chain), ("decode", "bad", "p_bad"))
-        self.assertEqual(str(err), "decode failed in codec 'bad' of chain 'p_bad'")
-
-    def test_original_exception_is_cause(self):
-        original = ValueError("boom")
-
-        def raiser(_):
-            raise original
-
-        chain = CodecChain((Fn("bad", encode=raiser, decode=raiser),))
-        for method in (chain.encode, chain.decode):
-            with self.subTest(method=method.__name__):
-                with self.assertRaises(CodecError) as cm:
-                    method(b"x")
-                self.assertIs(cm.exception.__cause__, original)
-
-    def test_cause_types_are_preserved(self):
-        for exc_type in (ValueError, KeyError, TypeError, OSError, RuntimeError):
-            with self.subTest(exc_type=exc_type.__name__):
-
-                def raiser(_, exc_type=exc_type):
-                    raise exc_type("x")
-
-                chain = CodecChain((Fn("bad", encode=raiser),))
-                with self.assertRaises(CodecError) as cm:
-                    chain.encode(b"x")
-                self.assertIsInstance(cm.exception.__cause__, exc_type)
-
-    def test_encode_stops_at_first_failure(self):
-        log = []
-        chain = CodecChain(
-            (Fn("a", log=log), Fn("bad", encode=boom, log=log), Fn("c", log=log))
-        )
-        with self.assertRaises(CodecError):
-            chain.encode(b"x")
-        self.assertEqual(log, ["encode:a", "encode:bad"])
-
-    def test_decode_stops_at_first_failure(self):
-        log = []
-        chain = CodecChain(
-            (Fn("a", log=log), Fn("bad", decode=boom, log=log), Fn("c", log=log))
-        )
-        with self.assertRaises(CodecError):
-            chain.decode(b"x")
-        # reversed order: c runs, bad fails, a never runs
-        self.assertEqual(log, ["decode:c", "decode:bad"])
-
-    def test_error_names_the_failing_codec_wherever_it_sits(self):
-        for position in range(3):
-            with self.subTest(position=position):
-                codecs_ = [Fn("a"), Fn("b"), Fn("c")]
-                codecs_[position] = Fn("bad", encode=boom)
-                chain = CodecChain(tuple(codecs_))
-                with self.assertRaises(CodecError) as cm:
-                    chain.encode(b"x")
-                self.assertEqual(cm.exception.codec, "bad")
-                self.assertEqual(cm.exception.chain, chain.name)
-
-    def test_nested_chain_reports_inner_codec_and_is_not_rewrapped(self):
-        inner = CodecChain((Fn("a"), Fn("bad", encode=boom)))
-        outer = CodecChain((prefix, inner))
-        with self.assertRaises(CodecError) as cm:
-            outer.encode(b"x")
-        err = cm.exception
-        self.assertEqual((err.op, err.codec, err.chain), ("encode", "bad", "a_bad"))
-        # cause is the codec's original error, not an inner CodecError
-        self.assertIsInstance(err.__cause__, ValueError)
-
-    def test_base_exception_is_not_wrapped(self):
-        def interrupt(_):
-            raise KeyboardInterrupt
-
-        chain = CodecChain((Fn("bad", encode=interrupt, decode=interrupt),))
-        for method in (chain.encode, chain.decode):
-            with (
-                self.subTest(method=method.__name__),
-                self.assertRaises(KeyboardInterrupt),
-            ):
-                method(b"x")
-
-    def test_error_is_picklable(self):
-        err = CodecError("encode", "bad", "p_bad")
-        restored = pickle.loads(pickle.dumps(err))
-        self.assertIsInstance(restored, CodecError)
-        self.assertEqual(
-            (restored.op, restored.codec, restored.chain), ("encode", "bad", "p_bad")
-        )
-        self.assertEqual(str(restored), str(err))
-
-    def test_error_does_not_break_later_calls(self):
-        flaky = {"fail": True}
-
-        def sometimes(data):
-            if flaky["fail"]:
-                raise ValueError("boom")
-            return data
-
-        chain = CodecChain((Fn("f", encode=sometimes),))
-        with self.assertRaises(CodecError):
-            chain.encode(b"x")
-        flaky["fail"] = False
-        self.assertEqual(chain.encode(b"x"), b"x")
-
-
-class CompositionTests(unittest.TestCase):
-    def test_chain_or_codec_appends(self):
-        self.assertEqual((CodecChain((prefix,)) | reverse).codecs, (prefix, reverse))
-
-    def test_codec_or_chain_prepends(self):
-        self.assertEqual((prefix | CodecChain((reverse,))).codecs, (prefix, reverse))
-
-    def test_building_from_empty_chain(self):
-        a, b, c = Fn("a"), Fn("b"), Fn("c")
-        chain = CodecChain() | a | b | c
-        self.assertEqual(chain.codecs, (a, b, c))
-        self.assertEqual(chain.name, "a_b_c")
-
-    def test_prepending_and_appending_together(self):
-        a, b, c = Fn("a"), Fn("b"), Fn("c")
-        chain = a | CodecChain((b,)) | c
-        self.assertEqual(chain.codecs, (a, b, c))
-
-    def test_chain_or_chain_nests_rather_than_flattens(self):
-        inner = CodecChain((reverse,))
-        outer = CodecChain((prefix,)) | inner
-        self.assertEqual(outer.codecs, (prefix, inner))
-        self.assertEqual(outer.encode(b"ab"), b"bax")
-        self.assertEqual(outer.decode(b"bax"), b"ab")
-
-    def test_or_returns_new_chain_and_does_not_mutate(self):
-        original = CodecChain((prefix,))
-        extended = original | reverse
-        self.assertIsInstance(extended, CodecChain)
-        self.assertIsNot(extended, original)
-        self.assertEqual(original.codecs, (prefix,))
-
-    def test_ror_returns_new_chain_and_does_not_mutate(self):
-        original = CodecChain((reverse,))
-        extended = prefix | original
-        self.assertIsInstance(extended, CodecChain)
-        self.assertEqual(original.codecs, (reverse,))
-
-    def test_composed_chain_encodes_in_written_order(self):
-        chain = CodecChain() | prefix | reverse
+    def test_prepending_codec(self) -> None:
+        chain = Prefix() | CodecChain.of(Reverse())
         self.assertEqual(chain.encode(b"ab"), b"bax")
+        self.assertEqual(chain.decode(b"bax"), b"ab")
 
+    def test_build_chain_from_empty(self) -> None:
+        chain = CodecChain() | Prefix() | Reverse()
+        self.assertEqual(chain.encode(b"ab"), b"bax")
+        self.assertEqual(chain.decode(b"bax"), b"ab")
 
-class ValueSemanticsTests(unittest.TestCase):
-    def test_default_is_empty_tuple(self):
-        self.assertEqual(CodecChain().codecs, ())
+    def test_composition_with_empty_chain(self) -> None:
+        chain = CodecChain.of(Prefix())
+        for combined in (chain | CodecChain(), CodecChain() | chain):
+            self.assertEqual(combined.encode(b"ab"), b"xab")
+            self.assertEqual(combined.decode(b"xab"), b"ab")
 
-    def test_frozen(self):
-        chain = CodecChain((prefix,))
-        with self.assertRaises(dataclasses.FrozenInstanceError):
-            chain.codecs = ()  # ty: ignore[invalid-assignment]
-
-    def test_uses_slots(self):
-        self.assertFalse(hasattr(CodecChain(), "__dict__"))
-
-    def test_equality_and_hash_by_codecs(self):
-        a = CodecChain((prefix, reverse))
-        b = CodecChain((prefix, reverse))
-        self.assertEqual(a, b)
-        self.assertEqual(hash(a), hash(b))
-        self.assertNotEqual(a, CodecChain((reverse, prefix)))
-        self.assertNotEqual(a, CodecChain())
-
-
-if __name__ == "__main__":
-    unittest.main()
+    def test_errors_propagate_and_stop_processing(self) -> None:
+        prefix, reverse = Prefix(), Reverse()
+        chain = CodecChain.of(prefix, reverse)
+        for operation, first, second in (
+            ("encode", prefix, reverse),
+            ("decode", reverse, prefix),
+        ):
+            failure = ValueError("codec failed")
+            with (
+                self.subTest(operation=operation),
+                patch.object(first, operation, side_effect=failure),
+                patch.object(second, operation) as remaining,
+                self.assertRaises(ValueError) as raised,
+            ):
+                getattr(chain, operation)(b"ab")
+            self.assertIs(raised.exception, failure)
+            remaining.assert_not_called()

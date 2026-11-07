@@ -1,7 +1,7 @@
 [project]
 name = "velis"
 version = "0.1.0"
-description = "Lightweight, thread-safe in-memory store with WAL crash recovery, pub-sub, TTL expiration, pluggable codecs and a protocol selector layer"
+description = "In-memory store with pluggable codecs (WIP: WAL recovery, pub-sub, TTL, protocol layer)"
 readme = "README.md"
 authors = [
     { name = "Giorgi Chapidze", email = "chapidze.giorgi@proton.me" }

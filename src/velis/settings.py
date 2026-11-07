@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -22,13 +21,13 @@ class Settings:
             raise ValueError(f"invalid port: {self.port}")
 
     @classmethod
-    def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
-        env = os.environ if env is None else env
+    def from_env(cls) -> Settings:
+        env = os.environ
         defaults = cls()
         return cls(
             log_level=env.get("VELIS_LOG_LEVEL", defaults.log_level).upper(),
             production=env.get("VELIS_ENV", "").lower() == "production",
-            log_file=Path(env.get("VELIS_LOG_FILE", defaults.log_file)),
+            log_file=Path(env.get("VELIS_LOG_FILE", str(defaults.log_file))),
             host=env.get("VELIS_HOST", defaults.host),
-            port=int(env.get("VELIS_PORT", defaults.port)),
+            port=int(env.get("VELIS_PORT", str(defaults.port))),
         )

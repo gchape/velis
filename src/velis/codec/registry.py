@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import codecs
+import logging
 from collections.abc import Buffer
 
 from velis.codec.chain import CodecChain
+
+logger = logging.getLogger(__name__)
 
 _infos: dict[str, codecs.CodecInfo] = {}
 
@@ -23,6 +26,7 @@ def register(chain: CodecChain, encoding: str = "utf-8") -> CodecChain:
         return chain.decode(data).decode(encoding, errors), len(data)
 
     _infos[chain.name] = codecs.CodecInfo(encode, decode, name=chain.name)
+    logger.info("registered codec %r (text encoding %s)", chain.name, encoding)
     return chain
 
 

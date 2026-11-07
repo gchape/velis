@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
-import signal
+from collections.abc import AsyncGenerator
+from contextlib import AsyncExitStack, asynccontextmanager
 
 from velis.config import Config
 from velis.core.broker import Broker
@@ -25,35 +25,32 @@ async def _maintain(engine: Engine, interval: float) -> None:
     """Sweep expired keys periodically, with interval measured in seconds."""
     while True:
         await asyncio.sleep(interval)
-        try:
-            engine.sweep()
-        except Exception:
-            log.exception("maintenance failed")
+        engine.sweep()
 
 
-async def _main(config: Config) -> None:
-    """Serve until SIGINT or SIGTERM, then stop maintenance and networking."""
-    engine = build_engine()
+@asynccontextmanager
+async def serve(
+    config: Config, *, engine: Engine | None = None
+) -> AsyncGenerator[TcpServer]:
+    """Own server and maintenance resources across startup, serving and cleanup.
+
+    Supply an engine to reuse application state or an injected clock.
+    Signal handling belongs to the CLI; embedding callers control this scope.
+    Maintenance failure interrupts the caller and closes the server. TaskGroup
+    reports worker or caller failures in an ExceptionGroup after cleanup.
+    """
+    if engine is None:
+        engine = build_engine()
     server = TcpServer(engine, config.server)
-    await server.start()
-    maintenance = asyncio.create_task(
-        _maintain(engine, config.sweep_interval_ms / 1000)
-    )
-
-    stop = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, stop.set)
-    try:
-        await stop.wait()
-    finally:
-        log.info("shutting down")
-        maintenance.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await maintenance
-        await server.close()
-
-
-def run(config: Config) -> None:
-    """Run the configured server in a new asyncio event loop."""
-    asyncio.run(_main(config))
+    async with AsyncExitStack() as resources:
+        resources.push_async_callback(server.close)
+        await server.start()
+        async with asyncio.TaskGroup() as workers:
+            maintenance = workers.create_task(
+                _maintain(engine, config.sweep_interval_ms / 1000)
+            )
+            try:
+                yield server
+            finally:
+                maintenance.cancel()
+                log.info("shutting down")

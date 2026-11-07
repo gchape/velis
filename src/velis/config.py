@@ -1,11 +1,8 @@
 from __future__ import annotations
 
 import logging
-import logging.config
 import os
 from dataclasses import dataclass
-
-_FORMAT = "%(asctime)s.%(msecs)03d %(levelname)-8s %(name)s:%(lineno)d  %(message)s"
 
 
 def _env_int(name: str, default: int) -> int:
@@ -69,27 +66,4 @@ class Config:
             log_level=os.environ.get("VELIS_LOG_LEVEL", "info").upper(),
             server=Server.from_env(),
             sweep_interval_ms=_env_int("VELIS_SWEEP_MS", 100),
-        )
-
-    def configure_logging(self) -> None:
-        """Configure the velis logger with timestamped console output."""
-        logging.config.dictConfig(
-            {
-                "version": 1,
-                "disable_existing_loggers": False,
-                "formatters": {"default": {"format": _FORMAT}},
-                "handlers": {
-                    "console": {
-                        "class": "logging.StreamHandler",
-                        "formatter": "default",
-                    },
-                },
-                "loggers": {
-                    "velis": {
-                        "level": self.log_level,
-                        "handlers": ["console"],
-                        "propagate": False,
-                    },
-                },
-            }
         )

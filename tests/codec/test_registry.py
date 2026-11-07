@@ -1,5 +1,8 @@
 import codecs
 import itertools
+import subprocess
+import sys
+import textwrap
 import unittest
 
 from tests.codec.helpers import Prefix, Reverse
@@ -78,7 +81,7 @@ class RegistryTests(unittest.TestCase):
         for name in ("utf8", "ascii", "base64", "zlib"):
             with self.subTest(name=name), self.assertRaises(ValueError):
                 register(CodecChain.of(Prefix(name)))
-        self.assertEqual("é".encode("utf8"), b"\xc3\xa9")
+        self.assertEqual(codecs.encode("é", "utf8"), b"\xc3\xa9")
 
     def test_duplicate_registration_preserves_original(self) -> None:
         chain = self.register_chain()
@@ -108,4 +111,33 @@ class RegistryTests(unittest.TestCase):
         with self.assertRaises(LookupError):
             codecs.lookup(first.name)
         self.assertEqual("ab".encode(second.name), b"bax")
-        self.assertEqual("ab".encode("utf8"), b"ab")
+        self.assertEqual(codecs.encode("ab", "utf8"), b"ab")
+
+    def test_import_defers_global_registration_until_first_register(self) -> None:
+        """Check import behavior in a fresh interpreter with an empty registry."""
+        script = textwrap.dedent(
+            """
+            import codecs
+            from unittest.mock import patch
+            from tests.codec.helpers import Prefix
+
+            with patch.object(codecs, "register", wraps=codecs.register) as hook:
+                from velis.codec import CodecChain, register, unregister
+                hook.assert_not_called()
+                chain = register(CodecChain.of(Prefix("lazytest")))
+                hook.assert_called_once()
+                assert "ab".encode(chain.name) == b"xab"
+                unregister(chain.name)
+                try:
+                    codecs.lookup(chain.name)
+                except LookupError:
+                    pass
+                else:
+                    raise AssertionError("unregistered codec is still visible")
+                hook.assert_called_once()
+            """
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script], capture_output=True, text=True, check=False
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)

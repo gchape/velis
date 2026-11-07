@@ -7,7 +7,10 @@ from typing import Protocol
 class Codec(Protocol):
     """Named transformation with reversible bytes-to-bytes operations."""
 
-    name: str
+    @property
+    def name(self) -> str:
+        """Identify the transformation for chain naming and registration."""
+        ...
 
     def encode(self, data: bytes) -> bytes:
         """Transform bytes into the encoded representation."""
@@ -36,7 +39,7 @@ class CodecChain:
     @property
     def name(self) -> str:
         """Join codec names with underscores in encoding order."""
-        return "_".join(c.name for c in self.codecs)
+        return "_".join(codec.name for codec in self.codecs)
 
     def encode(self, data: bytes) -> bytes:
         """Apply each codec from left to right."""
@@ -52,9 +55,8 @@ class CodecChain:
 
     def __or__(self, other: Codec | CodecChain) -> CodecChain:
         """Append a codec or flatten another chain into a new chain."""
-        return CodecChain(
-            self.codecs + (other.codecs if isinstance(other, CodecChain) else (other,))
-        )
+        appended = other.codecs if isinstance(other, CodecChain) else (other,)
+        return CodecChain(self.codecs + appended)
 
     def __ror__(self, other: Codec) -> CodecChain:
         """Prepend a codec without changing this chain."""

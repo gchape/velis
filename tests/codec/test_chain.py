@@ -7,20 +7,20 @@ from velis.codec import CodecChain
 
 class CodecChainTests(unittest.TestCase):
     def test_empty_chain_is_identity(self) -> None:
-        chain = CodecChain()
+        chain = CodecChain.identity(bytes)
         for data in (b"", bytes(range(256))):
             with self.subTest(data=data):
                 self.assertEqual(chain.encode(data), data)
                 self.assertEqual(chain.decode(data), data)
 
     def test_encode_order_and_reverse_decode_order(self) -> None:
-        chain = CodecChain.of(Prefix(), Reverse())
+        chain = CodecChain.of(Prefix()) | Reverse()
         self.assertEqual(chain.name, "testprefix_testreverse")
         self.assertEqual(chain.encode(b"ab"), b"bax")
         self.assertEqual(chain.decode(b"bax"), b"ab")
 
     def test_roundtrip_binary_empty_and_large_payloads(self) -> None:
-        chain = CodecChain.of(Prefix(), Reverse())
+        chain = CodecChain.of(Prefix()) | Reverse()
         for data in (b"", bytes(range(256)), b"abc\x00" * 100_000):
             with self.subTest(length=len(data)):
                 self.assertEqual(chain.decode(chain.encode(data)), data)
@@ -46,19 +46,22 @@ class CodecChainTests(unittest.TestCase):
         self.assertEqual(chain.decode(b"bax"), b"ab")
 
     def test_build_chain_from_empty(self) -> None:
-        chain = CodecChain() | Prefix() | Reverse()
+        chain = CodecChain.identity(bytes) | Prefix() | Reverse()
         self.assertEqual(chain.encode(b"ab"), b"bax")
         self.assertEqual(chain.decode(b"bax"), b"ab")
 
     def test_composition_with_empty_chain(self) -> None:
         chain = CodecChain.of(Prefix())
-        for combined in (chain | CodecChain(), CodecChain() | chain):
+        for combined in (
+            chain | CodecChain.identity(bytes),
+            CodecChain.identity(bytes) | chain,
+        ):
             self.assertEqual(combined.encode(b"ab"), b"xab")
             self.assertEqual(combined.decode(b"xab"), b"ab")
 
     def test_errors_propagate_and_stop_processing(self) -> None:
         prefix, reverse = Prefix(), Reverse()
-        chain = CodecChain.of(prefix, reverse)
+        chain = CodecChain.of(prefix) | reverse
         for operation, first, second in (
             ("encode", prefix, reverse),
             ("decode", reverse, prefix),

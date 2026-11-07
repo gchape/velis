@@ -1,51 +1,64 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 
-from velis.net import protocol
+from velis.core.commands import Command, Message, Reply
+from velis.net.protocol import DEFAULT_PROTOCOL, WireProtocol
 
 
 class Connection:
-    """One client socket. Implements core.broker.Subscriber."""
+    """Server-side wire I/O and push buffering for one subscriber socket."""
 
-    __slots__ = ("_max_buffer", "reader", "writer")
+    __slots__ = ("_max_buffer", "_reader", "_wire", "_writer")
 
     def __init__(
         self,
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
         max_buffer: int,
+        *,
+        wire: WireProtocol = DEFAULT_PROTOCOL,
     ) -> None:
-        self.reader = reader
-        self.writer = writer
+        self._wire = wire
+        self._reader = reader
+        self._writer = writer
         self._max_buffer = max_buffer
+
+    async def read_command(self) -> Command:
+        return await self._wire.read_command(self._reader)
+
+    def write_reply(self, reply: Reply) -> None:
+        """Validate and encode the complete reply before writing any bytes."""
+        self._writer.write(self._wire.frames.encode(reply))
 
     def send(self, channel: str, payload: bytes) -> bool:
         """Queue a push; reject disconnected, failed or overloaded transports.
 
         Abort slow connections immediately instead of waiting to flush them.
         """
-        if self.writer.is_closing():
+        if self._writer.is_closing():
             return False
-        data = protocol.encode_message(channel, payload)
+        data = self._wire.frames.encode(Message(channel, payload))
         try:
-            self.writer.write(data)
+            self._writer.write(data)
         except ConnectionError:
-            self.writer.transport.abort()
+            self._writer.transport.abort()
             return False
-        if self.writer.transport.get_write_buffer_size() > self._max_buffer:
-            self.writer.transport.abort()
+        if self._writer.transport.get_write_buffer_size() > self._max_buffer:
+            self._writer.transport.abort()
             return False
         return True
 
-    def write(self, data: bytes) -> None:
-        """Queue encoded bytes for the client connection."""
-        self.writer.write(data)
-
     async def drain(self) -> None:
         """Wait for the transport to allow further writes."""
-        await self.writer.drain()
+        await self._writer.drain()
 
     def close(self) -> None:
         """Begin closing the client connection."""
-        self.writer.close()
+        self._writer.close()
+
+    async def wait_closed(self) -> None:
+        """Finish socket cleanup even when the peer has already disconnected."""
+        with contextlib.suppress(ConnectionError):
+            await self._writer.wait_closed()

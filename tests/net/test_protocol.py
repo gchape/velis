@@ -96,9 +96,62 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         )
         for frame in frames:
             with self.subTest(frame=frame), self.assertRaises(ProtocolError):
-                await protocol.read_command(stream(frame))
+                await protocol.read_command(
+                    stream(protocol.DEFAULT_PROTOCOL.framing.encode(frame))
+                )
 
     async def test_truncated_command_raises_incomplete_read(self) -> None:
         encoded = protocol.encode_command(Set("key", b"value"))
         with self.assertRaises(asyncio.IncompleteReadError):
             await protocol.read_command(stream(encoded[:-1]))
+
+    async def test_fragmented_and_consecutive_messages(self) -> None:
+        first, second = Set("key", b"value"), Get("key")
+        encoded = protocol.encode_command(first) + protocol.encode_command(second)
+        reader = asyncio.StreamReader()
+        task = asyncio.create_task(protocol.read_command(reader))
+        for byte in encoded:
+            reader.feed_data(bytes([byte]))
+            await asyncio.sleep(0)
+        reader.feed_eof()
+        self.assertEqual(await task, first)
+        self.assertEqual(await protocol.read_command(reader), second)
+
+    async def test_oversized_outer_length_rejected_before_reading_body(self) -> None:
+        reader = asyncio.StreamReader()
+        reader.feed_data(struct.pack(">I", protocol.MAX_FRAME_LEN + 1))
+        # No EOF or body: rejecting the header must not wait for either.
+        with self.assertRaisesRegex(ProtocolError, "field too long"):
+            async with asyncio.timeout(1):
+                await protocol.read_command(reader)
+
+    async def test_complete_frame_rejects_truncated_or_trailing_record(self) -> None:
+        body = protocol.COMMANDS.encode(Set("key", b"value"))
+        for malformed in (body[:-1], body + b"extra"):
+            with self.subTest(body=malformed), self.assertRaises(ProtocolError):
+                await protocol.read_command(
+                    stream(protocol.DEFAULT_PROTOCOL.framing.encode(malformed))
+                )
+
+    def test_wire_bytes_are_explicitly_length_prefixed(self) -> None:
+        self.assertEqual(
+            protocol.encode_command(Get("k")),
+            b"\x00\x00\x00\x0c\x00\x00\x00\x03GET\x00\x00\x00\x01k",
+        )
+        self.assertEqual(
+            protocol.encode_reply(Ok()), b"\x00\x00\x00\x06\x00\x00\x00\x02OK"
+        )
+
+    def test_sync_chains_roundtrip_and_reject_wrong_message_direction(self) -> None:
+        command = Set("key", b"value")
+        self.assertEqual(
+            protocol.COMMANDS.decode(protocol.COMMANDS.encode(command)), command
+        )
+        self.assertEqual(
+            protocol.FRAMES.decode(protocol.FRAMES.encode(Message("ch", b"v"))),
+            Message("ch", b"v"),
+        )
+        with self.assertRaisesRegex(ProtocolError, "unknown command"):
+            protocol.COMMANDS.decode(protocol.FRAMES.encode(Ok()))
+        with self.assertRaisesRegex(ProtocolError, "unknown frame"):
+            protocol.FRAMES.decode(protocol.COMMANDS.encode(Get("key")))

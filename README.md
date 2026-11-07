@@ -1,6 +1,6 @@
 <img width="300" height="100" alt="logo" src="https://github.com/user-attachments/assets/b047dd5e-2c8d-4eae-a8c4-516d81900fea" />
 
-Velis is a lightweight in-memory key-value store with TTL expiration, pub-sub, a small TCP protocol and pluggable client-side codecs. It runs on a single asyncio event loop, so the store needs no locks.
+Velis is a lightweight in-memory key-value store with TTL expiration, pub-sub, a small TCP protocol and composable payload and wire codecs. It runs on a single asyncio event loop, so the store needs no locks.
 
 > **Status: early development.** The store, TTL, pub-sub, TCP server and async client all work and are tested. The wire protocol is custom, and there is no authentication or TLS yet, so keep it bound to localhost. See [Roadmap](#roadmap) for what's next.
 
@@ -14,7 +14,7 @@ Velis is a lightweight in-memory key-value store with TTL expiration, pub-sub, a
 | **TTL** | Monotonic deadlines, expired lazily on read **and** actively by a background sweep, so keys nobody reads are still freed. |
 | **Pub-sub** | `SUBSCRIBE` / `UNSUBSCRIBE` / `PUBLISH`. Live delivery to connected subscribers on one server. Slow network connections are disconnected when their server write buffer exceeds the configured limit. |
 | **Network** | Length-prefixed binary protocol over TCP, an asyncio server and an async `Client`. |
-| **Codecs** | Composable `CodecChain`s applied on the client, optionally registered as Python text codecs. The server only sees opaque bytes. |
+| **Codecs** | Typed `CodecChain`s for payload transforms, wire serialization and validation. Stored values remain opaque bytes. |
 | **Config** | Frozen, validated `Config` loaded from `VELIS_*` environment variables. |
 
 ---
@@ -70,11 +70,11 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-`Client` raises `CommandError` when the server replies `ERR`, `ProtocolError` for invalid outgoing fields or integer ranges, and `ConnectionError` when the connection drops. Invalid outgoing data is rejected before writing and leaves the connection usable. Closing a client wakes waiting requests and message readers.
+`Client` raises `CommandError` when the server replies `ERR`, `ProtocolError` for invalid outgoing fields, integer ranges or wire rules, and `ConnectionError` when the connection drops or an incoming wire frame is invalid. Exceptions from custom payload codecs propagate to the caller. Invalid outgoing data is rejected before writing and leaves the connection usable. Closing a client wakes waiting requests and message readers.
 
-`next_message()` has no timeout argument. Use `asyncio.timeout(seconds)` around the call; timing out while waiting for a message leaves the connection usable. Cancelling or timing out an in-flight command closes that connection, because its pending reply cannot safely be matched to a later request. Connect a new client before sending another command.
+`next_message()` has no timeout argument. Use `asyncio.timeout(seconds)` around the call; timing out while waiting for a message leaves the connection usable. Cancelling or timing out a command after it has been written closes that connection, because its pending reply cannot safely be matched to a later request. After that closure, connect a new client before sending another command. Cancelling while waiting for the request lock does not close the connection.
 
-Clients buffer at most 1,024 unread messages and 8 MiB of channel/payload bytes by default, measured before codec decoding. Set `max_pending_messages` and `max_pending_bytes` as keyword arguments to `Client.connect()` to change these positive limits. Crossing either limit closes the connection and fails pending requests. Already queued messages can be drained before `next_message()` raises `ConnectionError`. A full message buffer never blocks the reply reader.
+Clients buffer at most 1,024 unread messages and 8 MiB of channel/payload bytes by default, measured after wire decoding and before client payload decoding. Set `max_pending_messages` and `max_pending_bytes` as keyword arguments to `Client.connect()` to change these positive limits. Crossing either limit closes the connection and fails pending requests. Already queued messages can be drained before `next_message()` raises `ConnectionError`. A full message buffer never blocks the reply reader.
 
 `PUBLISH` returns the number of subscriber connections that accepted the message for delivery. It does not acknowledge that their applications have read or processed it.
 
@@ -86,34 +86,44 @@ The server separates command handling from networking, and the dependency only p
 
 ```mermaid
 flowchart TB
-    client["Client<br/>(codec chain applied here)"]
-
     subgraph net ["velis.net"]
-        session["TcpSession<br/>requests, pushes and buffers"]
-        server["TcpServer"]
-        proto["protocol<br/>bytes <-> Command / Reply"]
-        conn["Connection<br/>(is a Subscriber)"]
+        client["Client<br/>payload codec and error translation"]
+        session["TcpSession<br/>request ordering and message queue"]
+        server["TcpServer<br/>command loop"]
+        conn["Connection<br/>wire I/O and push buffering"]
+        wire["WireProtocol on each peer<br/>command and frame chains"]
     end
 
-    subgraph core ["velis.core: no sockets, no wire format"]
-        engine["Engine<br/>execute(Command) -> Reply"]
-        store["Store<br/>data + TTL heap"]
-        broker["Broker<br/>channels and Subscribers"]
+    subgraph codecs ["velis.codec"]
+        chain["CodecChain<br/>typed composition"]
+        stages["Validate, TaggedCodec, Utf8,<br/>UInt and LengthPrefix"]
     end
 
-    client --> session
-    session <-->|"TCP frames"| server
-    server --> proto
-    server --> conn
-    server --> engine
+    subgraph core ["velis.core: no sockets or wire format"]
+        engine["Engine<br/>execute command and return reply"]
+        store["Store<br/>opaque bytes and TTL heap"]
+        broker["Broker<br/>channel membership"]
+    end
+
+    client -->|"Session interface"| session
+    session <-->|"length-prefixed TCP messages"| conn
+    server -->|"owns"| conn
+    server -->|"Command / Reply"| engine
+    session -.->|"uses"| wire
+    conn -.->|"reads commands and encodes frames"| wire
+    client -.->|"payload transforms"| chain
+    wire --> chain
+    chain --> stages
     engine --> store
     engine --> broker
-    broker -. "send()" .-> conn
+    broker -->|"Subscriber.send"| conn
 ```
 
-`Client` owns the user-facing command API, codecs and error translation. It delegates request ordering, message buffering and connection shutdown to a `Session`. The built-in `TcpSession` implements that interface over the wire protocol. Codecs can be individual `Codec` objects or composed `CodecChain`s.
+The diagram shows runtime calls and codec usage; each peer uses its own configured wire protocol. `Broker` calls the structural `Subscriber` interface, so it has no dependency on the concrete `Connection` class.
 
-`Client.connect()` creates the TCP session for you. To supply a different transport, use `Client(session, codec)` with an object implementing `request(command)`, `next_message()` and `close()`. For existing asyncio streams, construct `Client(TcpSession(reader, writer), codec)`. Sessions exchange command/reply dataclasses and encoded payload bytes; the client applies codecs and translates `Err` replies into `CommandError`.
+`Client` owns the user-facing command API, payload codecs and error translation. It delegates request ordering, message buffering and connection shutdown to a `Session`. The built-in `TcpSession` implements that interface over the wire protocol. Payload codecs can be individual `Codec[bytes, bytes]` objects or composed `CodecChain[bytes, bytes]` instances. The default is an identity chain.
+
+`Client.connect()` creates the TCP session for you. To supply a different transport, use `Client(session, codec)` with an object implementing `request(command)`, `next_message()` and `close()`. For existing asyncio streams, construct `Client(TcpSession(reader, writer), codec)`. Sessions exchange command/reply dataclasses containing payload-encoded bytes; the client applies codecs and translates `Err` replies into `CommandError`.
 
 Clients support async context management, including cleanup when application code raises:
 
@@ -123,7 +133,7 @@ async def read_greeting() -> bytes | None:
         return await client.get("greeting")
 ```
 
-Requests and replies are plain frozen dataclasses (`velis.core.commands`). `net/protocol.py` provides `encode_command`, `encode_reply` and `encode_message`, with readers for commands and incoming server frames. The earlier `message` encoder name remains available for compatibility. `Engine.execute` handles each command the same way: **validate, apply, reply.**
+Requests and replies are plain frozen dataclasses (`velis.core.commands`). `net/protocol.py` defines `COMMANDS` and `FRAMES` codec chains using shared tagged-record schemas. `WireProtocol` appends bounded length framing and adapts the chains to asynchronous TCP reads. The convenience functions `encode_command`, `encode_reply`, `encode_message`, `read_command` and `read_frame` use `DEFAULT_PROTOCOL`. `Engine.execute` handles each command the same way: **validate, apply, reply.**
 
 ### Request lifecycle
 
@@ -134,22 +144,40 @@ Cache mutations only change memory. The engine calls `Store.expire(key, ms)` and
 ```mermaid
 sequenceDiagram
     participant C as Client
+    participant T as TcpSession
     participant S as TcpServer
     participant E as Engine
-    participant T as Store
+    participant K as Store
 
-    C->>S: SET key value
-    S->>E: execute(Set)
-    E->>T: set(key, value)
-    E-->>S: Ok
-    S-->>C: OK
+    C->>C: payload codec.encode(value)
+    C->>T: request(Set(key, encoded_value))
+    T->>T: wire.commands.encode(command)
+    T->>S: Length-prefixed SET frame
+    S->>S: connection.read_command()
+    S->>E: execute(Set, connection)
+    E->>K: set(key, encoded_value)
+    E-->>S: Ok()
+    S->>S: connection.write_reply(reply)
+    S-->>T: Length-prefixed OK frame
+    T->>T: wire.read_frame(reader), resolve pending reply
+    T-->>C: Ok()
 
-    C->>S: EXPIRE key 5000
-    S->>E: execute(Expire)
-    E->>T: expire(key, 5000)
-    E-->>S: Ok
-    S-->>C: OK
+    C->>T: request(Get(key))
+    T->>T: wire.commands.encode(command)
+    T->>S: Length-prefixed GET frame
+    S->>S: connection.read_command()
+    S->>E: execute(Get, connection)
+    E->>K: get(key)
+    K-->>E: encoded_value
+    E-->>S: Value(encoded_value)
+    S->>S: connection.write_reply(reply)
+    S-->>T: Length-prefixed VALUE frame
+    T->>T: wire.read_frame(reader), resolve pending reply
+    T-->>C: Value(encoded_value)
+    C->>C: payload codec.decode(encoded_value)
 ```
+
+The diagram shows a successful `SET` followed by `GET` on the same key. `TcpSession` serializes requests around one pending reply; its reader routes `Message` frames into a separate queue. `Connection` owns server-side wire decoding, reply encoding and socket I/O; `TcpServer` dispatches decoded commands to the engine. Payload bytes stay encoded in the store.
 
 ### Pub-sub
 
@@ -157,48 +185,73 @@ The `Broker` only knows the `Subscriber` protocol (`send(channel, payload) -> bo
 
 ```mermaid
 sequenceDiagram
-    participant A as Subscriber client
+    participant A as Subscriber TcpSession
     participant S as TcpServer
     participant E as Engine
     participant B as Broker
-    participant P as Publisher client
+    participant N as Subscriber Connection
+    participant P as Publisher TcpSession
 
-    A->>S: SUBSCRIBE news
-    S->>E: execute(Subscribe, connection A)
-    E->>B: subscribe(news, connection A)
-    S-->>A: SUBSCRIBED news
+    A->>S: SUBSCRIBE news frame
+    S->>E: execute(Subscribe, subscriber connection)
+    E->>B: subscribe(news, subscriber connection)
+    E-->>S: Subscribed(news)
+    S-->>A: SUBSCRIBED news frame
 
-    P->>S: PUBLISH news payload
-    S->>E: execute(Publish)
+    P->>S: PUBLISH news payload frame
+    S->>E: execute(Publish, publisher connection)
     E->>B: publish(news, payload)
-    B-->>A: MESSAGE news payload (pushed via Connection.send)
-    S-->>P: DELIVERED 1
+    B->>N: send(news, payload)
+    N->>N: wire.frames.encode(Message(news, payload))
+    N-->>A: MESSAGE news payload frame
+    N-->>B: True when accepted for delivery
+    B-->>E: accepted count
+    E-->>S: Delivered(1)
+    S-->>P: DELIVERED 1 frame
+    A->>A: Decode wire frame and queue Message
+    Note over A: Client.next_message() decodes the payload
 ```
+
+Network arrows above represent complete length-prefixed frames encoded and decoded with each peer's configured wire chains. The publisher client encodes the payload before requesting `Publish`; the subscriber client decodes it when calling `next_message()`. `DELIVERED 1` means one connection accepted the push, regardless of when the subscriber reads it.
 
 ### Key lifecycle
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Live: SET
-    Live --> Live: SET (overwrites)
-    Live --> Expiring: EXPIRE
-    Expiring --> Expiring: EXPIRE (new deadline)
-    Expiring --> Live: SET (clears the TTL)
-    Expiring --> Gone: deadline passes (lazy on read or background sweep)
-    Gone --> [*]
+    [*] --> Missing
+    Missing --> Live: SET
+    Missing --> Missing: GET or EXPIRE returns NIL
+    Live --> Live: SET overwrites
+    Live --> Expiring: EXPIRE sets a deadline
+    Expiring --> Expiring: EXPIRE replaces deadline
+    Expiring --> Live: SET clears TTL
+    Expiring --> Expired: deadline reached
+    Expired --> Missing: GET, EXPIRE or sweep removes entry
+    Expired --> Live: SET replaces expired entry
+    note right of Expired
+        Logically missing immediately.
+        Physical cleanup can happen later.
+    end note
 ```
+
+The key-state diagram assumes valid commands. Invalid TTL values return an error without changing the key or its deadline.
 
 ### Startup and shutdown
 
 ```mermaid
 flowchart TD
-    start([velis starts]) --> load["Load Config from VELIS_* env"]
-    load --> serve["Create empty Store and Broker, start TcpServer and maintenance"]
-    serve --> run(["Serve until SIGINT or SIGTERM"])
-    run --> shut["Stop maintenance, stop accepting and close clients"]
+    start(["CLI starts"]) --> load["Load Config, configure logging and show banner"]
+    load --> signals["Install SIGINT and SIGTERM handlers"]
+    signals --> engine["serve: create Store, Broker and Engine"]
+    engine --> server["Start TcpServer with DEFAULT_PROTOCOL"]
+    server --> maintenance["Start periodic expiry sweep"]
+    maintenance --> run["Serve until a stop signal"]
+    run --> cancel["Cancel and await maintenance"]
+    cancel --> close["Stop accepting and close client sockets"]
+    close --> restore["Restore signal handlers"]
 ```
 
-The `serve(config)` async context manager in `velis.app` owns the server and maintenance task, including cleanup after startup or caller failures. It yields the running `TcpServer`. Pass `engine=existing_engine` to reuse application state or a store with an injected clock; the default creates a fresh engine. Shutdown releases runtime resources while an injected engine remains available to its owner. The CLI separately configures logging and installs signal handlers; embedded callers control the runtime scope themselves:
+The `serve(config)` async context manager in `velis.app` owns the server and maintenance task, including cleanup after startup or caller failures. It yields the running `TcpServer`. Pass `engine=existing_engine` to reuse application state or a store with an injected clock; the default creates a fresh engine. Pass `wire=custom_wire` to configure the server's codec chains; the CLI uses `DEFAULT_PROTOCOL`. Shutdown releases runtime resources while an injected engine remains available to its owner. The CLI separately configures logging and installs signal handlers; embedded callers control the runtime scope themselves:
 
 ```python
 from velis.app import serve
@@ -222,7 +275,7 @@ One task sweeps expired keys every `VELIS_SWEEP_MS`. Each sweep processes at mos
 
 ## Wire protocol
 
-Integers use big-endian byte order. A **string** or **bytes** field is `u32 length` followed by that many bytes (strings are UTF-8). Encoders and receivers reject string and bytes fields larger than 1 MiB; the limit includes any expansion from client-side codecs. There is no outer length prefix for the entire request.
+The following tables describe the default body codecs (`COMMANDS` and `FRAMES`). Integers use big-endian byte order. A **string** or **bytes** field is `u32 length` followed by that many bytes (strings are UTF-8). Encoders and receivers reject string and bytes fields larger than 1 MiB; the limit includes any expansion from client-side codecs. Every request, reply and push has an **outer u32 body length** followed by exactly that many bytes. The default outer limit is 8 MiB, checked before reading the body; field limits also apply after body decoding. This is a breaking change from the earlier unframed protocol: update both peers together.
 
 **Requests**
 
@@ -235,7 +288,7 @@ Integers use big-endian byte order. A **string** or **bytes** field is `u32 leng
 | `UNSUBSCRIBE` | `channel: str` | `UNSUBSCRIBED` |
 | `PUBLISH` | `channel: str`, `payload: bytes` | `DELIVERED` |
 
-A request is the command name as a string followed by its fields.
+Inside the outer frame, a request is the command name as a string followed by its fields.
 
 **Replies and pushes**
 
@@ -251,7 +304,7 @@ A request is the command name as a string followed by its fields.
 **Errors**
 
 * `ERR` with the connection kept open: a valid request that can't be honoured (for example a TTL out of range).
-* `ERR` followed by the server closing the connection: the stream is malformed (unknown command, oversized field, invalid UTF-8). It can't be resynchronised.
+* Best-effort `ERR` followed by the server closing the connection: the message violates the protocol (unknown tag, oversized field/frame, invalid UTF-8, truncated record, trailing bytes or a failed wire rule). The server deliberately closes on these errors, including when the configured codec or disconnected peer prevents sending the error reply. An incomplete TCP frame at EOF closes the connection without a reply.
 
 ---
 
@@ -283,22 +336,23 @@ Unknown log levels, ports outside `0–65535`, nonpositive buffer sizes or sweep
 
 ## Codecs
 
-Codecs transform values on the **client** (compress, encode, encrypt, ...). The server stores whatever bytes it is given, and the codec chain never leaves the client.
+Codecs describe reversible representations: `Codec[T, Encoded]`. The same `CodecChain` abstraction composes client payload transforms, protocol field encoders, complete commands/replies and validation rules. Client payload codecs still operate on `bytes`; the store retains their output as opaque bytes.
 
-A codec is any object with a `name` and `encode` / `decode` methods that work on `bytes`:
+A codec is any object satisfying this structural interface:
 
 ```python
 from typing import Protocol
 
 
-class Codec(Protocol):
-    name: str
+class Codec[T, Encoded](Protocol):
+    @property
+    def name(self) -> str: ...
 
-    def encode(self, data: bytes) -> bytes: ...
-    def decode(self, data: bytes) -> bytes: ...
+    def encode(self, value: T, /) -> Encoded: ...
+    def decode(self, data: Encoded, /) -> T: ...
 ```
 
-Codecs are combined into a `CodecChain` with `|`. Encoding runs the codecs left to right, and decoding runs them right to left. The chain's name is the codec names joined with `_`. Combining chains preserves the written order and flattens their steps. An empty chain leaves bytes unchanged. Codec exceptions propagate to the caller.
+Codecs are combined into a `CodecChain` with `|`. Encoding runs the codecs left to right, and decoding runs them right to left. The chain's name is the codec names joined with `_`. Combining chains preserves the written order and flattens their steps. Adjacent stages must have compatible types; the type checker rejects mismatches. Chain composition does not inspect Python annotations or enforce those types at runtime. `CodecChain.identity(bytes)` (or another type) creates an empty identity chain. Start a nonempty chain with `CodecChain.of(first)` and append stages using `|`. Codec exceptions propagate and stop processing.
 
 ```python
 import base64
@@ -327,7 +381,7 @@ class B64:
         return base64.b64decode(data)
 
 
-chain = CodecChain.of(Deflate()) | B64()  # or CodecChain() | Deflate() | B64()
+chain = CodecChain.of(Deflate()) | B64()  # CodecChain[bytes, bytes]
 chain.name  # "deflate_b64"
 chain.decode(chain.encode(b"hello"))  # b"hello"
 ```
@@ -345,11 +399,92 @@ finally:
     await kv.close()
 ```
 
-Readers of a key and subscribers to a channel must use the same codec chain as their writers or publishers. Keys and channel names are not transformed.
+Readers of a key and subscribers to a channel must use the same codec chain as their writers or publishers. Payload codecs do not transform keys or channel names; wire codecs serialize the entire command or frame, including those fields.
+
+### Typed representations and rules
+
+Built-in `Utf8`, `UInt(bits)` and `LengthPrefix(max_length)` codecs can be composed directly:
+
+```python
+from velis.codec import CodecChain, LengthPrefix, Utf8, Validate
+
+
+def require_text(value: str) -> None:
+    if not value:
+        raise ValueError("text must not be empty")
+
+
+text = CodecChain.of(Validate("nonempty", require_text)) | Utf8() | LengthPrefix(1024)
+# CodecChain[str, bytes]: encode validates text, encodes UTF-8, then prefixes length.
+assert text.decode(text.encode("hello")) == "hello"
+```
+
+`Validate[T]` runs a rule on both encode and decode, preserving the value. Its position determines what it validates: before `Utf8()` it sees strings; after it, bytes. Rules raise to reject input. `UInt` checks unsigned ranges and exact encoded widths; `Utf8` rejects malformed text; `LengthPrefix` enforces the body limit and exact length.
+
+### Composing the wire protocol
+
+`COMMANDS` is `CodecChain[Command, bytes]`; `FRAMES` is `CodecChain[Reply | Message, bytes]`. Both use `Field`, `Record` and `TaggedCodec` from `velis.codec.records` so field order and codecs are defined once for both directions. Variable-width fields include a u32 length prefix; fixed-width fields declare their width explicitly. Record constructors receive keyword arguments by field name, so wire order can differ from constructor order and keyword-only dataclasses work. Duplicate field names, record tags and record types are rejected when defining a schema.
+
+```python
+from velis.codec import CodecChain, Validate
+from velis.core.commands import Command, Get
+from velis.errors import ProtocolError
+from velis.net.protocol import COMMANDS, FRAMES, WireProtocol
+
+
+def check_command(command: Command) -> None:
+    if isinstance(command, Get) and not command.key:
+        raise ProtocolError("GET requires a nonempty key")
+
+
+wire = WireProtocol(
+    command_codec=CodecChain.of(Validate("commandrules", check_command)) | COMMANDS,
+    frame_codec=FRAMES,
+)
+```
+
+Pass `wire=wire` to `serve(config, ...)` or `TcpServer(engine, config.server, ...)`, and to `Client.connect(...)`, `TcpSession.connect(...)` or `TcpSession(reader, writer, ...)`. `WireProtocol.commands` and `.frames` are the complete chains including outer framing. You can also round-trip records synchronously with those chains.
+
+The full command chain has the following shape; `FRAMES` uses the same framing for replies and pushes:
+
+```mermaid
+flowchart LR
+    command["Command dataclass"] -->|"encode"| rule["Optional Validate rule"]
+    rule --> schema["COMMANDS<br/>tag and field codecs"]
+    schema --> transform["Optional bytes-to-bytes transforms"]
+    transform --> framing["LengthPrefix<br/>8 MiB body limit by default"]
+    framing --> tcp["TCP message bytes"]
+```
+
+Decoding runs right to left after the stream adapter reads the four-byte length, checks the outer limit and reads exactly one body. For example, the default `GET k` message is `u32(12) + u32(3) + b"GET" + u32(1) + b"k"`. The 12-byte body includes field prefixes but excludes the outer prefix.
+
+To use the rule above on both peers within an application:
+
+```python
+from velis.app import serve
+from velis.config import Config, Server
+from velis.net.client import Client
+
+
+async def with_custom_wire() -> None:
+    config = Config("INFO", Server("127.0.0.1", 0))
+    async with serve(config, wire=wire) as server:
+        async with await Client.connect("127.0.0.1", server.port, wire=wire) as client:
+            await client.set("greeting", b"hello")
+            assert await client.get("greeting") == b"hello"
+```
+
+Set `WireProtocol(framing=LengthPrefix(max_length))` to change the outer body limit. This limit is independent of `VELIS_MAX_BUFFER` and the client queue limits; all default wire string/bytes fields still have the 1 MiB limit.
+
+Append byte transforms to the body chains, for example `COMMANDS | Deflate()` and `FRAMES | Deflate()` using the example codec above. `WireProtocol` always appends the outer length prefix last, allowing TCP to read one complete body before reversing the transformations. Both peers must agree on representations; there is no codec negotiation. The minimal `Deflate` example needs additional handling for use on the wire: custom wire codecs must raise `ProtocolError` for malformed input, bound any decompressed output themselves, and be safe to share across connections.
+
+Wire rules validate representations and decoded commands. Stateful command semantics and access policies belong in the engine or a command validation layer, where they also apply to non-TCP sessions. Payload codecs configured with `codec=` remain independent from wire codecs configured with `wire=`.
+
+Migration from the earlier API: use `Codec[T, Encoded]` and `CodecChain[T, Encoded]` in annotations, replace `CodecChain()` with `CodecChain.identity(bytes)`, and replace `CodecChain.of(a, b)` with `CodecChain.of(a) | b`. The old `protocol.message` alias has been removed; use `encode_message`.
 
 ### Registering a chain as a Python codec
 
-`register` also makes a chain available to the standard `str.encode` and `bytes.decode` under the chain's name. Text is encoded with the given text encoding (default `utf-8`) before the chain runs, and decoded after it on the way back.
+`register` accepts a `CodecChain[bytes, bytes]` and makes it available to the standard `str.encode` and `bytes.decode` under the chain's name. Text is encoded with the given text encoding (default `utf-8`) before the chain runs, and decoded after it on the way back.
 
 ```python
 from velis.codec import register, unregister
@@ -379,24 +514,27 @@ src/velis/
   errors.py          # VelisError, ProtocolError, CommandError
   banner.py          # startup banner (honours NO_COLOR)
   core/              # no sockets, no wire format
-    commands.py      # Command / Reply dataclasses
+    commands.py      # Command / Reply / Message dataclasses
     engine.py        # validate -> apply -> reply
     store.py         # key/value map, TTL heap
     broker.py        # pub-sub over the Subscriber protocol
     clock.py         # Clock protocol and monotonic SystemClock
   net/
-    protocol.py      # bytes <-> commands and replies
-    connection.py    # one client socket; implements Subscriber
+    protocol.py      # command/frame schemas, wire chains and TCP framing
+    connection.py    # server-side wire I/O and Subscriber push buffering
     server.py        # TcpServer
     client.py        # command API, codecs, error translation and scoped cleanup
     session.py       # Session interface and TCP request/message lifecycle
   codec/
-    chain.py         # Codec protocol and CodecChain
+    chain.py         # typed Codec protocol and CodecChain
+    binary.py        # UTF-8, unsigned integers and length framing
+    records.py       # shared tagged-record field schemas
+    rules.py         # bidirectional Validate stages
     registry.py      # register chains as Python text codecs
 tests/
   helpers.py         # ManualClock and RecordingSubscriber test helpers
   app/               # runtime cleanup and CLI signal ownership
-  codec/             # composition, round trips and codec registration
+  codec/             # typed composition, rules, binary codecs and registration
   core/              # store, engine, broker and cache lifetime
   net/               # protocol, client lifecycle and TCP integration tests
 ```
@@ -428,7 +566,7 @@ The core is deliberately easy to test without sockets or real time: the `Store` 
 * **TTLs use monotonic time.** Deadlines are internal to the running process and are discarded on restart.
 * **No auth or TLS**, and no limits on connections or total memory yet. Don't expose it to untrusted networks.
 * **One command at a time per client.** An asyncio lock serializes requests around one pending reply future; server pushes use a separate bounded queue. There are no request IDs.
-* **Separate buffer limits.** Server write buffers and client unread-message buffers have independent limits. Client byte budgets cover encoded channel and payload bytes; decoded values and application-held messages use additional memory.
+* **Separate buffer limits.** Server write buffers and client unread-message buffers have independent limits. Client byte budgets count UTF-8 channel bytes and payload-encoded bytes after wire decoding; decoded values and application-held messages use additional memory.
 
 ---
 

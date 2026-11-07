@@ -29,7 +29,9 @@ def _validate_name(name: str) -> None:
     raise ValueError(f"codec name already in use: {name!r}")
 
 
-def _make_text_codec(chain: CodecChain, encoding: str) -> codecs.CodecInfo:
+def _make_text_codec(
+    chain: CodecChain[bytes, bytes], encoding: str
+) -> codecs.CodecInfo:
     """Adapt a byte codec chain to Python's text and consumed-length interface."""
 
     def encode(text: str, errors: str = "strict") -> tuple[bytes, int]:
@@ -42,7 +44,9 @@ def _make_text_codec(chain: CodecChain, encoding: str) -> codecs.CodecInfo:
     return codecs.CodecInfo(encode, decode, name=chain.name)
 
 
-def register(chain: CodecChain, encoding: str = "utf-8") -> CodecChain:
+def register(
+    chain: CodecChain[bytes, bytes], encoding: str = "utf-8"
+) -> CodecChain[bytes, bytes]:
     """Register a chain as a Python text codec and return the same chain.
 
     Encode text before applying the chain, and decode text after reversing

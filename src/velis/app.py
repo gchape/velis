@@ -11,6 +11,7 @@ from velis.config import Config
 from velis.core.broker import Broker
 from velis.core.engine import Engine
 from velis.core.store import Store
+from velis.net.protocol import DEFAULT_PROTOCOL, WireProtocol
 from velis.net.server import TcpServer
 
 log = logging.getLogger(__name__)
@@ -30,18 +31,22 @@ async def _maintain(engine: Engine, interval: float) -> None:
 
 @asynccontextmanager
 async def serve(
-    config: Config, *, engine: Engine | None = None
+    config: Config,
+    *,
+    engine: Engine | None = None,
+    wire: WireProtocol = DEFAULT_PROTOCOL,
 ) -> AsyncGenerator[TcpServer]:
     """Own server and maintenance resources across startup, serving and cleanup.
 
-    Supply an engine to reuse application state or an injected clock.
+    Supply an engine to reuse application state or an injected clock, and
+    a wire protocol to compose custom serialization and validation.
     Signal handling belongs to the CLI; embedding callers control this scope.
     Maintenance failure interrupts the caller and closes the server. TaskGroup
     reports worker or caller failures in an ExceptionGroup after cleanup.
     """
     if engine is None:
         engine = build_engine()
-    server = TcpServer(engine, config.server)
+    server = TcpServer(engine, config.server, wire=wire)
     async with AsyncExitStack() as resources:
         resources.push_async_callback(server.close)
         await server.start()

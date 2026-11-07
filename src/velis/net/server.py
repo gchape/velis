@@ -8,8 +8,8 @@ from velis.config import Server as ServerConfig
 from velis.core.commands import Err
 from velis.core.engine import Engine
 from velis.errors import CommandError, ProtocolError
-from velis.net import protocol
 from velis.net.connection import Connection
+from velis.net.protocol import DEFAULT_PROTOCOL, WireProtocol
 
 log = logging.getLogger(__name__)
 
@@ -17,7 +17,14 @@ log = logging.getLogger(__name__)
 class TcpServer:
     """Serve commands over TCP and track active subscriber connections."""
 
-    def __init__(self, engine: Engine, config: ServerConfig) -> None:
+    def __init__(
+        self,
+        engine: Engine,
+        config: ServerConfig,
+        *,
+        wire: WireProtocol = DEFAULT_PROTOCOL,
+    ) -> None:
+        self._wire = wire
         self._engine = engine
         self._config = config
         self._listener: asyncio.Server | None = None
@@ -54,7 +61,9 @@ class TcpServer:
         Send a protocol error before closing a malformed stream when possible.
         """
         peer = writer.get_extra_info("peername")
-        connection = Connection(reader, writer, self._config.max_buffer)
+        connection = Connection(
+            reader, writer, self._config.max_buffer, wire=self._wire
+        )
         self._connections.add(connection)
         log.info("connected: %s", peer)
         try:
@@ -63,24 +72,26 @@ class TcpServer:
             pass
         except ProtocolError as exc:
             log.warning("protocol error from %s: %s", peer, exc)
-            connection.write(protocol.encode_reply(Err(str(exc))))
+            # The same codec/transport may also reject the error reply.
+            # Closing the malformed connection must still complete normally.
+            with contextlib.suppress(ProtocolError, ConnectionError):
+                connection.write_reply(Err(str(exc)))
         except Exception:
             log.exception("unexpected error serving %s", peer)
         finally:
             self._connections.discard(connection)
             self._engine.disconnect(connection)
             connection.close()
-            with contextlib.suppress(ConnectionError):
-                await writer.wait_closed()
+            await connection.wait_closed()
             log.info("disconnected: %s", peer)
 
     async def _serve_commands(self, connection: Connection) -> None:
         """Read commands and reply until the connection ends or misbehaves."""
         while True:
-            command = await protocol.read_command(connection.reader)
+            command = await connection.read_command()
             try:
                 reply = self._engine.execute(command, connection)
             except CommandError as exc:
                 reply = Err(str(exc))
-            connection.write(protocol.encode_reply(reply))
+            connection.write_reply(reply)
             await connection.drain()

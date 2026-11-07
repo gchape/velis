@@ -8,7 +8,7 @@ from typing import Protocol
 
 from velis.core.commands import Command, Message, Reply
 from velis.errors import ProtocolError
-from velis.net import protocol
+from velis.net.protocol import DEFAULT_PROTOCOL, WireProtocol
 
 
 class Session(Protocol):
@@ -43,11 +43,13 @@ class TcpSession:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
         *,
+        wire: WireProtocol = DEFAULT_PROTOCOL,
         max_pending_messages: int = 1024,
         max_pending_bytes: int = 8 << 20,
     ) -> None:
         if max_pending_messages <= 0 or max_pending_bytes <= 0:
             raise ValueError("pending message limits must be positive")
+        self._wire = wire
         self._reader = reader
         self._writer = writer
         self._request_lock = asyncio.Lock()
@@ -67,6 +69,7 @@ class TcpSession:
         host: str,
         port: int,
         *,
+        wire: WireProtocol = DEFAULT_PROTOCOL,
         max_pending_messages: int = 1024,
         max_pending_bytes: int = 8 << 20,
     ) -> TcpSession:
@@ -76,6 +79,7 @@ class TcpSession:
             return cls(
                 reader,
                 writer,
+                wire=wire,
                 max_pending_messages=max_pending_messages,
                 max_pending_bytes=max_pending_bytes,
             )
@@ -89,7 +93,7 @@ class TcpSession:
         """Split the incoming stream into replies and server pushes."""
         try:
             while True:
-                frame = await protocol.read_frame(self._reader)
+                frame = await self._wire.read_frame(self._reader)
                 if isinstance(frame, Message):
                     self._enqueue_message(frame)
                 else:
@@ -140,7 +144,7 @@ class TcpSession:
         async with self._request_lock:
             if self._closed:
                 raise ConnectionError(self._close_reason)
-            encoded_command = protocol.encode_command(command)
+            encoded_command = self._wire.commands.encode(command)
             reply_future: asyncio.Future[Reply] = (
                 asyncio.get_running_loop().create_future()
             )

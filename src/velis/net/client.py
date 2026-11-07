@@ -22,23 +22,29 @@ from velis.core.commands import (
     Value,
 )
 from velis.errors import CommandError, ProtocolError
+from velis.net.protocol import DEFAULT_PROTOCOL, WireProtocol
 from velis.net.session import Session, TcpSession
 
 
 class Client:
     """Typed cache and pub-sub API over an owned session and a byte codec."""
 
-    def __init__(self, session: Session, codec: Codec | None = None) -> None:
+    def __init__(
+        self, session: Session, codec: Codec[bytes, bytes] | None = None
+    ) -> None:
         self._session = session
-        self._codec: Codec = CodecChain() if codec is None else codec
+        self._codec: Codec[bytes, bytes] = (
+            CodecChain.identity(bytes) if codec is None else codec
+        )
 
     @classmethod
     async def connect(
         cls,
         host: str,
         port: int,
-        codec: Codec | None = None,
+        codec: Codec[bytes, bytes] | None = None,
         *,
+        wire: WireProtocol = DEFAULT_PROTOCOL,
         max_pending_messages: int = 1024,
         max_pending_bytes: int = 8 << 20,
     ) -> Client:
@@ -46,6 +52,7 @@ class Client:
         session = await TcpSession.connect(
             host,
             port,
+            wire=wire,
             max_pending_messages=max_pending_messages,
             max_pending_bytes=max_pending_bytes,
         )

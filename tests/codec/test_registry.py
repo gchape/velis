@@ -20,8 +20,8 @@ class RegistryTests(unittest.TestCase):
         for name in self.names:
             unregister(name)
 
-    def register_chain(self, encoding: str = "utf-8") -> CodecChain:
-        chain = CodecChain.of(Prefix(f"velisregistrytest{next(_counter)}"), Reverse())
+    def register_chain(self, encoding: str = "utf-8") -> CodecChain[bytes, bytes]:
+        chain = CodecChain.of(Prefix(f"velisregistrytest{next(_counter)}")) | Reverse()
         self.assertIs(register(chain, encoding), chain)
         self.names.add(chain.name)
         return chain
@@ -75,7 +75,7 @@ class RegistryTests(unittest.TestCase):
             with self.subTest(name=name), self.assertRaises(ValueError):
                 register(CodecChain.of(Prefix(name)))
         with self.assertRaises(ValueError):
-            register(CodecChain())
+            register(CodecChain.identity(bytes))
 
     def test_builtin_names_are_rejected(self) -> None:
         for name in ("utf8", "ascii", "base64", "zlib"):

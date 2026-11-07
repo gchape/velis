@@ -1,63 +1,71 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol, cast
 
 
-class Codec(Protocol):
-    """Named transformation with reversible bytes-to-bytes operations."""
+class Codec[T, Encoded](Protocol):
+    """A named, reversible representation of a value."""
 
     @property
-    def name(self) -> str:
-        """Identify the transformation for chain naming and registration."""
-        ...
+    def name(self) -> str: ...
 
-    def encode(self, data: bytes) -> bytes:
-        """Transform bytes into the encoded representation."""
-        ...
+    def encode(self, value: T, /) -> Encoded: ...
 
-    def decode(self, data: bytes) -> bytes:
-        """Restore bytes from the encoded representation."""
-        ...
+    def decode(self, data: Encoded, /) -> T: ...
 
 
-@dataclass(frozen=True, slots=True)
-class CodecChain:
-    """Compose codecs in order, decoding in reverse order.
+@dataclass(frozen=True, slots=True, init=False)
+class CodecChain[T, Encoded]:
+    """Compose compatible representations; decode in reverse order.
 
-    An empty chain preserves bytes unchanged. Codec errors propagate
-    to the caller.
+    Start with ``of(codec)`` or ``identity(type)`` and append with ``|``.
+    Intermediate types are erased only in storage; composition checks that
+    each stage's output matches the following stage's input.
     """
 
-    codecs: tuple[Codec, ...] = ()
+    codecs: tuple[Codec[Any, Any], ...]
+
+    def __init__(self, codec: Codec[T, Encoded]) -> None:
+        steps = codec.codecs if isinstance(codec, CodecChain) else (codec,)
+        object.__setattr__(self, "codecs", steps)
+
+    @staticmethod
+    def of[A, B](codec: Codec[A, B]) -> CodecChain[A, B]:
+        return CodecChain(codec)
+
+    @staticmethod
+    def identity[A](value_type: type[A]) -> CodecChain[A, A]:
+        """Create an empty chain with explicit, identical endpoint types."""
+        return CodecChain._from_steps(())
 
     @classmethod
-    def of(cls, *codecs: Codec) -> CodecChain:
-        """Build a chain from codecs in their encoding order."""
-        return cls(codecs)
+    def _from_steps(cls, steps: tuple[Codec[Any, Any], ...]) -> CodecChain[T, Encoded]:
+        chain = object.__new__(cls)
+        object.__setattr__(chain, "codecs", steps)
+        return chain
 
     @property
     def name(self) -> str:
-        """Join codec names with underscores in encoding order."""
         return "_".join(codec.name for codec in self.codecs)
 
-    def encode(self, data: bytes) -> bytes:
-        """Apply each codec from left to right."""
+    def encode(self, value: T) -> Encoded:
+        current: Any = value
         for codec in self.codecs:
-            data = codec.encode(data)
-        return data
+            current = codec.encode(current)
+        return cast(Encoded, current)
 
-    def decode(self, data: bytes) -> bytes:
-        """Apply each decoder from right to left."""
+    def decode(self, data: Encoded) -> T:
+        current: Any = data
         for codec in reversed(self.codecs):
-            data = codec.decode(data)
-        return data
+            current = codec.decode(current)
+        return cast(T, current)
 
-    def __or__(self, other: Codec | CodecChain) -> CodecChain:
-        """Append a codec or flatten another chain into a new chain."""
-        appended = other.codecs if isinstance(other, CodecChain) else (other,)
-        return CodecChain(self.codecs + appended)
+    def __or__[Next](self, other: Codec[Encoded, Next]) -> CodecChain[T, Next]:
+        steps = other.codecs if isinstance(other, CodecChain) else (other,)
+        return CodecChain._from_steps(self.codecs + steps)
 
-    def __ror__(self, other: Codec) -> CodecChain:
-        """Prepend a codec without changing this chain."""
-        return CodecChain((other, *self.codecs))
+    def __ror__[Previous](
+        self, other: Codec[Previous, T]
+    ) -> CodecChain[Previous, Encoded]:
+        return CodecChain._from_steps((other, *self.codecs))

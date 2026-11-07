@@ -5,14 +5,14 @@ import unittest
 from tests.codec.helpers import Reverse
 from tests.helpers import ManualClock
 from velis.app import serve
-from velis.codec import CodecChain
+from velis.codec import CodecChain, Validate
 from velis.config import Config
 from velis.config import Server as ServerConfig
 from velis.core.broker import Broker
-from velis.core.commands import Err, Message
+from velis.core.commands import Command, Err, Get, Message
 from velis.core.engine import Engine
 from velis.core.store import Store
-from velis.errors import CommandError
+from velis.errors import CommandError, ProtocolError
 from velis.net import protocol
 from velis.net.client import Client
 from velis.net.server import TcpServer
@@ -25,7 +25,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         await self.server.start()
         self.addAsyncCleanup(self.server.close)
 
-    async def client(self, codec: CodecChain | None = None) -> Client:
+    async def client(self, codec: CodecChain[bytes, bytes] | None = None) -> Client:
         c = await Client.connect("127.0.0.1", self.server.port, codec)
         self.addAsyncCleanup(c.close)
         return c
@@ -73,9 +73,11 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_unknown_command_gets_err_then_close(self) -> None:
         reader, writer = await asyncio.open_connection("127.0.0.1", self.server.port)
-        writer.write(struct.pack(">I", 4) + b"NOPE")
+        writer.write(
+            protocol.DEFAULT_PROTOCOL.framing.encode(struct.pack(">I", 4) + b"NOPE")
+        )
         frame = await asyncio.wait_for(protocol.read_frame(reader), 1)
-        self.assertIsInstance(frame, Err)
+        self.assertEqual(frame, Err("unknown command: 'NOPE'"))
         self.assertEqual(await asyncio.wait_for(reader.read(), 1), b"")
         writer.close()
 
@@ -96,6 +98,72 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         await coded.set("k", b"abc")
         self.assertEqual(await raw.get("k"), b"cba")
         self.assertEqual(await coded.get("k"), b"abc")
+
+    async def test_custom_wire_chains_cover_commands_replies_pushes_and_errors(
+        self,
+    ) -> None:
+        wire = protocol.WireProtocol(
+            command_codec=protocol.COMMANDS | Reverse(),
+            frame_codec=protocol.FRAMES | Reverse(),
+        )
+        store = Store()
+        server = TcpServer(
+            Engine(store, Broker()), ServerConfig("127.0.0.1", 0), wire=wire
+        )
+        await server.start()
+        self.addAsyncCleanup(server.close)
+        async with await Client.connect(
+            "127.0.0.1", server.port, codec=Reverse(), wire=wire
+        ) as client:
+            await client.set("key", b"value")
+            self.assertEqual(store.get("key"), b"eulav")
+            self.assertEqual(await client.get("key"), b"value")
+            await client.subscribe("news")
+            self.assertEqual(await client.publish("news", b"hello"), 1)
+            async with asyncio.timeout(1):
+                self.assertEqual(await client.next_message(), Message("news", b"hello"))
+            with self.assertRaises(CommandError):
+                await client.expire("key", 1 << 63)
+            self.assertEqual(await client.get("key"), b"value")
+            await client.unsubscribe("news")
+
+    async def test_command_rule_rejects_locally_without_writing(self) -> None:
+        def allow(command: Command) -> None:
+            if isinstance(command, Get) and command.key == "blocked":
+                raise ProtocolError("blocked key")
+
+        wire = protocol.WireProtocol(
+            command_codec=CodecChain.of(Validate("allowed", allow)) | protocol.COMMANDS,
+        )
+        async with await Client.connect(
+            "127.0.0.1", self.server.port, wire=wire
+        ) as client:
+            with self.assertRaisesRegex(ProtocolError, "blocked key"):
+                await client.get("blocked")
+            await client.set("key", b"value")
+            self.assertEqual(await client.get("key"), b"value")
+
+    async def test_command_rule_runs_on_server_decode(self) -> None:
+        def allow(command: Command) -> None:
+            if isinstance(command, Get) and command.key == "blocked":
+                raise ProtocolError("blocked key")
+
+        wire = protocol.WireProtocol(
+            command_codec=CodecChain.of(Validate("allowed", allow)) | protocol.COMMANDS,
+            frame_codec=protocol.FRAMES | Reverse(),
+        )
+        server = TcpServer(self.engine, ServerConfig("127.0.0.1", 0), wire=wire)
+        await server.start()
+        self.addAsyncCleanup(server.close)
+        reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+        try:
+            writer.write(protocol.encode_command(Get("blocked")))
+            async with asyncio.timeout(1):
+                self.assertEqual(await wire.read_frame(reader), Err("blocked key"))
+                self.assertEqual(await reader.read(), b"")
+        finally:
+            writer.close()
+            await writer.wait_closed()
 
 
 class RuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
@@ -118,8 +186,12 @@ class RuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_runtime_scope_serves_and_closes_live_connections(self) -> None:
         config = Config("INFO", ServerConfig("127.0.0.1", 0))
-        async with serve(config) as server:
-            client = await Client.connect("127.0.0.1", server.port)
+        wire = protocol.WireProtocol(
+            command_codec=protocol.COMMANDS | Reverse(),
+            frame_codec=protocol.FRAMES | Reverse(),
+        )
+        async with serve(config, wire=wire) as server:
+            client = await Client.connect("127.0.0.1", server.port, wire=wire)
             self.addAsyncCleanup(client.close)
             await client.set("key", b"value")
             self.assertEqual(await client.get("key"), b"value")

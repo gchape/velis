@@ -1,7 +1,9 @@
 import dataclasses
+import pickle
 import unittest
 
 from velis.codec import CodecChain
+from velis.exceptions import CodecError
 
 
 def identity(data):
@@ -136,25 +138,23 @@ class EncodeDecodeTests(unittest.TestCase):
 
 
 class ErrorTests(unittest.TestCase):
-    def test_encode_error_gets_note(self):
+    def test_encode_error_is_wrapped(self):
         chain = CodecChain((prefix, Fn("bad", encode=boom)))
-        with self.assertRaises(ValueError) as cm:
+        with self.assertRaises(CodecError) as cm:
             chain.encode(b"x")
-        self.assertEqual(
-            cm.exception.__notes__,
-            ["encode failed in codec 'bad' of chain 'p_bad'"],
-        )
+        err = cm.exception
+        self.assertEqual((err.op, err.codec, err.chain), ("encode", "bad", "p_bad"))
+        self.assertEqual(str(err), "encode failed in codec 'bad' of chain 'p_bad'")
 
-    def test_decode_error_gets_note(self):
+    def test_decode_error_is_wrapped(self):
         chain = CodecChain((prefix, Fn("bad", decode=boom)))
-        with self.assertRaises(ValueError) as cm:
+        with self.assertRaises(CodecError) as cm:
             chain.decode(b"x")
-        self.assertEqual(
-            cm.exception.__notes__,
-            ["decode failed in codec 'bad' of chain 'p_bad'"],
-        )
+        err = cm.exception
+        self.assertEqual((err.op, err.codec, err.chain), ("decode", "bad", "p_bad"))
+        self.assertEqual(str(err), "decode failed in codec 'bad' of chain 'p_bad'")
 
-    def test_original_exception_object_is_reraised(self):
+    def test_original_exception_is_cause(self):
         original = ValueError("boom")
 
         def raiser(_):
@@ -163,11 +163,11 @@ class ErrorTests(unittest.TestCase):
         chain = CodecChain((Fn("bad", encode=raiser, decode=raiser),))
         for method in (chain.encode, chain.decode):
             with self.subTest(method=method.__name__):
-                with self.assertRaises(ValueError) as cm:
+                with self.assertRaises(CodecError) as cm:
                     method(b"x")
-                self.assertIs(cm.exception, original)
+                self.assertIs(cm.exception.__cause__, original)
 
-    def test_exception_types_are_preserved(self):
+    def test_cause_types_are_preserved(self):
         for exc_type in (ValueError, KeyError, TypeError, OSError, RuntimeError):
             with self.subTest(exc_type=exc_type.__name__):
 
@@ -175,16 +175,16 @@ class ErrorTests(unittest.TestCase):
                     raise exc_type("x")
 
                 chain = CodecChain((Fn("bad", encode=raiser),))
-                with self.assertRaises(exc_type) as cm:
+                with self.assertRaises(CodecError) as cm:
                     chain.encode(b"x")
-                self.assertEqual(len(cm.exception.__notes__), 1)
+                self.assertIsInstance(cm.exception.__cause__, exc_type)
 
     def test_encode_stops_at_first_failure(self):
         log = []
         chain = CodecChain(
             (Fn("a", log=log), Fn("bad", encode=boom, log=log), Fn("c", log=log))
         )
-        with self.assertRaises(ValueError):
+        with self.assertRaises(CodecError):
             chain.encode(b"x")
         self.assertEqual(log, ["encode:a", "encode:bad"])
 
@@ -193,36 +193,52 @@ class ErrorTests(unittest.TestCase):
         chain = CodecChain(
             (Fn("a", log=log), Fn("bad", decode=boom, log=log), Fn("c", log=log))
         )
-        with self.assertRaises(ValueError):
+        with self.assertRaises(CodecError):
             chain.decode(b"x")
         # reversed order: c runs, bad fails, a never runs
         self.assertEqual(log, ["decode:c", "decode:bad"])
 
-    def test_note_names_the_failing_codec_wherever_it_sits(self):
+    def test_error_names_the_failing_codec_wherever_it_sits(self):
         for position in range(3):
             with self.subTest(position=position):
                 codecs_ = [Fn("a"), Fn("b"), Fn("c")]
                 codecs_[position] = Fn("bad", encode=boom)
                 chain = CodecChain(tuple(codecs_))
-                with self.assertRaises(ValueError) as cm:
+                with self.assertRaises(CodecError) as cm:
                     chain.encode(b"x")
-                self.assertEqual(
-                    cm.exception.__notes__,
-                    [f"encode failed in codec 'bad' of chain {chain.name!r}"],
-                )
+                self.assertEqual(cm.exception.codec, "bad")
+                self.assertEqual(cm.exception.chain, chain.name)
 
-    def test_nested_chain_failure_gets_inner_then_outer_note(self):
+    def test_nested_chain_reports_inner_codec_and_is_not_rewrapped(self):
         inner = CodecChain((Fn("a"), Fn("bad", encode=boom)))
         outer = CodecChain((prefix, inner))
-        with self.assertRaises(ValueError) as cm:
+        with self.assertRaises(CodecError) as cm:
             outer.encode(b"x")
+        err = cm.exception
+        self.assertEqual((err.op, err.codec, err.chain), ("encode", "bad", "a_bad"))
+        # cause is the codec's original error, not an inner CodecError
+        self.assertIsInstance(err.__cause__, ValueError)
+
+    def test_base_exception_is_not_wrapped(self):
+        def interrupt(_):
+            raise KeyboardInterrupt
+
+        chain = CodecChain((Fn("bad", encode=interrupt, decode=interrupt),))
+        for method in (chain.encode, chain.decode):
+            with (
+                self.subTest(method=method.__name__),
+                self.assertRaises(KeyboardInterrupt),
+            ):
+                method(b"x")
+
+    def test_error_is_picklable(self):
+        err = CodecError("encode", "bad", "p_bad")
+        restored = pickle.loads(pickle.dumps(err))
+        self.assertIsInstance(restored, CodecError)
         self.assertEqual(
-            cm.exception.__notes__,
-            [
-                "encode failed in codec 'bad' of chain 'a_bad'",
-                "encode failed in codec 'a_bad' of chain 'p_a_bad'",
-            ],
+            (restored.op, restored.codec, restored.chain), ("encode", "bad", "p_bad")
         )
+        self.assertEqual(str(restored), str(err))
 
     def test_error_does_not_break_later_calls(self):
         flaky = {"fail": True}
@@ -233,7 +249,7 @@ class ErrorTests(unittest.TestCase):
             return data
 
         chain = CodecChain((Fn("f", encode=sometimes),))
-        with self.assertRaises(ValueError):
+        with self.assertRaises(CodecError):
             chain.encode(b"x")
         flaky["fail"] = False
         self.assertEqual(chain.encode(b"x"), b"x")

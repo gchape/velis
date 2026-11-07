@@ -3,6 +3,7 @@ import itertools
 import unittest
 
 from velis.codec import CodecChain, register, registry
+from velis.exceptions import CodecError
 
 # codecs.lookup caches results and can't be cleared, so every test registers
 # under a fresh name instead of reusing one.
@@ -308,31 +309,27 @@ class ErrorsArgumentTests(RegistryTestCase):
 
 
 class ChainFailureTests(RegistryTestCase):
-    def test_encode_failure_propagates_with_chain_note(self):
+    def test_encode_failure_raises_codec_error(self):
         chain = self.reg(encode=boom)
-        with self.assertRaises(ValueError) as cm:
+        with self.assertRaises(CodecError) as cm:
             "abc".encode(chain.name)
-        self.assertTrue(
-            any(
-                f"encode failed in codec {chain.name!r}" in note
-                for note in cm.exception.__notes__
-            ),
-            cm.exception.__notes__,
+        err = cm.exception
+        self.assertEqual(
+            (err.op, err.codec, err.chain), ("encode", chain.name, chain.name)
         )
+        self.assertIsInstance(err.__cause__, ValueError)
 
-    def test_decode_failure_propagates_with_chain_note(self):
+    def test_decode_failure_raises_codec_error(self):
         chain = self.reg(decode=boom)
-        with self.assertRaises(ValueError) as cm:
+        with self.assertRaises(CodecError) as cm:
             b"abc".decode(chain.name)
-        self.assertTrue(
-            any(
-                f"decode failed in codec {chain.name!r}" in note
-                for note in cm.exception.__notes__
-            ),
-            cm.exception.__notes__,
+        err = cm.exception
+        self.assertEqual(
+            (err.op, err.codec, err.chain), ("decode", chain.name, chain.name)
         )
+        self.assertIsInstance(err.__cause__, ValueError)
 
-    def test_exception_types_are_preserved(self):
+    def test_cause_types_are_preserved(self):
         for exc_type in (ValueError, KeyError, TypeError, RuntimeError):
             with self.subTest(exc_type=exc_type.__name__):
 
@@ -340,8 +337,9 @@ class ChainFailureTests(RegistryTestCase):
                     raise exc_type("x")
 
                 chain = self.reg(encode=raiser)
-                with self.assertRaises(exc_type):
+                with self.assertRaises(CodecError) as cm:
                     "abc".encode(chain.name)
+                self.assertIsInstance(cm.exception.__cause__, exc_type)
 
     def test_text_encode_error_means_chain_never_runs(self):
         chain = self.reg(encoding="ascii")

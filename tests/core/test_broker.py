@@ -25,6 +25,10 @@ class BrokerTests(unittest.TestCase):
         self.assertEqual(b.publish("a", b"x"), 1)
         self.assertEqual(b.subscribers("a"), 1)
         self.assertEqual(b.subscribers("b"), 1)
+        self.assertEqual(live.messages, [("a", b"x")])
+        self.assertEqual(dead.messages, [])
+        self.assertEqual(b.publish("b", b"next"), 1)
+        self.assertEqual(live.messages, [("a", b"x"), ("b", b"next")])
 
     def test_unsubscribe_and_unsubscribe_all(self) -> None:
         """Leaving channels and repeating cleanup is safe."""

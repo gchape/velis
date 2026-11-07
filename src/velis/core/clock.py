@@ -8,15 +8,15 @@ class Clock(Protocol):
     """Time source for TTL calculation and expiry checks."""
 
     def now_ms(self) -> int:
-        """Wall-clock unix time in milliseconds."""
+        """Monotonic time in milliseconds, with an arbitrary origin."""
         ...
 
 
 @final
 class SystemClock:
-    """Read the system wall clock without instance state."""
+    """Read the system monotonic clock without instance state."""
 
     @staticmethod
     def now_ms() -> int:
-        """Return the current Unix time in milliseconds."""
-        return time.time_ns() // 1_000_000
+        """Return monotonic milliseconds for elapsed-time TTLs."""
+        return time.monotonic_ns() // 1_000_000

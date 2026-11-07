@@ -22,8 +22,6 @@ from velis.core.commands import (
 from velis.core.store import Store
 from velis.errors import CommandError
 
-MAX_TTL_MS = 1 << 62
-
 
 class Engine:
     """Executes commands: validate -> apply -> reply.
@@ -36,10 +34,9 @@ class Engine:
         self._store = store
         self._broker = broker
 
-
-    def execute(self, cmd: Command, sub: Subscriber) -> Reply:
+    def execute(self, command: Command, subscriber: Subscriber) -> Reply:
         """Validate and execute a command for the requesting subscriber."""
-        match cmd:
+        match command:
             case Get(key):
                 value = self._store.get(key)
                 return Nil() if value is None else Value(value)
@@ -47,24 +44,25 @@ class Engine:
                 self._store.set(key, value)
                 return Ok()
             case Expire(key, ms):
-                if not 0 <= ms <= MAX_TTL_MS:
-                    raise CommandError("ttl out of range")
-                return Ok() if self._store.expire(key, ms) else Nil()
+                try:
+                    found = self._store.expire(key, ms)
+                except ValueError as exc:
+                    raise CommandError(str(exc)) from exc
+                return Ok() if found else Nil()
             case Subscribe(channel):
-                self._broker.subscribe(channel, sub)
+                self._broker.subscribe(channel, subscriber)
                 return Subscribed(channel)
             case Unsubscribe(channel):
-                self._broker.unsubscribe(channel, sub)
+                self._broker.unsubscribe(channel, subscriber)
                 return Unsubscribed(channel)
             case Publish(channel, payload):
                 return Delivered(self._broker.publish(channel, payload))
             case _:
-                assert_never(cmd)
+                assert_never(command)
 
-    def disconnect(self, sub: Subscriber) -> None:
+    def disconnect(self, subscriber: Subscriber) -> None:
         """Remove the disconnected subscriber from every channel."""
-        self._broker.unsubscribe_all(sub)
-
+        self._broker.unsubscribe_all(subscriber)
 
     def sweep(self) -> int:
         """Run the store expiry sweep and return the number of keys removed."""

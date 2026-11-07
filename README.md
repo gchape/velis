@@ -1,4 +1,5 @@
-# Velis
+<img width="300" height="100" alt="logo" src="https://github.com/user-attachments/assets/b047dd5e-2c8d-4eae-a8c4-516d81900fea" />
+
 
 Velis is a lightweight, thread-safe in-memory store with WAL crash recovery, pub-sub, TTL expiration, pluggable codecs and a protocol selector layer.
 

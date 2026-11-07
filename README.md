@@ -11,7 +11,7 @@ Velis is a lightweight in-memory key-value store with TTL expiration, pub-sub, a
 | Area | Description |
 | --- | --- |
 | **Store** | `GET` / `SET` / `EXPIRE` on opaque `bytes` values. Single-owner, so no locks. |
-| **TTL** | Absolute deadlines, expired lazily on read **and** actively by a background sweep, so keys nobody reads are still freed. |
+| **TTL** | Monotonic deadlines, expired lazily on read **and** actively by a background sweep, so keys nobody reads are still freed. |
 | **Pub-sub** | `SUBSCRIBE` / `UNSUBSCRIBE` / `PUBLISH`. Live delivery to connected subscribers on one server. Slow network connections are disconnected when their server write buffer exceeds the configured limit. |
 | **Network** | Length-prefixed binary protocol over TCP, an asyncio server and an async `Client`. |
 | **Codecs** | Composable `CodecChain`s applied on the client, optionally registered as Python text codecs. The server only sees opaque bytes. |
@@ -70,9 +70,11 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-`Client` raises `CommandError` when the server replies `ERR` and `ConnectionError` when the connection drops. Closing a client wakes waiting requests and message readers.
+`Client` raises `CommandError` when the server replies `ERR`, `ProtocolError` for invalid outgoing fields or integer ranges, and `ConnectionError` when the connection drops. Invalid outgoing data is rejected before writing and leaves the connection usable. Closing a client wakes waiting requests and message readers.
 
 `next_message()` has no timeout argument. Use `asyncio.timeout(seconds)` around the call; timing out while waiting for a message leaves the connection usable. Cancelling or timing out an in-flight command closes that connection, because its pending reply cannot safely be matched to a later request. Connect a new client before sending another command.
+
+Clients buffer at most 1,024 unread messages and 8 MiB of channel/payload bytes by default, measured before codec decoding. Set `max_pending_messages` and `max_pending_bytes` as keyword arguments to `Client.connect()` to change these positive limits. Crossing either limit closes the connection and fails pending requests. Already queued messages can be drained before `next_message()` raises `ConnectionError`. A full message buffer never blocks the reply reader.
 
 `PUBLISH` returns the number of subscriber connections that accepted the message for delivery. It does not acknowledge that their applications have read or processed it.
 
@@ -87,6 +89,7 @@ flowchart TB
     client["Client<br/>(codec chain applied here)"]
 
     subgraph net ["velis.net"]
+        session["TcpSession<br/>requests, pushes and buffers"]
         server["TcpServer"]
         proto["protocol<br/>bytes <-> Command / Reply"]
         conn["Connection<br/>(is a Subscriber)"]
@@ -98,7 +101,8 @@ flowchart TB
         broker["Broker<br/>channels and Subscribers"]
     end
 
-    client <-->|"TCP frames"| server
+    client --> session
+    session <-->|"TCP frames"| server
     server --> proto
     server --> conn
     server --> engine
@@ -107,11 +111,23 @@ flowchart TB
     broker -. "send()" .-> conn
 ```
 
-Requests and replies are plain frozen dataclasses (`velis.core.commands`). `net/protocol.py` converts them to and from bytes, and `Engine.execute` handles each one the same way: **validate, apply, reply.**
+`Client` owns the user-facing command API, codecs and error translation. It delegates request ordering, message buffering and connection shutdown to a `Session`. The built-in `TcpSession` implements that interface over the wire protocol. Codecs can be individual `Codec` objects or composed `CodecChain`s.
+
+`Client.connect()` creates the TCP session for you. To supply a different transport, use `Client(session, codec)` with an object implementing `request(command)`, `next_message()` and `close()`. For existing asyncio streams, construct `Client(TcpSession(reader, writer), codec)`. Sessions exchange command/reply dataclasses and encoded payload bytes; the client applies codecs and translates `Err` replies into `CommandError`.
+
+Clients support async context management, including cleanup when application code raises:
+
+```python
+async def read_greeting() -> bytes | None:
+    async with await Client.connect("127.0.0.1", 9000) as client:
+        return await client.get("greeting")
+```
+
+Requests and replies are plain frozen dataclasses (`velis.core.commands`). `net/protocol.py` provides `encode_command`, `encode_reply` and `encode_message`, with readers for commands and incoming server frames. The earlier `message` encoder name remains available for compatibility. `Engine.execute` handles each command the same way: **validate, apply, reply.**
 
 ### Request lifecycle
 
-Cache mutations only change memory. The engine validates the TTL range and calls `Store.expire(key, ms)`. The store owns its clock and converts the relative TTL to an absolute deadline for its expiry heap.
+Cache mutations only change memory. The engine calls `Store.expire(key, ms)` and translates validation failures into command errors. The store validates the TTL range, owns its monotonic clock and calculates an internal deadline for its expiry heap. Direct store callers receive `ValueError` for invalid TTLs without changing existing values or deadlines. System wall-clock adjustments do not change TTL duration.
 
 `SET` clears any previous TTL. `EXPIRE` returns `NIL` for a missing or already expired key, so it cannot revive expired data. A zero TTL expires a live key immediately. Accepted TTLs are between `0` and `2**62` milliseconds, inclusive.
 
@@ -137,7 +153,7 @@ sequenceDiagram
 
 ### Pub-sub
 
-The `Broker` only knows the `Subscriber` protocol (`send(channel, payload) -> bool`). A `Connection` implements it, enforces the per-connection buffer limit and returns `False` when it should be dropped. The broker then removes that subscriber from every channel.
+The `Broker` only knows the `Subscriber` protocol (`send(channel, payload) -> bool`). Delivery callbacks must return promptly; adapters own encoding, buffering and expected transport failures. A `Connection` implements this contract and returns `False` when disconnected, when a write fails with a connection error, or when its buffer limit is exceeded. The broker then removes that subscriber from every channel and continues delivering to healthy subscribers. Acceptance does not acknowledge application processing; unexpected adapter errors propagate.
 
 ```mermaid
 sequenceDiagram
@@ -182,15 +198,31 @@ flowchart TD
     run --> shut["Stop maintenance, stop accepting and close clients"]
 ```
 
+The `serve(config)` async context manager in `velis.app` owns the server and maintenance task, including cleanup after startup or caller failures. It yields the running `TcpServer`. Pass `engine=existing_engine` to reuse application state or a store with an injected clock; the default creates a fresh engine. Shutdown releases runtime resources while an injected engine remains available to its owner. The CLI separately configures logging and installs signal handlers; embedded callers control the runtime scope themselves:
+
+```python
+from velis.app import serve
+from velis.config import Config, Server
+
+
+async def embedded() -> None:
+    config = Config(log_level="INFO", server=Server("127.0.0.1", 0))
+    async with serve(config) as server:
+        print(server.port)
+        # Run application work here; leaving the scope closes the server.
+```
+
 ### Background maintenance
 
-One task sweeps expired keys every `VELIS_SWEEP_MS`. Each sweep processes at most 1,000 heap entries to limit work on the event loop; stale entries left by overwritten values or TTLs count toward that limit. Reads and `EXPIRE` also remove expired keys as needed.
+Maintenance runs in a task group owned by `serve()`. An unexpected sweep failure interrupts the active runtime scope and closes the server. Worker and caller failures are reported in an `ExceptionGroup` after cleanup; external cancellation remains `CancelledError`. Normal shutdown cancels and awaits maintenance before closing the server. Client disconnections remain local to their connections.
+
+One task sweeps expired keys every `VELIS_SWEEP_MS`. Each sweep processes at most 1,000 heap entries to limit work on the event loop; stale entries left by overwritten values or TTLs count toward that limit. Reads and `EXPIRE` also remove expired keys as needed. Mutations and sweeps rebuild the heap when it exceeds both 1,024 entries and twice the number of active TTLs. Rebuilding uses current deadlines and takes time proportional to the number of active TTLs on the event loop.
 
 ---
 
 ## Wire protocol
 
-Integers use big-endian byte order. A **string** or **bytes** field is `u32 length` followed by that many bytes (strings are UTF-8). Receivers reject string and bytes fields larger than 1 MiB; the limit includes any expansion from client-side codecs. There is no outer length prefix for the entire request.
+Integers use big-endian byte order. A **string** or **bytes** field is `u32 length` followed by that many bytes (strings are UTF-8). Encoders and receivers reject string and bytes fields larger than 1 MiB; the limit includes any expansion from client-side codecs. There is no outer length prefix for the entire request.
 
 **Requests**
 
@@ -333,7 +365,7 @@ unregister("deflate_b64")  # mainly useful in tests
 Notes:
 
 * Registering an empty chain, a chain whose name is not lowercase `a-z0-9` words joined by `_`, or a name already taken (including a built-in Python codec such as `zlib` or `base64`) raises `ValueError`.
-* Importing `velis.codec` registers a lookup function in Python's global codec registry. `register` and `unregister` modify that process-wide state.
+* Importing `velis.codec` leaves Python's global codec registry unchanged. The first `register()` call installs the lookup function; unregistering the final chain removes it. These explicit operations modify process-wide state.
 
 ---
 
@@ -341,8 +373,8 @@ Notes:
 
 ```
 src/velis/
-  __main__.py         # entry point: config -> logging -> banner -> app.run
-  app.py             # composition root: serve, maintenance, shutdown
+  __main__.py         # CLI: configuration, logging, signals and runtime startup
+  app.py             # composition root: serve() owns networking and maintenance
   config.py          # Config / Server, loaded from VELIS_* env vars
   errors.py          # VelisError, ProtocolError, CommandError
   banner.py          # startup banner (honours NO_COLOR)
@@ -351,20 +383,22 @@ src/velis/
     engine.py        # validate -> apply -> reply
     store.py         # key/value map, TTL heap
     broker.py        # pub-sub over the Subscriber protocol
-    clock.py         # Clock protocol and SystemClock
+    clock.py         # Clock protocol and monotonic SystemClock
   net/
     protocol.py      # bytes <-> commands and replies
     connection.py    # one client socket; implements Subscriber
     server.py        # TcpServer
-    client.py        # async Client (applies the codec chain)
+    client.py        # command API, codecs, error translation and scoped cleanup
+    session.py       # Session interface and TCP request/message lifecycle
   codec/
     chain.py         # Codec protocol and CodecChain
     registry.py      # register chains as Python text codecs
 tests/
   helpers.py         # ManualClock and RecordingSubscriber test helpers
+  app/               # runtime cleanup and CLI signal ownership
   codec/             # composition, round trips and codec registration
   core/              # store, engine, broker and cache lifetime
-  net/               # client lifecycle and TCP integration tests
+  net/               # protocol, client lifecycle and TCP integration tests
 ```
 
 ---
@@ -391,10 +425,10 @@ The core is deliberately easy to test without sockets or real time: the `Store` 
 ## Design notes and limitations
 
 * **Single-threaded by design.** The event-loop thread owns the `Engine`, `Store` and `Broker`, which is why none of them take locks. Don't call them from other threads.
-* **TTLs use wall-clock time.** A large clock jump can expire keys early or late.
+* **TTLs use monotonic time.** Deadlines are internal to the running process and are discarded on restart.
 * **No auth or TLS**, and no limits on connections or total memory yet. Don't expose it to untrusted networks.
-* **One command at a time per client.** An asyncio lock serializes requests; server pushes are separated by their `MESSAGE` tag. There are no request IDs.
-* **Client message queues are unbounded.** Server write buffer limits protect slow network connections, but an application that stops calling `next_message()` can still accumulate messages in its client queue.
+* **One command at a time per client.** An asyncio lock serializes requests around one pending reply future; server pushes use a separate bounded queue. There are no request IDs.
+* **Separate buffer limits.** Server write buffers and client unread-message buffers have independent limits. Client byte budgets cover encoded channel and payload bytes; decoded values and application-held messages use additional memory.
 
 ---
 

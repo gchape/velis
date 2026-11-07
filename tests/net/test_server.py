@@ -3,7 +3,10 @@ import struct
 import unittest
 
 from tests.codec.helpers import Reverse
+from tests.helpers import ManualClock
+from velis.app import serve
 from velis.codec import CodecChain
+from velis.config import Config
 from velis.config import Server as ServerConfig
 from velis.core.broker import Broker
 from velis.core.commands import Err, Message
@@ -93,6 +96,36 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         await coded.set("k", b"abc")
         self.assertEqual(await raw.get("k"), b"cba")
         self.assertEqual(await coded.get("k"), b"abc")
+
+
+class RuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_runtime_uses_supplied_engine_and_clock(self) -> None:
+        clock = ManualClock()
+        store = Store(clock)
+        store.set("existing", b"value")
+        engine = Engine(store, Broker())
+        config = Config("INFO", ServerConfig("127.0.0.1", 0))
+        async with (
+            serve(config, engine=engine) as server,
+            await Client.connect("127.0.0.1", server.port) as client,
+        ):
+            self.assertEqual(await client.get("existing"), b"value")
+            await client.expire("existing", 500)
+            clock.advance(500)
+            self.assertIsNone(await client.get("existing"))
+            await client.set("retained", b"data")
+        self.assertEqual(store.get("retained"), b"data")
+
+    async def test_runtime_scope_serves_and_closes_live_connections(self) -> None:
+        config = Config("INFO", ServerConfig("127.0.0.1", 0))
+        async with serve(config) as server:
+            client = await Client.connect("127.0.0.1", server.port)
+            self.addAsyncCleanup(client.close)
+            await client.set("key", b"value")
+            self.assertEqual(await client.get("key"), b"value")
+        async with asyncio.timeout(1):
+            with self.assertRaises(ConnectionError):
+                await client.get("key")
 
 
 if __name__ == "__main__":

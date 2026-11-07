@@ -3,52 +3,38 @@ from __future__ import annotations
 import logging.config
 from pathlib import Path
 
+_FORMAT = "%(asctime)s %(levelname)-8s %(name)s: %(message)s"
 
-def configure(
-    *,
-    level: str,
-    log_file: Path,
-    production: bool,
-) -> None:
-    handlers: dict[str, logging.config._HandlerConfiguration]
 
-    if production:
-        path = Path(log_file)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        handlers = {
-            "file": {
-                "class": "logging.handlers.RotatingFileHandler",
-                "formatter": "default",
-                "filename": str(path),
-                "maxBytes": 5 * 1024 * 1024,
-                "backupCount": 5,
-                "encoding": "utf-8",
-                "delay": True,
-            },
-        }
-    else:
-        handlers = {
-            "console": {
-                "class": "logging.StreamHandler",
-                "formatter": "default",
-            },
-        }
-
-    config: logging.config._DictConfigArgs = {
-        "version": 1,
-        "disable_existing_loggers": False,
-        "formatters": {
-            "default": {
-                "format": "%(asctime)s %(levelname)-8s %(name)s: %(message)s",
-            },
-        },
-        "handlers": handlers,
-        "loggers": {
-            "velis": {
-                "level": level,
-                "handlers": list(handlers),
-                "propagate": False,
-            },
-        },
+def _file_handler(log_file: Path) -> dict[str, object]:
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    return {
+        "class": "logging.handlers.RotatingFileHandler",
+        "formatter": "default",
+        "filename": str(log_file),
+        "maxBytes": 5 * 1024 * 1024,
+        "backupCount": 5,
+        "encoding": "utf-8",
+        "delay": True,
     }
-    logging.config.dictConfig(config)
+
+
+def _console_handler() -> dict[str, object]:
+    return {"class": "logging.StreamHandler", "formatter": "default"}
+
+
+def configure(level: str, log_file: Path, production: bool) -> None:
+    name = "file" if production else "console"
+    handler = _file_handler(log_file) if production else _console_handler()
+
+    logging.config.dictConfig(
+        {
+            "version": 1,
+            "disable_existing_loggers": False,
+            "formatters": {"default": {"format": _FORMAT}},
+            "handlers": {name: handler},
+            "loggers": {
+                "velis": {"level": level, "handlers": [name], "propagate": False},
+            },
+        }
+    )

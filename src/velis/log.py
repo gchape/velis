@@ -5,10 +5,10 @@ from pathlib import Path
 
 
 def configure(
-    level: str,
     *,
+    level: str,
+    log_file: Path,
     production: bool,
-    log_file: Path | str,
 ) -> None:
     handlers: dict[str, logging.config._HandlerConfiguration]
 

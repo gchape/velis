@@ -1,11 +1,11 @@
-import os
+from velis.log import configure
+from velis.settings import Settings
 
 
 def main() -> None:
-    from velis.log import configure
-
+    settings = Settings.from_env()
     configure(
-        os.environ.get("VELIS_LOG_LEVEL", "INFO"),
-        production=os.environ.get("VELIS_ENV") == "production",
-        log_file=os.environ.get("VELIS_LOG_FILE", "/var/log/velis/velis.log"),
+        level=settings.log_level,
+        production=settings.production,
+        log_file=settings.log_file,
     )

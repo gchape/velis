@@ -1,8 +1,6 @@
 .DEFAULT_GOAL := check
 
-.PHONY: check test lint fmt benchmark
-
-BENCHMARK_ARGS ?=
+.PHONY: check test lint fmt
 
 check: lint test
 
@@ -17,6 +15,3 @@ lint:
 fmt:
 	uv run ruff check --fix .
 	uv run ruff format .
-
-benchmark:
-	uv run python benchmarks/publish.py $(BENCHMARK_ARGS)

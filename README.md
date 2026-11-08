@@ -280,7 +280,7 @@ The key-state diagram assumes valid commands. Invalid TTL values return an error
 
 ```mermaid
 flowchart TD
-    start(["CLI starts"]) --> load["Load Config, configure logging and show banner"]
+    start(["CLI starts"]) --> load["Load Config and configure logging"]
     load --> signals["Install SIGINT and SIGTERM handlers"]
     signals --> engine["serve: create Store, Broker and Engine"]
     engine --> server["Start TcpServer with DEFAULT_PROTOCOL"]
@@ -564,7 +564,6 @@ src/velis/
   app.py — composition root: serve() owns networking and maintenance
   config.py — Config / Server, loaded from VELIS_* env vars
   errors.py — VelisError, ProtocolError, CommandError, CapacityError
-  banner.py — startup banner (honours NO_COLOR)
   validation.py — shared positive-limit validation
   core/ — no sockets, no wire format
     commands.py — Command / Reply / Message dataclasses and TTL sentinels

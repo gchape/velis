@@ -3,7 +3,6 @@ import logging.config
 import signal
 from contextlib import ExitStack
 
-from velis import banner
 from velis.app import serve
 from velis.config import Config
 
@@ -50,7 +49,6 @@ def main() -> None:
     """Load configuration, set up logging and start the server."""
     config = Config.from_env()
     configure_logging(config.log_level)
-    banner.show()
     asyncio.run(_main(config))
 
 

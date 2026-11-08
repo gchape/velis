@@ -2,16 +2,16 @@ import unittest
 from unittest.mock import patch
 
 from tests.codec.helpers import Prefix, Reverse
-from velis.codec import CodecChain
+from velis.codec import CodecChain, Identity
 
 
 class CodecChainTests(unittest.TestCase):
-    def test_empty_chain_is_identity(self) -> None:
-        chain = CodecChain.identity(bytes)
+    def test_identity_preserves_bytes(self) -> None:
+        codec = Identity()
         for data in (b"", bytes(range(256))):
             with self.subTest(data=data):
-                self.assertEqual(chain.encode(data), data)
-                self.assertEqual(chain.decode(data), data)
+                self.assertIs(codec.encode(data), data)
+                self.assertIs(codec.decode(data), data)
 
     def test_encode_order_and_reverse_decode_order(self) -> None:
         chain = CodecChain.of(Prefix()) | Reverse()
@@ -40,21 +40,17 @@ class CodecChainTests(unittest.TestCase):
         self.assertEqual(combined.encode(b"ab"), b"bax")
         self.assertEqual(combined.decode(b"bax"), b"ab")
 
-    def test_prepending_codec(self) -> None:
-        chain = Prefix() | CodecChain.of(Reverse())
+    def test_build_chain_from_identity(self) -> None:
+        chain = CodecChain.of(Identity()) | Prefix() | Reverse()
+        self.assertEqual(chain.name, "identity_testprefix_testreverse")
         self.assertEqual(chain.encode(b"ab"), b"bax")
         self.assertEqual(chain.decode(b"bax"), b"ab")
 
-    def test_build_chain_from_empty(self) -> None:
-        chain = CodecChain.identity(bytes) | Prefix() | Reverse()
-        self.assertEqual(chain.encode(b"ab"), b"bax")
-        self.assertEqual(chain.decode(b"bax"), b"ab")
-
-    def test_composition_with_empty_chain(self) -> None:
+    def test_composition_with_identity(self) -> None:
         chain = CodecChain.of(Prefix())
         for combined in (
-            chain | CodecChain.identity(bytes),
-            CodecChain.identity(bytes) | chain,
+            chain | Identity(),
+            CodecChain.of(Identity()) | chain,
         ):
             self.assertEqual(combined.encode(b"ab"), b"xab")
             self.assertEqual(combined.decode(b"xab"), b"ab")

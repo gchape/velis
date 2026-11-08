@@ -4,8 +4,6 @@ The net layer turns bytes into these and back; the Engine only ever sees
 these.
 """
 
-from __future__ import annotations
-
 from dataclasses import dataclass
 
 

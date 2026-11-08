@@ -6,36 +6,44 @@ from velis.errors import ProtocolError
 
 
 @dataclass(frozen=True, slots=True)
+class Identity:
+    name: str = "identity"
+
+    def encode(self, value: bytes) -> bytes:
+        return value
+
+    def decode(self, data: bytes) -> bytes:
+        return data
+
+
+@dataclass(frozen=True, slots=True)
 class UInt:
-    bits: int
+    """Big-endian unsigned integer of a fixed width in bytes."""
+
+    width: int
 
     def __post_init__(self) -> None:
-        if self.bits <= 0 or self.bits % 8:
-            raise ValueError("integer width must be a positive multiple of 8")
+        if self.width <= 0:
+            raise ValueError("integer width must be positive")
 
     @property
     def name(self) -> str:
-        return f"u{self.bits}"
-
-    @property
-    def width(self) -> int:
-        return self.bits // 8
+        return f"u{self.width * 8}"
 
     def encode(self, value: int) -> bytes:
-        if not isinstance(value, int) or not 0 <= value < 1 << self.bits:
-            raise ProtocolError(
-                f"unsigned {self.bits}-bit integer out of range: {value}"
-            )
-        return value.to_bytes(self.width, "big")
+        try:
+            return value.to_bytes(self.width)  # big-endian is the default
+        except OverflowError:
+            raise ProtocolError(f"{self.name} integer out of range: {value}") from None
 
     def decode(self, data: bytes) -> int:
         if len(data) != self.width:
             raise ProtocolError(f"expected {self.width} integer bytes")
-        return int.from_bytes(data, "big")
+        return int.from_bytes(data)
 
 
-U32 = UInt(32)
-U64 = UInt(64)
+U32 = UInt(4)
+U64 = UInt(8)
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,13 +52,13 @@ class Utf8:
 
     def encode(self, value: str) -> bytes:
         try:
-            return value.encode("utf-8")
+            return value.encode()
         except UnicodeEncodeError:
             raise ProtocolError("invalid utf-8 in string field") from None
 
     def decode(self, data: bytes) -> str:
         try:
-            return data.decode("utf-8")
+            return data.decode()
         except UnicodeDecodeError:
             raise ProtocolError("invalid utf-8 in string field") from None
 
@@ -63,7 +71,7 @@ class LengthPrefix:
     name: str = "length"
 
     def __post_init__(self) -> None:
-        if not 0 <= self.max_length < 1 << 32:
+        if not 0 <= self.max_length < 1 << (U32.width * 8):
             raise ValueError("length limit must fit an unsigned 32-bit integer")
 
     def check_length(self, length: int) -> None:

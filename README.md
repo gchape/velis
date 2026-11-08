@@ -96,7 +96,7 @@ flowchart TB
 
     subgraph codecs ["velis.codec"]
         chain["CodecChain<br/>typed composition"]
-        stages["Validate, TaggedCodec, Utf8,<br/>UInt and LengthPrefix"]
+        stages["Validate, Utf8,<br/>UInt and LengthPrefix"]
     end
 
     subgraph core ["velis.core: no sockets or wire format"]
@@ -121,7 +121,7 @@ flowchart TB
 
 The diagram shows runtime calls and codec usage; each peer uses its own configured wire protocol. `Broker` calls the structural `Subscriber` interface, so it has no dependency on the concrete `Connection` class.
 
-`Client` owns the user-facing command API, payload codecs and error translation. It delegates request ordering, message buffering and connection shutdown to a `Session`. The built-in `TcpSession` implements that interface over the wire protocol. Payload codecs can be individual `Codec[bytes, bytes]` objects or composed `CodecChain[bytes, bytes]` instances. The default is an identity chain.
+`Client` owns the user-facing command API, payload codecs and error translation. It delegates request ordering, message buffering and connection shutdown to a `Session`. The built-in `TcpSession` implements that interface over the wire protocol. Payload codecs can be individual `Codec[bytes, bytes]` objects or composed `CodecChain[bytes, bytes]` instances. The default is `Identity()`, which returns bytes unchanged.
 
 `Client.connect()` creates the TCP session for you. To supply a different transport, use `Client(session, codec)` with an object implementing `request(command)`, `next_message()` and `close()`. For existing asyncio streams, construct `Client(TcpSession(reader, writer), codec)`. Sessions exchange command/reply dataclasses containing payload-encoded bytes; the client applies codecs and translates `Err` replies into `CommandError`.
 
@@ -133,7 +133,7 @@ async def read_greeting() -> bytes | None:
         return await client.get("greeting")
 ```
 
-Requests and replies are plain frozen dataclasses (`velis.core.commands`). `net/protocol.py` defines `COMMANDS` and `FRAMES` codec chains using shared tagged-record schemas. `WireProtocol` appends bounded length framing and adapts the chains to asynchronous TCP reads. The convenience functions `encode_command`, `encode_reply`, `encode_message`, `read_command` and `read_frame` use `DEFAULT_PROTOCOL`. `Engine.execute` handles each command the same way: **validate, apply, reply.**
+Requests and replies are plain frozen dataclasses (`velis.core.commands`). `net/protocol.py` defines `CommandCodec` and `FrameCodec` to encode and decode message tags and fields. `WireProtocol` appends bounded length framing for encoding. Its asynchronous readers validate the outer length, read the body and decode it directly. Use `DEFAULT_PROTOCOL.commands.encode(command)`, `DEFAULT_PROTOCOL.frames.encode(frame)` and the protocol object's `read_command()` / `read_frame()` methods. `Engine.execute` handles each command the same way: **validate, apply, reply.**
 
 ### Request lifecycle
 
@@ -275,7 +275,7 @@ One task sweeps expired keys every `VELIS_SWEEP_MS`. Each sweep processes at mos
 
 ## Wire protocol
 
-The following tables describe the default body codecs (`COMMANDS` and `FRAMES`). Integers use big-endian byte order. A **string** or **bytes** field is `u32 length` followed by that many bytes (strings are UTF-8). Encoders and receivers reject string and bytes fields larger than 1 MiB; the limit includes any expansion from client-side codecs. Every request, reply and push has an **outer u32 body length** followed by exactly that many bytes. The default outer limit is 8 MiB, checked before reading the body; field limits also apply after body decoding. This is a breaking change from the earlier unframed protocol: update both peers together.
+The following tables describe the default body codecs (`CommandCodec` and `FrameCodec`). Integers use big-endian byte order. A **string** or **bytes** field is `u32 length` followed by that many bytes (strings are UTF-8). Values, publication payloads and general text fields are capped at 1 MiB; the limit includes any expansion from client-side codecs. Command, reply and push tags are capped at 32 bytes. Every request, reply and push has an **outer u32 body length** followed by exactly that many bytes. The default outer limit is 2 MiB, checked before reading the body. Field byte limits are checked before UTF-8 decoding. This is a breaking change from the earlier unframed protocol: update both peers together.
 
 **Requests**
 
@@ -289,6 +289,8 @@ The following tables describe the default body codecs (`COMMANDS` and `FRAMES`).
 | `PUBLISH` | `channel: str`, `payload: bytes` | `DELIVERED` |
 
 Inside the outer frame, a request is the command name as a string followed by its fields.
+
+Request keys contain 1–512 characters and request channels contain 1–256 characters. Their UTF-8 byte lengths are capped at 2,048 and 1,024 bytes respectively, allowing four bytes per character. These byte limits are checked before UTF-8 decoding, then the character rules run on the decoded strings. The character rules also run before sending; whitespace and control characters are allowed. Reply and push channels retain the existing UTF-8 and 1 MiB field size checks.
 
 **Replies and pushes**
 
@@ -352,7 +354,7 @@ class Codec[T, Encoded](Protocol):
     def decode(self, data: Encoded, /) -> T: ...
 ```
 
-Codecs are combined into a `CodecChain` with `|`. Encoding runs the codecs left to right, and decoding runs them right to left. The chain's name is the codec names joined with `_`. Combining chains preserves the written order and flattens their steps. Adjacent stages must have compatible types; the type checker rejects mismatches. Chain composition does not inspect Python annotations or enforce those types at runtime. `CodecChain.identity(bytes)` (or another type) creates an empty identity chain. Start a nonempty chain with `CodecChain.of(first)` and append stages using `|`. Codec exceptions propagate and stop processing.
+Codecs are combined into a `CodecChain` with `|`. Encoding runs the codecs left to right, and decoding runs them right to left. The chain's name is the codec names joined with `_`. Combining chains preserves the written order and flattens their steps. Adjacent stages must have compatible types; the type checker rejects mismatches. Chain composition does not inspect Python annotations or enforce those types at runtime. `Identity()` is a byte codec that returns its input unchanged in both directions. Start a chain with `CodecChain.of(first)` and append stages using `|`, including `Identity()` when needed. Codec exceptions propagate and stop processing.
 
 ```python
 import base64
@@ -403,7 +405,7 @@ Readers of a key and subscribers to a channel must use the same codec chain as t
 
 ### Typed representations and rules
 
-Built-in `Utf8`, `UInt(bits)` and `LengthPrefix(max_length)` codecs can be composed directly:
+Built-in `Utf8`, `UInt(width)` and `LengthPrefix(max_length)` codecs can be composed directly:
 
 ```python
 from velis.codec import CodecChain, LengthPrefix, Utf8, Validate
@@ -423,36 +425,39 @@ assert text.decode(text.encode("hello")) == "hello"
 
 ### Composing the wire protocol
 
-`COMMANDS` is `CodecChain[Command, bytes]`; `FRAMES` is `CodecChain[Reply | Message, bytes]`. Both use `Field`, `Record` and `TaggedCodec` from `velis.codec.records` so field order and codecs are defined once for both directions. Variable-width fields include a u32 length prefix; fixed-width fields declare their width explicitly. Record constructors receive keyword arguments by field name, so wire order can differ from constructor order and keyword-only dataclasses work. Duplicate field names, record tags and record types are rejected when defining a schema.
+`CommandCodec` encodes and decodes `Command` values; `FrameCodec` handles `Reply | Message` values. They match message types and tags explicitly, composing field codecs for text, bytes and unsigned integers. `Cursor` reads fields sequentially and rejects truncated records; body decoders reject unknown tags and trailing bytes. `UInt(width)` takes a positive width in bytes, such as `UInt(4)` for a u32.
+
+The `KEY` and `CHANNEL` chains in `net/protocol.py` apply the request name rules through `Validate`: before encoding on the client and after length and UTF-8 decoding on the server. Custom wire codecs define their own validation; direct core calls and sessions that bypass these codecs do not apply the wire name rules. A local name validation error raises `ProtocolError` before sending and leaves the connection usable; malformed names received by the server produce `ERR` and close the connection. Engine errors such as an invalid TTL continue to raise `CommandError` and leave the connection open.
 
 ```python
 from velis.codec import CodecChain, Validate
 from velis.core.commands import Command, Get
 from velis.errors import ProtocolError
-from velis.net.protocol import COMMANDS, FRAMES, WireProtocol
+from velis.net.protocol import CommandCodec, FrameCodec, WireProtocol
 
 
 def check_command(command: Command) -> None:
-    if isinstance(command, Get) and not command.key:
-        raise ProtocolError("GET requires a nonempty key")
+    if isinstance(command, Get) and command.key.startswith("private:"):
+        raise ProtocolError("GET cannot read private keys")
 
 
 wire = WireProtocol(
-    command_codec=CodecChain.of(Validate("commandrules", check_command)) | COMMANDS,
-    frame_codec=FRAMES,
+    command_codec=CodecChain.of(Validate("commandrules", check_command))
+    | CommandCodec(),
+    frame_codec=FrameCodec(),
 )
 ```
 
-Pass `wire=wire` to `serve(config, ...)` or `TcpServer(engine, config.server, ...)`, and to `Client.connect(...)`, `TcpSession.connect(...)` or `TcpSession(reader, writer, ...)`. `WireProtocol.commands` and `.frames` are the complete chains including outer framing. You can also round-trip records synchronously with those chains.
+Pass `wire=wire` to `serve(config, ...)` or `TcpServer(engine, config.server, ...)`, and to `Client.connect(...)`, `TcpSession.connect(...)` or `TcpSession(reader, writer, ...)`. `WireProtocol.commands` and `.frames` are cached complete chains including outer framing. You can round-trip records synchronously with those chains; asynchronous reads validate the length prefix separately and decode the body without rebuilding or slicing off its header.
 
-The full command chain has the following shape; `FRAMES` uses the same framing for replies and pushes:
+The full command chain has the following shape; `FrameCodec` uses the same framing for replies and pushes:
 
 ```mermaid
 flowchart LR
     command["Command dataclass"] -->|"encode"| rule["Optional Validate rule"]
-    rule --> schema["COMMANDS<br/>tag and field codecs"]
-    schema --> transform["Optional bytes-to-bytes transforms"]
-    transform --> framing["LengthPrefix<br/>8 MiB body limit by default"]
+    rule --> body["CommandCodec<br/>tag and field codecs"]
+    body --> transform["Optional bytes-to-bytes transforms"]
+    transform --> framing["LengthPrefix<br/>2 MiB body limit by default"]
     framing --> tcp["TCP message bytes"]
 ```
 
@@ -474,33 +479,13 @@ async def with_custom_wire() -> None:
             assert await client.get("greeting") == b"hello"
 ```
 
-Set `WireProtocol(framing=LengthPrefix(max_length))` to change the outer body limit. This limit is independent of `VELIS_MAX_BUFFER` and the client queue limits; all default wire string/bytes fields still have the 1 MiB limit.
+Set `WireProtocol(framing=LengthPrefix(max_length))` to change the outer body limit. This limit is independent of `VELIS_MAX_BUFFER` and the client queue limits; the default body codecs retain their field limits for tags, request names, payloads and general text.
 
-Append byte transforms to the body chains, for example `COMMANDS | Deflate()` and `FRAMES | Deflate()` using the example codec above. `WireProtocol` always appends the outer length prefix last, allowing TCP to read one complete body before reversing the transformations. Both peers must agree on representations; there is no codec negotiation. The minimal `Deflate` example needs additional handling for use on the wire: custom wire codecs must raise `ProtocolError` for malformed input, bound any decompressed output themselves, and be safe to share across connections.
+Append byte transforms to the body chains, for example `CodecChain.of(CommandCodec()) | Deflate()` and `CodecChain.of(FrameCodec()) | Deflate()` using the example codec above. `WireProtocol` always appends the outer length prefix last, allowing TCP to read one complete body before reversing the transformations. Both peers must agree on representations; there is no codec negotiation. The minimal `Deflate` example needs additional handling for use on the wire: custom wire codecs must raise `ProtocolError` for malformed input, bound any decompressed output themselves, and be safe to share across connections.
 
 Wire rules validate representations and decoded commands. Stateful command semantics and access policies belong in the engine or a command validation layer, where they also apply to non-TCP sessions. Payload codecs configured with `codec=` remain independent from wire codecs configured with `wire=`.
 
-Migration from the earlier API: use `Codec[T, Encoded]` and `CodecChain[T, Encoded]` in annotations, replace `CodecChain()` with `CodecChain.identity(bytes)`, and replace `CodecChain.of(a, b)` with `CodecChain.of(a) | b`. The old `protocol.message` alias has been removed; use `encode_message`.
-
-### Registering a chain as a Python codec
-
-`register` accepts a `CodecChain[bytes, bytes]` and makes it available to the standard `str.encode` and `bytes.decode` under the chain's name. Text is encoded with the given text encoding (default `utf-8`) before the chain runs, and decoded after it on the way back.
-
-```python
-from velis.codec import register, unregister
-
-register(chain)  # or register(chain, encoding="latin-1")
-
-blob = "hello".encode("deflate_b64")
-blob.decode("deflate_b64")  # "hello"
-
-unregister("deflate_b64")  # mainly useful in tests
-```
-
-Notes:
-
-* Registering an empty chain, a chain whose name is not lowercase `a-z0-9` words joined by `_`, or a name already taken (including a built-in Python codec such as `zlib` or `base64`) raises `ValueError`.
-* Importing `velis.codec` leaves Python's global codec registry unchanged. The first `register()` call installs the lookup function; unregistering the final chain removes it. These explicit operations modify process-wide state.
+Migration from the earlier API: use `Codec[T, Encoded]` and `CodecChain[T, Encoded]` in annotations, use `Identity()` for a byte passthrough codec, and replace `CodecChain.of(a, b)` with `CodecChain.of(a) | b`. Use byte widths for `UInt`, such as `UInt(4)` in place of `UInt(32)`. Replace `COMMANDS` and `FRAMES` with `CommandCodec()` and `FrameCodec()`, wrapping them in `CodecChain.of(...)` before appending transforms. Module-level wire wrappers have been removed: use `DEFAULT_PROTOCOL.commands.encode(command)`, `DEFAULT_PROTOCOL.frames.encode(reply_or_message)` and `DEFAULT_PROTOCOL.read_command(reader)` / `read_frame(reader)`.
 
 ---
 
@@ -518,23 +503,22 @@ src/velis/
     engine.py        # validate -> apply -> reply
     store.py         # key/value map, TTL heap
     broker.py        # pub-sub over the Subscriber protocol
-    clock.py         # Clock protocol and monotonic SystemClock
+    clock.py         # structural Clock protocol and monotonic SystemClock
   net/
-    protocol.py      # command/frame schemas, wire chains and TCP framing
+    protocol.py      # command/frame codecs, name rules and TCP framing
     connection.py    # server-side wire I/O and Subscriber push buffering
     server.py        # TcpServer
     client.py        # command API, codecs, error translation and scoped cleanup
     session.py       # Session interface and TCP request/message lifecycle
   codec/
     chain.py         # typed Codec protocol and CodecChain
-    binary.py        # UTF-8, unsigned integers and length framing
-    records.py       # shared tagged-record field schemas
+    binary.py        # Identity, UTF-8, unsigned integers and length framing
+    cursor.py        # sequential bounded reads of binary fields
     rules.py         # bidirectional Validate stages
-    registry.py      # register chains as Python text codecs
 tests/
   helpers.py         # ManualClock and RecordingSubscriber test helpers
   app/               # runtime cleanup and CLI signal ownership
-  codec/             # typed composition, rules, binary codecs and registration
+  codec/             # typed composition, rules and binary codecs
   core/              # store, engine, broker and cache lifetime
   net/               # protocol, client lifecycle and TCP integration tests
 ```

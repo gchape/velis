@@ -2,7 +2,7 @@ import unittest
 from typing import assert_type
 
 from tests.codec.helpers import Reverse
-from velis.codec import CodecChain, LengthPrefix, UInt, Utf8, Validate
+from velis.codec import CodecChain, Identity, LengthPrefix, UInt, Utf8, Validate
 from velis.errors import ProtocolError
 
 
@@ -14,14 +14,13 @@ class BinaryCodecTests(unittest.TestCase):
         self.assertEqual(chain.decode(chain.encode("ქართული")), "ქართული")
         assert_type(chain.decode(b"\x00\x00\x00\x00"), str)
 
-    def test_typed_chain_prepend_and_identity(self) -> None:
-        chain = Utf8() | CodecChain.of(Reverse())
+    def test_typed_chain_composition_and_identity(self) -> None:
+        chain = CodecChain.of(Utf8()) | CodecChain.of(Reverse())
         assert_type(chain, CodecChain[str, bytes])
-        wrapped = CodecChain.identity(str) | chain | CodecChain.identity(bytes)
+        wrapped = chain | Identity()
         assert_type(wrapped, CodecChain[str, bytes])
-        self.assertEqual(wrapped.codecs, chain.codecs)
         self.assertEqual(wrapped.decode(wrapped.encode("hello")), "hello")
-        self.assertEqual(CodecChain.of(wrapped).codecs, chain.codecs)
+        self.assertEqual(CodecChain.of(wrapped).codecs, wrapped.codecs)
 
     def test_rules_validate_both_directions_at_their_position(self) -> None:
         def nonempty(value: str) -> None:
@@ -37,19 +36,24 @@ class BinaryCodecTests(unittest.TestCase):
             chain.decode(b"")
 
     def test_unsigned_integer_boundaries_and_exact_width(self) -> None:
-        for bits in (8, 32, 64):
-            codec = UInt(bits)
+        for width in (1, 3, 4, 8):
+            codec = UInt(width)
+            bits = width * 8
+            self.assertEqual(codec.name, f"u{bits}")
             for value in (0, (1 << bits) - 1):
-                self.assertEqual(codec.decode(codec.encode(value)), value)
+                encoded = codec.encode(value)
+                self.assertEqual(len(encoded), width)
+                self.assertEqual(codec.decode(encoded), value)
+            self.assertEqual(codec.encode(1), b"\x00" * (width - 1) + b"\x01")
             for value in (-1, 1 << bits):
                 with self.assertRaises(ProtocolError):
                     codec.encode(value)
-            for data in (b"", b"\x00" * (bits // 8 + 1)):
+            for data in (b"", b"\x00" * (width - 1), b"\x00" * (width + 1)):
                 with self.assertRaises(ProtocolError):
                     codec.decode(data)
-        for bits in (0, -8, 7):
+        for width in (0, -1):
             with self.assertRaises(ValueError):
-                UInt(bits)
+                UInt(width)
 
     def test_length_prefix_limits_and_malformed_bodies(self) -> None:
         codec = LengthPrefix(3)

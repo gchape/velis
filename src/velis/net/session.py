@@ -1,7 +1,5 @@
 """Transport sessions for serialized commands and asynchronous server messages."""
 
-from __future__ import annotations
-
 import asyncio
 import contextlib
 from typing import Protocol
@@ -92,7 +90,7 @@ class TcpSession:
     async def _receive_frames(self) -> None:
         """Split the incoming stream into replies and server pushes."""
         try:
-            while True:
+            while not self._closed:
                 frame = await self._wire.read_frame(self._reader)
                 if isinstance(frame, Message):
                     self._enqueue_message(frame)
@@ -109,7 +107,8 @@ class TcpSession:
         """Buffer a publication within the message count and byte limits."""
         size = self._message_size(message)
         if self._messages.full() or self._queued_bytes + size > self._max_pending_bytes:
-            raise ProtocolError("pending message buffer limit exceeded")
+            self._begin_close("pending message buffer limit exceeded")
+            return
         self._messages.put_nowait(message)
         self._queued_bytes += size
 

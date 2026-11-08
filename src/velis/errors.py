@@ -3,7 +3,11 @@ class VelisError(Exception):
 
 
 class ProtocolError(VelisError):
-    """The byte stream is malformed or desynced; reply ERR, then close."""
+    """A value or byte stream violates the configured wire representation.
+
+    Invalid outgoing values fail before writing and leave the stream usable.
+    Invalid incoming data requires closing the stream; servers first try ERR.
+    """
 
 
 class CommandError(VelisError):

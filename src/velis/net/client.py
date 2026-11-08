@@ -1,8 +1,7 @@
-from __future__ import annotations
-
 from types import TracebackType
+from typing import final
 
-from velis.codec import Codec, CodecChain
+from velis.codec import Codec, Identity
 from velis.core.commands import (
     Command,
     Delivered,
@@ -26,6 +25,7 @@ from velis.net.protocol import DEFAULT_PROTOCOL, WireProtocol
 from velis.net.session import Session, TcpSession
 
 
+@final
 class Client:
     """Typed cache and pub-sub API over an owned session and a byte codec."""
 
@@ -33,9 +33,7 @@ class Client:
         self, session: Session, codec: Codec[bytes, bytes] | None = None
     ) -> None:
         self._session = session
-        self._codec: Codec[bytes, bytes] = (
-            CodecChain.identity(bytes) if codec is None else codec
-        )
+        self._codec: Codec[bytes, bytes] = Identity() if codec is None else codec
 
     @classmethod
     async def connect(
@@ -56,11 +54,7 @@ class Client:
             max_pending_messages=max_pending_messages,
             max_pending_bytes=max_pending_bytes,
         )
-        try:
-            return cls(session, codec)
-        except Exception:
-            await session.close()
-            raise
+        return cls(session, codec)
 
     async def __aenter__(self) -> Client:
         """Use this client within an owned asynchronous resource scope."""

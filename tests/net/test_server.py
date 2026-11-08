@@ -5,7 +5,7 @@ import unittest
 from tests.codec.helpers import Reverse
 from tests.helpers import ManualClock
 from velis.app import serve
-from velis.codec import CodecChain, Validate
+from velis.codec import Codec, CodecChain, Validate
 from velis.config import Config
 from velis.config import Server as ServerConfig
 from velis.core.broker import Broker
@@ -25,7 +25,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         await self.server.start()
         self.addAsyncCleanup(self.server.close)
 
-    async def client(self, codec: CodecChain[bytes, bytes] | None = None) -> Client:
+    async def client(self, codec: Codec[bytes, bytes] | None = None) -> Client:
         c = await Client.connect("127.0.0.1", self.server.port, codec)
         self.addAsyncCleanup(c.close)
         return c
@@ -37,6 +37,28 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await c.expire("k", 60_000))
         self.assertFalse(await c.expire("missing", 1))
         self.assertIsNone(await c.get("missing"))
+
+    async def test_invalid_name_rejected_locally_keeps_connection_usable(self) -> None:
+        client = await self.client()
+        await client.set("k", b"v")
+        with self.assertRaisesRegex(ProtocolError, "key must not be empty"):
+            await client.get("")
+        self.assertEqual(await client.get("k"), b"v")
+
+    async def test_empty_key_from_raw_socket_gets_err_then_eof(self) -> None:
+        reader, writer = await asyncio.open_connection("127.0.0.1", self.server.port)
+        try:
+            body = protocol.TEXT.encode("GET") + struct.pack(">I", 0)
+            writer.write(protocol.DEFAULT_PROTOCOL.framing.encode(body))
+            async with asyncio.timeout(1):
+                self.assertEqual(
+                    await protocol.DEFAULT_PROTOCOL.read_frame(reader),
+                    Err("key must not be empty"),
+                )
+                self.assertEqual(await reader.read(), b"")
+        finally:
+            writer.close()
+            await writer.wait_closed()
 
     async def test_pubsub(self) -> None:
         sub, pub = await self.client(), await self.client()
@@ -76,7 +98,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         writer.write(
             protocol.DEFAULT_PROTOCOL.framing.encode(struct.pack(">I", 4) + b"NOPE")
         )
-        frame = await asyncio.wait_for(protocol.read_frame(reader), 1)
+        frame = await asyncio.wait_for(protocol.DEFAULT_PROTOCOL.read_frame(reader), 1)
         self.assertEqual(frame, Err("unknown command: 'NOPE'"))
         self.assertEqual(await asyncio.wait_for(reader.read(), 1), b"")
         writer.close()
@@ -93,7 +115,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_codec_lives_on_the_client(self) -> None:
         """The server stores opaque bytes while the client applies its codec."""
-        coded = await self.client(CodecChain.of(Reverse()))
+        coded = await self.client(Reverse())
         raw = await self.client()
         await coded.set("k", b"abc")
         self.assertEqual(await raw.get("k"), b"cba")
@@ -103,8 +125,8 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         wire = protocol.WireProtocol(
-            command_codec=protocol.COMMANDS | Reverse(),
-            frame_codec=protocol.FRAMES | Reverse(),
+            command_codec=CodecChain.of(protocol.CommandCodec()) | Reverse(),
+            frame_codec=CodecChain.of(protocol.FrameCodec()) | Reverse(),
         )
         store = Store()
         server = TcpServer(
@@ -133,7 +155,8 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
                 raise ProtocolError("blocked key")
 
         wire = protocol.WireProtocol(
-            command_codec=CodecChain.of(Validate("allowed", allow)) | protocol.COMMANDS,
+            command_codec=CodecChain.of(Validate("allowed", allow))
+            | protocol.CommandCodec(),
         )
         async with await Client.connect(
             "127.0.0.1", self.server.port, wire=wire
@@ -149,15 +172,16 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
                 raise ProtocolError("blocked key")
 
         wire = protocol.WireProtocol(
-            command_codec=CodecChain.of(Validate("allowed", allow)) | protocol.COMMANDS,
-            frame_codec=protocol.FRAMES | Reverse(),
+            command_codec=CodecChain.of(Validate("allowed", allow))
+            | protocol.CommandCodec(),
+            frame_codec=CodecChain.of(protocol.FrameCodec()) | Reverse(),
         )
         server = TcpServer(self.engine, ServerConfig("127.0.0.1", 0), wire=wire)
         await server.start()
         self.addAsyncCleanup(server.close)
         reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
         try:
-            writer.write(protocol.encode_command(Get("blocked")))
+            writer.write(protocol.DEFAULT_PROTOCOL.commands.encode(Get("blocked")))
             async with asyncio.timeout(1):
                 self.assertEqual(await wire.read_frame(reader), Err("blocked key"))
                 self.assertEqual(await reader.read(), b"")
@@ -187,8 +211,8 @@ class RuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_runtime_scope_serves_and_closes_live_connections(self) -> None:
         config = Config("INFO", ServerConfig("127.0.0.1", 0))
         wire = protocol.WireProtocol(
-            command_codec=protocol.COMMANDS | Reverse(),
-            frame_codec=protocol.FRAMES | Reverse(),
+            command_codec=CodecChain.of(protocol.CommandCodec()) | Reverse(),
+            frame_codec=CodecChain.of(protocol.FrameCodec()) | Reverse(),
         )
         async with serve(config, wire=wire) as server:
             client = await Client.connect("127.0.0.1", server.port, wire=wire)

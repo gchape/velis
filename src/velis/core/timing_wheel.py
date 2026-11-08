@@ -2,6 +2,7 @@
 
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 _BITS = 6
 _SLOTS = 1 << _BITS
@@ -12,11 +13,10 @@ _MASK = _SLOTS - 1
 class _Bucket:
     level: int
     slot: int
-    keys: OrderedDict[str, None] = field(default_factory=OrderedDict)
+    keys: dict[str, None] = field(default_factory=dict)
 
 
-@dataclass(frozen=True, slots=True)
-class _Timer:
+class _Timer(NamedTuple):
     deadline: int
     bucket: _Bucket
 
@@ -31,6 +31,7 @@ class TimingWheel:
 
     Each key has one timer. Rescheduling and cancellation unlink it immediately,
     including from partly drained buckets, without stale entries or compaction.
+    Keys that share a bucket are processed in unspecified (LIFO) order.
     """
 
     def __init__(self, now: int = 0) -> None:
@@ -61,32 +62,33 @@ class TimingWheel:
             self._ready[bucket] = None
         else:
             level = (delta.bit_length() - 1) // _BITS
-            while len(self._wheel) <= level:
-                self._wheel.append({})
+            if level >= len(self._wheel):
+                self._wheel.extend({} for _ in range(level + 1 - len(self._wheel)))
             slot = (deadline >> (level * _BITS)) & _MASK
-            bucket = self._wheel[level].get(slot)
+            slots = self._wheel[level]
+            bucket = slots.get(slot)
             if bucket is None:
-                bucket = self._wheel[level][slot] = _Bucket(level, slot)
+                bucket = slots[slot] = _Bucket(level, slot)
         bucket.keys[key] = None
         self._timers[key] = _Timer(deadline, bucket)
 
-    def _unlink(self, key: str, timer: _Timer) -> None:
-        """Unlink a timer and release its bucket when it becomes empty."""
-        bucket = timer.bucket
-        del bucket.keys[key]
-        if not bucket.keys:
-            self._ready.pop(bucket, None)
-            if bucket.level >= 0:
-                slots = self._wheel[bucket.level]
-                if slots.get(bucket.slot) is bucket:
-                    del slots[bucket.slot]
+    def _release(self, bucket: _Bucket) -> None:
+        """Drop a bucket from the ready queue and wheel once it is empty."""
+        if bucket.keys:
+            return
+        self._ready.pop(bucket, None)
+        if bucket.level >= 0:
+            slots = self._wheel[bucket.level]
+            if slots.get(bucket.slot) is bucket:
+                del slots[bucket.slot]
 
     def clear(self, key: str) -> bool:
         """Cancel a timer immediately and return whether it existed."""
         timer = self._timers.pop(key, None)
         if timer is None:
             return False
-        self._unlink(key, timer)
+        del timer.bucket.keys[key]
+        self._release(timer.bucket)
         return True
 
     def _advance(self, now: int) -> None:
@@ -117,16 +119,15 @@ class TimingWheel:
     def pop_due(self, now: int, limit: int) -> list[str]:
         """Process at most limit timers, counting both expiration and cascading."""
         self._advance(now)
-        due = []
-        for _ in range(limit):
-            if not self._ready:
-                break
+        due: list[str] = []
+        while limit > 0 and self._ready:
+            limit -= 1
             bucket = next(iter(self._ready))
-            key = next(iter(bucket.keys))
-            timer = self._timers.pop(key)
-            self._unlink(key, timer)
-            if timer.deadline <= self._now:
+            key, _ = bucket.keys.popitem()
+            deadline = self._timers.pop(key).deadline
+            self._release(bucket)
+            if deadline <= self._now:
                 due.append(key)
             else:
-                self._schedule(key, timer.deadline)
+                self._schedule(key, deadline)
         return due

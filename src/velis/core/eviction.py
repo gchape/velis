@@ -1,7 +1,7 @@
 """Key ordering only; Store owns values, capacity and removal."""
 
-from collections import OrderedDict
-from dataclasses import dataclass
+import random
+from collections import OrderedDict, defaultdict
 from typing import Protocol
 
 
@@ -27,63 +27,80 @@ class Lru:
         self._order.pop(key, None)
 
     def victim(self) -> str:
+        assert self._order, "cannot evict from an empty store"
         return next(iter(self._order))
 
 
-@dataclass(slots=True, eq=False)
-class _Node:
-    key: str
-    newer: _Node | None = None
-    older: _Node | None = None
-    visited: bool = False
-
-
-class Sieve:
-    """Insertion order and a moving hand; hits only mark a visited bit.
-
-    The hand scans from older to newer entries, clearing visited bits until
-    it finds an unvisited victim. Store removes that key through discard().
-    Algorithm: https://www.usenix.org/conference/nsdi24/presentation/zhang-yazhuo
-    """
+class Fifo:
+    """Evict the oldest inserted key; hits change nothing."""
 
     def __init__(self) -> None:
-        self._nodes: dict[str, _Node] = {}
-        self._head: _Node | None = None
-        self._tail: _Node | None = None
-        self._hand: _Node | None = None
+        self._order: OrderedDict[str, None] = OrderedDict()
 
     def access(self, key: str) -> None:
-        if (node := self._nodes.get(key)) is not None:
-            node.visited = True
-            return
-        node = _Node(key, older=self._head)
-        if self._head is not None:
-            self._head.newer = node
-        else:
-            self._tail = node
-        self._head = self._nodes[key] = node
+        self._order.setdefault(key, None)
 
     def discard(self, key: str) -> None:
-        node = self._nodes.pop(key, None)
-        if node is None:
-            return
-        if self._hand is node:
-            self._hand = node.newer
-        if node.newer is None:
-            self._head = node.older
-        else:
-            node.newer.older = node.older
-        if node.older is None:
-            self._tail = node.newer
-        else:
-            node.older.newer = node.newer
+        self._order.pop(key, None)
 
     def victim(self) -> str:
-        node = self._hand or self._tail
-        assert node is not None, "cannot evict from an empty store"
-        while node.visited:
-            node.visited = False
-            node = node.newer or self._tail
-            assert node is not None
-        self._hand = node.newer
-        return node.key
+        assert self._order, "cannot evict from an empty store"
+        return next(iter(self._order))
+
+
+class Lfu:
+    """Evict the least frequently used key; ties go to the least recently used."""
+
+    def __init__(self) -> None:
+        self._freq: dict[str, int] = {}
+        self._buckets: defaultdict[int, OrderedDict[str, None]] = defaultdict(
+            OrderedDict
+        )
+
+    def access(self, key: str) -> None:
+        f = self._freq.get(key, 0)
+        if f:
+            self._remove(key, f)
+        self._freq[key] = f + 1
+        self._buckets[f + 1][key] = None
+
+    def discard(self, key: str) -> None:
+        if (f := self._freq.get(key)) is not None:
+            self._remove(key, f)
+
+    def victim(self) -> str:
+        assert self._buckets, "cannot evict from an empty store"
+        return next(iter(self._buckets[min(self._buckets)]))
+
+    def _remove(self, key: str, f: int) -> None:
+        bucket = self._buckets[f]
+        del bucket[key]
+        if not bucket:
+            del self._buckets[f]
+        del self._freq[key]
+
+
+class Random:
+    """Evict a uniformly random key; O(1) via swap-remove."""
+
+    def __init__(self, seed: int | None = None) -> None:
+        self._keys: list[str] = []
+        self._index: dict[str, int] = {}
+        self._rng = random.Random(seed)
+
+    def access(self, key: str) -> None:
+        if key not in self._index:
+            self._index[key] = len(self._keys)
+            self._keys.append(key)
+
+    def discard(self, key: str) -> None:
+        if (i := self._index.pop(key, None)) is None:
+            return
+        last = self._keys.pop()
+        if i < len(self._keys):
+            self._keys[i] = last
+            self._index[last] = i
+
+    def victim(self) -> str:
+        assert self._keys, "cannot evict from an empty store"
+        return self._rng.choice(self._keys)

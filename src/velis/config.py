@@ -27,8 +27,8 @@ def _env_int(name: str, default: int) -> int:
         return default
     try:
         return int(raw)
-    except ValueError:
-        raise ValueError(f"{name} must be an integer, got {raw!r}") from None
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
 
 
 def _env_policy(name: str, default: EvictionPolicy) -> EvictionPolicy:
@@ -36,9 +36,9 @@ def _env_policy(name: str, default: EvictionPolicy) -> EvictionPolicy:
     raw = os.environ.get(name, default)
     try:
         return EvictionPolicy(raw)
-    except ValueError:
+    except ValueError as exc:
         choices = ", ".join(EvictionPolicy)
-        raise ValueError(f"{name} must be one of {choices}, got {raw!r}") from None
+        raise ValueError(f"{name} must be one of {choices}, got {raw!r}") from exc
 
 
 @dataclass(frozen=True, slots=True)

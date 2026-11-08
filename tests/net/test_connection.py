@@ -2,14 +2,52 @@ import asyncio
 import unittest
 from unittest.mock import Mock
 
+from tests.codec.helpers import Reverse
 from tests.helpers import RecordingSubscriber
+from velis.codec import CodecChain
 from velis.core.broker import Broker
+from velis.core.commands import Message
 from velis.errors import ProtocolError
 from velis.net import protocol
-from velis.net.connection import Connection
+from velis.net.connection import Connection, share_message_encodings
 
 
 class ConnectionDeliveryTests(unittest.TestCase):
+    def test_publish_reuses_encoding_per_wire_and_releases_cache_after_dispatch(
+        self,
+    ) -> None:
+        for transformed in (False, True):
+            with self.subTest(transformed=transformed):
+                codec = Mock(wraps=protocol.FrameCodec())
+                wire = protocol.WireProtocol(frame_codec=codec)
+                if transformed:
+                    wire = protocol.WireProtocol(
+                        frame_codec=CodecChain.of(codec) | Reverse()
+                    )
+                other_codec = Mock(wraps=protocol.FrameCodec())
+                other_wire = protocol.WireProtocol(frame_codec=other_codec)
+                first = Connection(Mock(), self.writer, 16, wire=wire)
+                second = Connection(Mock(), self.writer, 16, wire=wire)
+                third = Connection(Mock(), self.writer, 16, wire=other_wire)
+                for expected_calls in (1, 2):
+                    self.writer.write.reset_mock()
+                    with share_message_encodings():
+                        self.assertTrue(first.send("news", b"hello"))
+                        self.assertTrue(second.send("news", b"hello"))
+                        self.assertTrue(third.send("news", b"hello"))
+                    self.assertEqual(codec.encode.call_count, expected_calls)
+                    self.assertEqual(other_codec.encode.call_count, expected_calls)
+                    first_data, second_data, third_data = (
+                        call.args[0] for call in self.writer.write.call_args_list
+                    )
+                    self.assertIs(first_data, second_data)
+                    self.assertEqual(
+                        wire.frames.decode(first_data), Message("news", b"hello")
+                    )
+                    self.assertEqual(
+                        other_wire.frames.decode(third_data), Message("news", b"hello")
+                    )
+
     def setUp(self) -> None:
         self.writer = Mock(spec=asyncio.StreamWriter)
         self.writer.is_closing.return_value = False

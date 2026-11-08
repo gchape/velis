@@ -1,8 +1,28 @@
 import asyncio
 import contextlib
+from collections.abc import Generator
+from contextvars import ContextVar
 
 from velis.core.commands import Command, Message, Reply
 from velis.net.protocol import DEFAULT_PROTOCOL, WireProtocol
+
+_push_encodings: ContextVar[dict[tuple[int, str, bytes], bytes] | None] = ContextVar(
+    "push_encodings", default=None
+)
+
+
+@contextlib.contextmanager
+def share_message_encodings() -> Generator[None]:
+    """Reuse each wire encoding during one synchronous command dispatch.
+
+    Connections using different WireProtocol instances have separate encodings.
+    Reset after dispatch so no payload remains cached between publications.
+    """
+    token = _push_encodings.set({})
+    try:
+        yield
+    finally:
+        _push_encodings.reset(token)
 
 
 class Connection:
@@ -37,7 +57,15 @@ class Connection:
         """
         if self._writer.is_closing():
             return False
-        data = self._wire.frames.encode(Message(channel, payload))
+        encodings = _push_encodings.get()
+        if encodings is None:
+            data = self._wire.frames.encode(Message(channel, payload))
+        else:
+            key = (id(self._wire), channel, payload)
+            data = encodings.get(key)
+            if data is None:
+                data = self._wire.frames.encode(Message(channel, payload))
+                encodings[key] = data
         try:
             self._writer.write(data)
         except ConnectionError:

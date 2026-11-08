@@ -1,7 +1,7 @@
 import asyncio
 import struct
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from tests.codec.helpers import Reverse
 from tests.helpers import ManualClock
@@ -10,16 +10,36 @@ from velis.codec import Codec, CodecChain, Validate
 from velis.config import Cache, Config
 from velis.config import Server as ServerConfig
 from velis.core.broker import Broker
-from velis.core.commands import Command, Err, Get, Message
+from velis.core.commands import Command, Err, Get, Message, Subscribe
 from velis.core.engine import Engine
 from velis.core.store import Store
 from velis.errors import CommandError, ProtocolError
 from velis.net import protocol
 from velis.net.client import Client
+from velis.net.connection import Connection
 from velis.net.server import TcpServer
 
 
 class ServerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_slow_subscriber_is_aborted_without_blocking_publisher(self) -> None:
+        writer = Mock(spec=asyncio.StreamWriter)
+        writer.is_closing.return_value = False
+        writer.transport = Mock(spec=asyncio.Transport)
+        writer.transport.get_write_buffer_size.return_value = 17
+        writer.drain = AsyncMock(
+            side_effect=AssertionError("must not drain subscriber")
+        )
+        slow = Connection(Mock(spec=asyncio.StreamReader), writer, max_buffer=16)
+        self.engine.execute(Subscribe("news"), slow)
+        healthy, publisher = await self.client(), await self.client()
+        await healthy.subscribe("news")
+        async with asyncio.timeout(1):
+            self.assertEqual(await publisher.publish("news", b"hello"), 1)
+            self.assertEqual(await healthy.next_message(), Message("news", b"hello"))
+            self.assertEqual(await publisher.publish("news", b"again"), 1)
+        writer.transport.abort.assert_called_once()
+        writer.drain.assert_not_awaited()
+
     async def test_connection_limit_rejects_excess_and_reuses_closed_slot(self) -> None:
         server = TcpServer(self.engine, ServerConfig("127.0.0.1", 0, max_connections=1))
         await server.start()
@@ -254,6 +274,36 @@ class RuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await client.publish("b", b"v"), 1)
             async with asyncio.timeout(1):
                 self.assertEqual(await client.next_message(), Message("b", b"v"))
+
+    async def test_server_encodes_one_push_per_publish_for_all_subscribers(
+        self,
+    ) -> None:
+        codec = Mock(wraps=protocol.FrameCodec())
+        wire = protocol.WireProtocol(frame_codec=codec)
+        config = Config("INFO", ServerConfig("127.0.0.1", 0))
+        async with (
+            serve(config, wire=wire) as server,
+            await Client.connect("127.0.0.1", server.port) as first,
+            await Client.connect("127.0.0.1", server.port) as second,
+            await Client.connect("127.0.0.1", server.port) as publisher,
+        ):
+            await first.subscribe("news")
+            await second.subscribe("news")
+            for _ in range(2):
+                codec.encode.reset_mock()
+                self.assertEqual(await publisher.publish("news", b"same payload"), 2)
+                async with asyncio.timeout(1):
+                    for subscriber in (first, second):
+                        self.assertEqual(
+                            await subscriber.next_message(),
+                            Message("news", b"same payload"),
+                        )
+                pushes = [
+                    call
+                    for call in codec.encode.call_args_list
+                    if isinstance(call.args[0], Message)
+                ]
+                self.assertEqual(len(pushes), 1)
 
     async def test_runtime_uses_supplied_engine_and_clock(self) -> None:
         clock = ManualClock()

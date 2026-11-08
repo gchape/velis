@@ -6,7 +6,7 @@ from velis.config import Server as ServerConfig
 from velis.core.commands import Err
 from velis.core.engine import Engine
 from velis.errors import CommandError, ProtocolError
-from velis.net.connection import Connection
+from velis.net.connection import Connection, share_message_encodings
 from velis.net.protocol import DEFAULT_PROTOCOL, WireProtocol
 
 log = logging.getLogger(__name__)
@@ -95,7 +95,8 @@ class TcpServer:
         while True:
             command = await connection.read_command()
             try:
-                reply = self._engine.execute(command, connection)
+                with share_message_encodings():
+                    reply = self._engine.execute(command, connection)
             except CommandError as exc:
                 reply = Err(str(exc))
             connection.write_reply(reply)

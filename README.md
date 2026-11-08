@@ -183,6 +183,8 @@ The diagram shows a successful `SET` followed by `GET` on the same key. `TcpSess
 
 The `Broker` only knows the `Subscriber` protocol (`send(channel, payload) -> bool`). Delivery callbacks must return promptly; adapters own encoding, buffering and expected transport failures. A `Connection` implements this contract and returns `False` when disconnected, when a write fails with a connection error, or when its buffer limit is exceeded. The broker then removes that subscriber from every channel and continues delivering to healthy subscribers. Acceptance does not acknowledge application processing; unexpected adapter errors propagate.
 
+During each server command dispatch, connections sharing a `WireProtocol` instance reuse the encoded push bytes. The encoding cache is released after dispatch, and distinct wire protocol instances use separate encodings. This avoids serializing a large publication once per subscriber while preserving custom wire codecs. Custom subscriber adapters still own their delivery behavior.
+
 ```mermaid
 sequenceDiagram
     participant A as Subscriber TcpSession
@@ -550,7 +552,9 @@ uv run ruff check --fix .
 
 `unittest discover` only descends into directories that contain an `__init__.py`, so every `tests/` subdirectory needs one.
 
-The core is deliberately easy to test without sockets or real time: the `Store` takes an injectable `Clock`. The `ManualClock` in `tests/helpers.py` makes TTLs deterministic. Network tests bind to localhost on an automatically selected port, so the test environment must allow local sockets.
+The core is deliberately easy to test without sockets or real time: the `Store` accepts any object implementing the `Clock` protocol's `now_ms()` method, without requiring inheritance. The `ManualClock` in `tests/helpers.py` makes TTLs deterministic. Decoder tests exercise seeded random bytes and mutations of every command and frame type. Network tests bind to localhost on an automatically selected port, so the test environment must allow local sockets.
+
+Run `uv run python benchmarks/publish.py --subscribers 1000 --repeats 3` to compare per-subscriber encoding with dispatch-scoped shared encoding for small and maximum-size payloads. The benchmark measures encoding and fan-out through in-memory sinks, excluding socket I/O and transport buffers.
 
 ---
 

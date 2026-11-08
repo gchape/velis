@@ -570,9 +570,10 @@ Run `uv run python benchmarks/publish.py --subscribers 1000 --repeats 3` to comp
 
 ## Roadmap
 
-* `DEL`, `TTL` and `PERSIST` commands.
-* Request IDs to support pipelining and safer request cancellation.
-* Pub-sub message replication between servers, independent of cache state.
-* Connection and memory limits, with an eviction policy.
-* Built-in codecs (compression, encryption) to compose with `CodecChain`.
-* Authentication and TLS.
+- [ ] `DEL`, `TTL` and `PERSIST` commands.
+- [ ] Request IDs to support pipelining and safer request cancellation.
+- [ ] Pub-sub message replication between servers, independent of cache state.
+- [x] Connection and memory limits.
+- [ ] Cache eviction policy.
+- [ ] Built-in codecs (compression, encryption) to compose with `CodecChain`.
+- [ ] Authentication and TLS.

@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import Mock
 
 from tests.helpers import ManualClock, RecordingSubscriber
 from velis.core.broker import Broker
@@ -43,6 +44,12 @@ class EngineTests(unittest.TestCase):
         for ms in (-1, 1 << 63):
             with self.subTest(ms=ms), self.assertRaises(CommandError):
                 e.execute(Expire("k", ms), self.sub)
+
+    def test_unexpected_store_value_error_is_not_a_command_error(self) -> None:
+        store = Mock(spec=Store)
+        store.expire.side_effect = ValueError("store bug")
+        with self.assertRaisesRegex(ValueError, "store bug"):
+            Engine(store, Broker()).execute(Expire("k", 1), self.sub)
 
     def test_pubsub(self) -> None:
         e = self.engine()

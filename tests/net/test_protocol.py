@@ -5,6 +5,7 @@ import unittest
 
 from velis.codec import Codec
 from velis.core.commands import (
+    Delete,
     Delivered,
     Err,
     Expire,
@@ -12,10 +13,14 @@ from velis.core.commands import (
     Message,
     Nil,
     Ok,
+    Persist,
+    Persistent,
     Publish,
     Set,
     Subscribe,
     Subscribed,
+    Ttl,
+    TtlValue,
     Unsubscribe,
     Unsubscribed,
     Value,
@@ -57,6 +62,9 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
 
         commands = (
             Get("key"),
+            Delete("key"),
+            Ttl("key"),
+            Persist("key"),
             Set("key", b"\x00\xff"),
             Expire("key", 1),
             Subscribe("ch"),
@@ -65,6 +73,8 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         )
         frames = (
             Ok(),
+            TtlValue(1 << 62),
+            Persistent(),
             Nil(),
             Value(b"\xff"),
             Err("error"),
@@ -82,6 +92,9 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         codec = protocol.CommandCodec()
         for tag, make, limit, suffix in (
             ("GET", Get, 512, b""),
+            ("DEL", Delete, 512, b""),
+            ("TTL", Ttl, 512, b""),
+            ("PERSIST", Persist, 512, b""),
             ("SET", lambda name: Set(name, b"x"), 512, protocol.BYTES.encode(b"x")),
             ("EXPIRE", lambda name: Expire(name, 1), 512, struct.pack(">Q", 1)),
             ("SUBSCRIBE", Subscribe, 256, b""),
@@ -169,6 +182,9 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
             protocol.CommandCodec(),
             (
                 Get("k"),
+                Delete("k"),
+                Ttl("k"),
+                Persist("k"),
                 Set("k", b"v"),
                 Expire("k", 1),
                 Subscribe("c"),
@@ -180,6 +196,8 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
             protocol.FrameCodec(),
             (
                 Ok(),
+                TtlValue(1 << 62),
+                Persistent(),
                 Nil(),
                 Value(b"v"),
                 Err("error"),
@@ -193,6 +211,9 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
     async def test_command_roundtrips(self) -> None:
         for command in (
             Get("ქართული"),
+            Delete("k"),
+            Ttl("k"),
+            Persist("k"),
             Set("key", bytes(range(256))),
             Expire("key", (1 << 64) - 1),
             Subscribe("news"),
@@ -226,6 +247,8 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
     async def test_reply_and_message_roundtrips(self) -> None:
         for reply in (
             Ok(),
+            TtlValue(1 << 62),
+            Persistent(),
             Nil(),
             Value(b"\xff"),
             Err("bad command"),

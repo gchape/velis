@@ -3,22 +3,31 @@ from typing import assert_never
 from velis.core.broker import Broker, Subscriber
 from velis.core.commands import (
     Command,
+    Delete,
     Delivered,
     Expire,
     Get,
     Nil,
     Ok,
+    Persist,
+    Persistent,
     Publish,
     Reply,
     Set,
     Subscribe,
     Subscribed,
+    Ttl,
+    TtlValue,
     Unsubscribe,
     Unsubscribed,
     Value,
 )
+from velis.core.expiry import MISSING, NO_EXPIRY
 from velis.core.store import Store
-from velis.errors import CommandError
+
+
+def _ok_or_nil(found: bool) -> Ok | Nil:
+    return Ok() if found else Nil()
 
 
 class Engine:
@@ -42,11 +51,16 @@ class Engine:
                 self._store.set(key, value)
                 return Ok()
             case Expire(key, ms):
-                try:
-                    found = self._store.expire(key, ms)
-                except ValueError as exc:
-                    raise CommandError(str(exc)) from exc
-                return Ok() if found else Nil()
+                return _ok_or_nil(self._store.expire(key, ms))
+            case Delete(key):
+                return _ok_or_nil(self._store.delete(key))
+            case Persist(key):
+                return _ok_or_nil(self._store.persist(key))
+            case Ttl(key):
+                ms = self._store.ttl(key)
+                if ms == MISSING:
+                    return Nil()
+                return Persistent() if ms == NO_EXPIRY else TtlValue(ms)
             case Subscribe(channel):
                 self._broker.subscribe(channel, subscriber)
                 return Subscribed(channel)

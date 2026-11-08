@@ -15,6 +15,7 @@ from velis.codec.binary import U32, U64
 from velis.codec.cursor import Cursor
 from velis.core.commands import (
     Command,
+    Delete,
     Delivered,
     Err,
     Expire,
@@ -22,11 +23,15 @@ from velis.core.commands import (
     Message,
     Nil,
     Ok,
+    Persist,
+    Persistent,
     Publish,
     Reply,
     Set,
     Subscribe,
     Subscribed,
+    Ttl,
+    TtlValue,
     Unsubscribe,
     Unsubscribed,
     Value,
@@ -53,16 +58,17 @@ def _text_rule(what: str, max_chars: int) -> Callable[[str], None]:
     return check
 
 
-KEY = (
-    CodecChain.of(Validate("key", _text_rule("key", 512)))
-    | Utf8()
-    | LengthPrefix(512 * 4)
-)
-CHANNEL = (
-    CodecChain.of(Validate("channel", _text_rule("channel", 256)))
-    | Utf8()
-    | LengthPrefix(256 * 4)
-)
+def _text_field(what: str, max_chars: int) -> CodecChain[str, bytes]:
+    # A Unicode character occupies at most four bytes in UTF-8.
+    return (
+        CodecChain.of(Validate(what, _text_rule(what, max_chars)))
+        | Utf8()
+        | LengthPrefix(max_chars * 4)
+    )
+
+
+KEY = _text_field("key", 512)
+CHANNEL = _text_field("channel", 256)
 
 
 def _tagged(tag: str, *fields: bytes) -> bytes:
@@ -81,6 +87,12 @@ class CommandCodec:
                 return _tagged("SET", KEY.encode(key), BYTES.encode(value))
             case Expire(key, ms):
                 return _tagged("EXPIRE", KEY.encode(key), U64.encode(ms))
+            case Delete(key):
+                return _tagged("DEL", KEY.encode(key))
+            case Ttl(key):
+                return _tagged("TTL", KEY.encode(key))
+            case Persist(key):
+                return _tagged("PERSIST", KEY.encode(key))
             case Subscribe(channel):
                 return _tagged("SUBSCRIBE", CHANNEL.encode(channel))
             case Unsubscribe(channel):
@@ -103,6 +115,12 @@ class CommandCodec:
                 command = Set(cursor.read(KEY), cursor.read(BYTES))
             case "EXPIRE":
                 command = Expire(cursor.read(KEY), cursor.read_uint(U64))
+            case "DEL":
+                command = Delete(cursor.read(KEY))
+            case "TTL":
+                command = Ttl(cursor.read(KEY))
+            case "PERSIST":
+                command = Persist(cursor.read(KEY))
             case "SUBSCRIBE":
                 command = Subscribe(cursor.read(CHANNEL))
             case "UNSUBSCRIBE":
@@ -135,6 +153,10 @@ class FrameCodec:
                 return _tagged("UNSUBSCRIBED", TEXT.encode(channel))
             case Delivered(count):
                 return _tagged("DELIVERED", U32.encode(count))
+            case TtlValue(ms):
+                return _tagged("TTL_VALUE", U64.encode(ms))
+            case Persistent():
+                return _tagged("PERSISTENT")
             case Message(channel, payload):
                 return _tagged("MESSAGE", TEXT.encode(channel), BYTES.encode(payload))
             case _:
@@ -159,6 +181,10 @@ class FrameCodec:
                 frame = Unsubscribed(cursor.read(TEXT))
             case "DELIVERED":
                 frame = Delivered(cursor.read_uint(U32))
+            case "TTL_VALUE":
+                frame = TtlValue(cursor.read_uint(U64))
+            case "PERSISTENT":
+                frame = Persistent()
             case "MESSAGE":
                 frame = Message(cursor.read(TEXT), cursor.read(BYTES))
             case _:

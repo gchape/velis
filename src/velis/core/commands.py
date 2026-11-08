@@ -52,21 +52,40 @@ class Publish:
     payload: bytes
 
 
-type Command = Get | Set | Expire | Subscribe | Unsubscribe | Publish
+@dataclass(frozen=True, slots=True)
+class Delete:
+    """Delete a live key."""
+
+    key: str
+
+
+@dataclass(frozen=True, slots=True)
+class Ttl:
+    """Read a key's remaining TTL in milliseconds."""
+
+    key: str
+
+
+@dataclass(frozen=True, slots=True)
+class Persist:
+    """Remove a live key's expiry deadline."""
+
+    key: str
+
+
+type Command = (
+    Get | Set | Expire | Delete | Ttl | Persist | Subscribe | Unsubscribe | Publish
+)
 
 
 @dataclass(frozen=True, slots=True)
 class Ok:
     """Acknowledge a successful cache mutation."""
 
-    ...
-
 
 @dataclass(frozen=True, slots=True)
 class Nil:
     """Indicate that a key is missing or expired."""
-
-    ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,7 +123,29 @@ class Delivered:
     count: int
 
 
-type Reply = Ok | Nil | Value | Err | Subscribed | Unsubscribed | Delivered
+@dataclass(frozen=True, slots=True)
+class TtlValue:
+    """Remaining TTL in milliseconds."""
+
+    ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class Persistent:
+    """A live key without an expiry deadline."""
+
+
+type Reply = (
+    Ok
+    | Nil
+    | Value
+    | Err
+    | Subscribed
+    | Unsubscribed
+    | Delivered
+    | TtlValue
+    | Persistent
+)
 
 
 @dataclass(frozen=True, slots=True)

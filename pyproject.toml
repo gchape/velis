@@ -7,7 +7,9 @@ authors = [
     { name = "Giorgi Chapidze", email = "chapidze.giorgi@proton.me" }
 ]
 requires-python = ">=3.15.2"
-dependencies = []
+dependencies = [
+    "cachetools>=8,<9",
+]
 
 [project.scripts]
 velis = "velis.__main__:main"

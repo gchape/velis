@@ -2,10 +2,26 @@ import logging
 import os
 from dataclasses import dataclass, field
 
-DEFAULT_MAX_KEYS = 100_000
-DEFAULT_MAX_BYTES = 64 << 20
+from velis.core.broker import DEFAULT_MAX_SUBSCRIPTIONS, validate_subscription_limit
+from velis.core.store import (
+    DEFAULT_EVICTION_POLICY,
+    DEFAULT_MAX_BYTES,
+    DEFAULT_MAX_KEYS,
+    StoreLimits,
+)
+from velis.core.store import (
+    EVICTION_POLICIES as EVICTION_POLICIES,
+)
+
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 9000
+DEFAULT_MAX_BUFFER = 8 << 20
 DEFAULT_MAX_CONNECTIONS = 1024
-DEFAULT_MAX_SUBSCRIPTIONS = 1024
+DEFAULT_SWEEP_INTERVAL_MS = 100
+DEFAULT_LOG_LEVEL = "INFO"
+
+# Preserve the existing configuration name; core owns limits and validation.
+Cache = StoreLimits
 
 
 def _env_int(name: str, default: int) -> int:
@@ -27,10 +43,10 @@ class Server:
     room for channel and payload fields plus protocol framing.
     """
 
-    host: str
-    port: int
+    host: str = DEFAULT_HOST
+    port: int = DEFAULT_PORT
 
-    max_buffer: int = 8 << 20
+    max_buffer: int = DEFAULT_MAX_BUFFER
     max_connections: int = DEFAULT_MAX_CONNECTIONS
     max_subscriptions: int = DEFAULT_MAX_SUBSCRIPTIONS
 
@@ -41,16 +57,15 @@ class Server:
             raise ValueError(f"invalid max_buffer: {self.max_buffer}")
         if self.max_connections <= 0:
             raise ValueError(f"invalid max_connections: {self.max_connections}")
-        if self.max_subscriptions <= 0:
-            raise ValueError(f"invalid max_subscriptions: {self.max_subscriptions}")
+        validate_subscription_limit(self.max_subscriptions)
 
     @classmethod
     def from_env(cls) -> Server:
         """Load listener settings from VELIS_HOST, VELIS_PORT and VELIS_MAX_BUFFER."""
         return cls(
-            host=os.environ.get("VELIS_HOST", "127.0.0.1"),
-            port=_env_int("VELIS_PORT", 9000),
-            max_buffer=_env_int("VELIS_MAX_BUFFER", 8 << 20),
+            host=os.environ.get("VELIS_HOST", DEFAULT_HOST),
+            port=_env_int("VELIS_PORT", DEFAULT_PORT),
+            max_buffer=_env_int("VELIS_MAX_BUFFER", DEFAULT_MAX_BUFFER),
             max_connections=_env_int("VELIS_MAX_CONNECTIONS", DEFAULT_MAX_CONNECTIONS),
             max_subscriptions=_env_int(
                 "VELIS_MAX_SUBSCRIPTIONS", DEFAULT_MAX_SUBSCRIPTIONS
@@ -59,34 +74,13 @@ class Server:
 
 
 @dataclass(frozen=True, slots=True)
-class Cache:
-    """Limits on retained keys and UTF-8 key plus value bytes."""
-
-    max_keys: int = DEFAULT_MAX_KEYS
-    max_bytes: int = DEFAULT_MAX_BYTES
-
-    def __post_init__(self) -> None:
-        if self.max_keys <= 0:
-            raise ValueError(f"invalid max_keys: {self.max_keys}")
-        if self.max_bytes <= 0:
-            raise ValueError(f"invalid max_bytes: {self.max_bytes}")
-
-    @classmethod
-    def from_env(cls) -> Cache:
-        return cls(
-            max_keys=_env_int("VELIS_MAX_KEYS", DEFAULT_MAX_KEYS),
-            max_bytes=_env_int("VELIS_MAX_BYTES", DEFAULT_MAX_BYTES),
-        )
-
-
-@dataclass(frozen=True, slots=True)
 class Config:
     """Validated logging, TCP server and expiry sweep settings."""
 
-    log_level: str
-    server: Server
-    sweep_interval_ms: int = 100
-    cache: Cache = field(default_factory=Cache)
+    log_level: str = DEFAULT_LOG_LEVEL
+    server: Server = field(default_factory=Server)
+    sweep_interval_ms: int = DEFAULT_SWEEP_INTERVAL_MS
+    cache: StoreLimits = field(default_factory=StoreLimits)
 
     def __post_init__(self) -> None:
         if self.sweep_interval_ms <= 0:
@@ -98,8 +92,14 @@ class Config:
     def from_env(cls) -> Config:
         """Load configuration from VELIS_* environment variables."""
         return cls(
-            log_level=os.environ.get("VELIS_LOG_LEVEL", "info").upper(),
+            log_level=os.environ.get("VELIS_LOG_LEVEL", DEFAULT_LOG_LEVEL).upper(),
             server=Server.from_env(),
-            sweep_interval_ms=_env_int("VELIS_SWEEP_MS", 100),
-            cache=Cache.from_env(),
+            sweep_interval_ms=_env_int("VELIS_SWEEP_MS", DEFAULT_SWEEP_INTERVAL_MS),
+            cache=StoreLimits(
+                max_keys=_env_int("VELIS_MAX_KEYS", DEFAULT_MAX_KEYS),
+                max_bytes=_env_int("VELIS_MAX_BYTES", DEFAULT_MAX_BYTES),
+                eviction_policy=os.environ.get(
+                    "VELIS_EVICTION_POLICY", DEFAULT_EVICTION_POLICY
+                ),
+            ),
         )

@@ -4,6 +4,7 @@ from typing import final
 from velis.codec import Codec, Identity
 from velis.core.commands import (
     Command,
+    Delete,
     Delivered,
     Err,
     Expire,
@@ -11,18 +12,28 @@ from velis.core.commands import (
     Message,
     Nil,
     Ok,
+    Persist,
+    Persistent,
     Publish,
     Reply,
     Set,
     Subscribe,
     Subscribed,
+    Ttl,
+    TtlValue,
     Unsubscribe,
     Unsubscribed,
     Value,
 )
+from velis.core.expiry import MISSING, NO_EXPIRY
 from velis.errors import CommandError, ProtocolError
 from velis.net.protocol import DEFAULT_PROTOCOL, WireProtocol
 from velis.net.session import Session, TcpSession
+
+
+def _unexpected(command: Command, reply: Reply) -> ProtocolError:
+    name = "DEL" if isinstance(command, Delete) else type(command).__name__.upper()
+    return ProtocolError(f"unexpected reply to {name}: {reply!r}")
 
 
 @final
@@ -84,7 +95,7 @@ class Client:
             case Nil():
                 return None
             case other:
-                raise ProtocolError(f"unexpected reply to GET: {other!r}")
+                raise _unexpected(Get(key), other)
 
     async def set(self, key: str, value: bytes) -> None:
         """Encode and store a value, clearing any previous TTL."""
@@ -92,13 +103,37 @@ class Client:
 
     async def expire(self, key: str, ms: int) -> bool:
         """Set a TTL in milliseconds; return False if the key is missing."""
-        match await self._request(Expire(key, ms)):
+        return await self._flag(Expire(key, ms))
+
+    async def delete(self, key: str) -> bool:
+        """Delete a live key; return whether it existed."""
+        return await self._flag(Delete(key))
+
+    async def persist(self, key: str) -> bool:
+        """Remove a live key's TTL; return whether it changed."""
+        return await self._flag(Persist(key))
+
+    async def _flag(self, command: Command) -> bool:
+        """Interpret the common mutation acknowledgment."""
+        match await self._request(command):
             case Ok():
                 return True
             case Nil():
                 return False
             case other:
-                raise ProtocolError(f"unexpected reply to EXPIRE: {other!r}")
+                raise _unexpected(command, other)
+
+    async def ttl(self, key: str) -> int:
+        """Remaining milliseconds; -2 means missing, -1 means no expiry."""
+        match await self._request(Ttl(key)):
+            case TtlValue(ms):
+                return ms
+            case Persistent():
+                return NO_EXPIRY
+            case Nil():
+                return MISSING
+            case other:
+                raise _unexpected(Ttl(key), other)
 
     async def subscribe(self, channel: str) -> None:
         """Join a channel to receive server pushes."""
@@ -110,11 +145,12 @@ class Client:
 
     async def publish(self, channel: str, payload: bytes) -> int:
         """Encode a message and return the number of accepting subscribers."""
-        match await self._request(Publish(channel, self._codec.encode(payload))):
+        command = Publish(channel, self._codec.encode(payload))
+        match await self._request(command):
             case Delivered(count):
                 return count
             case other:
-                raise ProtocolError(f"unexpected reply to PUBLISH: {other!r}")
+                raise _unexpected(command, other)
 
     async def next_message(self) -> Message:
         """Receive a publication and decode its payload with the client codec.
@@ -129,8 +165,7 @@ class Client:
         """Validate acknowledgments, including the channel for subscriptions."""
         reply = await self._request(command)
         if reply != expected:
-            name = type(command).__name__.upper()
-            raise ProtocolError(f"unexpected reply to {name}: {reply!r}")
+            raise _unexpected(command, reply)
 
     async def close(self) -> None:
         """Close the owned session and wake waiting operations."""

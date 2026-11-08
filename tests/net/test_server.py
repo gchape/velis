@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, Mock, patch
 from tests.codec.helpers import Reverse
 from tests.helpers import ManualClock
 from velis.app import serve
-from velis.codec import Codec, CodecChain, Validate
+from velis.codec import Codec, CodecChain, Deflate, Validate
 from velis.config import Cache, Config
 from velis.config import Server as ServerConfig
 from velis.core.broker import Broker
@@ -21,6 +21,26 @@ from velis.net.server import TcpServer
 
 
 class ServerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_compression_for_values_and_publications(self) -> None:
+        codec = Deflate()
+        coded = await self.client(codec)
+        raw = await self.client()
+        payload = b"compressible value" * 1000
+        await coded.set("compressed", payload)
+        encoded = await raw.get("compressed")
+        self.assertIsNotNone(encoded)
+        assert encoded is not None
+        self.assertLess(len(encoded), len(payload))
+        self.assertEqual(codec.decode(encoded), payload)
+        self.assertEqual(await coded.get("compressed"), payload)
+        await coded.subscribe("compressed")
+        self.assertEqual(await coded.publish("compressed", payload), 1)
+        async with asyncio.timeout(1):
+            self.assertEqual(await coded.next_message(), Message("compressed", payload))
+        with self.assertRaises(ProtocolError):
+            await coded.set("oversized", b"x" * (codec.max_length + 1))
+        self.assertEqual(await coded.get("compressed"), payload)
+
     async def test_slow_subscriber_is_aborted_without_blocking_publisher(self) -> None:
         writer = Mock(spec=asyncio.StreamWriter)
         writer.is_closing.return_value = False
@@ -246,13 +266,110 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
 
 
 class RuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_default_lru_eviction_over_tcp(self) -> None:
+        config = Config(
+            "INFO",
+            ServerConfig("127.0.0.1", 0),
+            cache=Cache(max_keys=2, max_bytes=4),
+        )
+        async with (
+            serve(config) as server,
+            await Client.connect("127.0.0.1", server.port) as client,
+        ):
+            await client.set("a", b"1")
+            await client.expire("a", 60_000)
+            await client.set("b", b"2")
+            self.assertEqual(await client.get("b"), b"2")
+            await client.set("c", b"3")
+            self.assertIsNone(await client.get("a"))
+            self.assertEqual(await client.ttl("a"), -2)
+            with self.assertRaisesRegex(CommandError, "byte limit"):
+                await client.set("b", b"oversized")
+            self.assertEqual(await client.get("b"), b"2")
+            self.assertEqual(await client.get("c"), b"3")
+
+    async def test_delete_ttl_and_persist_over_tcp(self) -> None:
+        clock = ManualClock()
+        store = Store(clock, max_keys=1)
+        engine = Engine(store, Broker())
+        config = Config("INFO", ServerConfig("127.0.0.1", 0))
+        async with (
+            serve(config, engine=engine) as server,
+            await Client.connect("127.0.0.1", server.port) as client,
+        ):
+            self.assertEqual(await client.ttl("k"), -2)
+            self.assertFalse(await client.delete("k"))
+            self.assertFalse(await client.persist("k"))
+            await client.set("k", b"")
+            self.assertEqual(await client.ttl("k"), -1)
+            self.assertFalse(await client.persist("k"))
+            await client.expire("k", 100)
+            self.assertEqual(await client.ttl("k"), 100)
+            clock.advance(99)
+            self.assertEqual(await client.ttl("k"), 1)
+            self.assertTrue(await client.persist("k"))
+            clock.advance(1)
+            self.assertEqual(await client.get("k"), b"")
+            self.assertEqual(await client.ttl("k"), -1)
+            self.assertTrue(await client.delete("k"))
+            await client.set("other", b"v")
+            await client.expire("other", 0)
+            self.assertFalse(await client.persist("other"))
+            self.assertEqual(await client.ttl("other"), -2)
+            self.assertFalse(await client.delete("other"))
+            for operation in (client.delete, client.ttl, client.persist):
+                with self.assertRaises(ProtocolError):
+                    await operation("")
+            await client.set("k", b"still usable")
+            self.assertEqual(await client.get("k"), b"still usable")
+
+    async def test_compressed_wire_and_oversized_decompression(self) -> None:
+        wire = protocol.WireProtocol(
+            command_codec=CodecChain.of(protocol.CommandCodec())
+            | Deflate(max_length=protocol.MAX_FRAME_LEN),
+            frame_codec=CodecChain.of(protocol.FrameCodec())
+            | Deflate(max_length=protocol.MAX_FRAME_LEN),
+        )
+        config = Config("INFO", ServerConfig("127.0.0.1", 0))
+        async with serve(config, wire=wire) as server:
+            async with await Client.connect(
+                "127.0.0.1", server.port, wire=wire
+            ) as client:
+                payload = b"x" * protocol.MAX_LEN
+                await client.set("key", payload)
+                self.assertEqual(await client.get("key"), payload)
+                await client.subscribe("ch")
+                self.assertEqual(await client.publish("ch", payload), 1)
+                async with asyncio.timeout(1):
+                    self.assertEqual(
+                        await client.next_message(), Message("ch", payload)
+                    )
+                with self.assertRaises(CommandError):
+                    await client.expire("key", 1 << 63)
+                self.assertEqual(await client.get("key"), payload)
+            reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+            try:
+                compressed = Deflate(max_length=3 << 20).encode(
+                    b"x" * (protocol.MAX_FRAME_LEN + 1)
+                )
+                writer.write(wire.framing.encode(compressed))
+                async with asyncio.timeout(1):
+                    self.assertEqual(
+                        await wire.read_frame(reader),
+                        Err("uncompressed data exceeds limit"),
+                    )
+                    self.assertEqual(await reader.read(), b"")
+            finally:
+                writer.close()
+                await writer.wait_closed()
+
     async def test_capacity_errors_keep_connection_and_existing_state_usable(
         self,
     ) -> None:
         config = Config(
             "INFO",
             ServerConfig("127.0.0.1", 0, max_subscriptions=1),
-            cache=Cache(max_keys=1, max_bytes=4),
+            cache=Cache(max_keys=1, max_bytes=4, eviction_policy="reject"),
         )
         async with (
             serve(config) as server,
@@ -260,8 +377,8 @@ class RuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
         ):
             await client.set("k", b"old")
             await client.expire("k", 60_000)
-            with self.assertRaisesRegex(CommandError, "key limit"):
-                await client.set("other", b"")
+            with self.assertRaisesRegex(CommandError, "store limit"):
+                await client.set("x", b"")
             with self.assertRaisesRegex(CommandError, "byte limit"):
                 await client.set("k", b"large")
             self.assertEqual(await client.get("k"), b"old")

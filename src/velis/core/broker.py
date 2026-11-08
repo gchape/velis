@@ -1,8 +1,14 @@
 from collections import defaultdict
 from typing import Protocol
 
-from velis.config import DEFAULT_MAX_SUBSCRIPTIONS
 from velis.errors import CapacityError
+
+DEFAULT_MAX_SUBSCRIPTIONS = 1024
+
+
+def validate_subscription_limit(limit: int) -> None:
+    if limit <= 0:
+        raise ValueError(f"invalid max_subscriptions: {limit}")
 
 
 class Subscriber(Protocol):
@@ -22,8 +28,7 @@ class Broker:
     """Track channel membership and deliver messages to live subscribers."""
 
     def __init__(self, *, max_subscriptions: int = DEFAULT_MAX_SUBSCRIPTIONS) -> None:
-        if max_subscriptions <= 0:
-            raise ValueError("subscription limit must be positive")
+        validate_subscription_limit(max_subscriptions)
         self._max_subscriptions = max_subscriptions
         self._subscribers: dict[str, set[Subscriber]] = defaultdict(set)
         self._subscriptions: dict[Subscriber, set[str]] = defaultdict(set)

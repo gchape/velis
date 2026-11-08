@@ -17,7 +17,8 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         clock = ManualClock()
-        store = Store(clock)
+        # Keep due entries until the maintenance task processes the backlog.
+        store = Store(clock, eviction_policy="reject")
         for index in range(3001):
             key = str(index)
             store.set(key, b"v")
@@ -49,7 +50,8 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         clock = ManualClock()
-        store = Store(clock)
+        # Preserve stale entries for the maintenance continuation check.
+        store = Store(clock, eviction_policy="reject")
         for index in range(1000):
             key = f"a{index}"
             store.set(key, b"v")

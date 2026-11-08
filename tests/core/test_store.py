@@ -1,15 +1,63 @@
 import unittest
 
 from tests.helpers import ManualClock
-from velis.core.store import MAX_TTL_MS, Store
-from velis.errors import CapacityError
+from velis.core.store import MAX_TTL_MS, Store, StoreLimits
+from velis.errors import CapacityError, CommandError
 
 
 class StoreTests(unittest.TestCase):
+    def test_delete_releases_capacity_and_removes_deadline(self) -> None:
+        store = Store(self.clock, max_keys=1, max_bytes=4)
+        store.set("é", b"12")
+        store.expire("é", 10)
+        self.assertTrue(store.delete("é"))
+        self.assertEqual(store.stored_bytes, 0)
+        self.assertFalse(store.delete("é"))
+        store.set("é", b"")
+        self.clock.advance(10)
+        store.sweep()
+        self.assertEqual(store.get("é"), b"")
+        self.assertTrue(store.delete("é"))
+        self.assertEqual(store.stored_bytes, 0)
+
+    def test_ttl_boundaries_and_lazy_cleanup(self) -> None:
+        self.assertEqual(self.store.ttl("k"), -2)
+        self.store.set("k", b"v")
+        self.assertEqual(self.store.ttl("k"), -1)
+        self.store.expire("k", MAX_TTL_MS)
+        self.assertEqual(self.store.ttl("k"), MAX_TTL_MS)
+        self.clock.advance(MAX_TTL_MS - 1)
+        self.assertEqual(self.store.ttl("k"), 1)
+        self.clock.advance(1)
+        self.assertEqual(self.store.ttl("k"), -2)
+        self.assertEqual(self.store.stored_bytes, 0)
+
+    def test_persist_preserves_value_and_ignores_stale_heap_entries(self) -> None:
+        self.assertFalse(self.store.persist("k"))
+        self.store.set("k", b"v")
+        self.assertFalse(self.store.persist("k"))
+        self.store.expire("k", 5)
+        size = self.store.stored_bytes
+        self.assertTrue(self.store.persist("k"))
+        self.assertFalse(self.store.persist("k"))
+        self.clock.advance(5)
+        self.store.sweep()
+        self.assertEqual(self.store.get("k"), b"v")
+        self.assertEqual(self.store.stored_bytes, size)
+        self.assertEqual(self.store.ttl("k"), -1)
+
+    def test_expired_keys_cannot_be_deleted_or_persisted_as_live(self) -> None:
+        for operation in (self.store.delete, self.store.persist):
+            self.store.set("k", b"v")
+            self.store.expire("k", 0)
+            self.assertFalse(operation("k"))
+            self.assertEqual(self.store.ttl("k"), -2)
+            self.assertEqual(self.store.stored_bytes, 0)
+
     def test_key_limit_allows_replacement_and_reclaims_expired_capacity(self) -> None:
-        store = Store(self.clock, max_keys=1)
+        store = Store(self.clock, max_keys=1, eviction_policy="reject")
         store.set("a", b"old")
-        with self.assertRaisesRegex(CapacityError, "key limit"):
+        with self.assertRaisesRegex(CapacityError, "store limit"):
             store.set("b", b"new")
         self.assertEqual(store.get("a"), b"old")
         store.set("a", b"replacement")
@@ -21,10 +69,10 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(store.get("b"), b"new")
 
     def test_byte_limit_counts_utf8_keys_and_replacement_deltas(self) -> None:
-        store = Store(self.clock, max_bytes=6)
+        store = Store(self.clock, max_bytes=6, eviction_policy="reject")
         store.set("é", b"1234")
         self.assertEqual(store.stored_bytes, 6)
-        with self.assertRaisesRegex(CapacityError, "byte limit"):
+        with self.assertRaisesRegex(CapacityError, "store limit"):
             store.set("x", b"")
         store.set("é", b"1")
         store.set("x", b"12")
@@ -54,6 +102,25 @@ class StoreTests(unittest.TestCase):
         for keys, size in ((0, 1), (1, 0), (1, -1)):
             with self.subTest(keys=keys, size=size), self.assertRaises(ValueError):
                 Store(max_keys=keys, max_bytes=size)
+
+    def test_validated_limits_can_be_shared_without_unpacking(self) -> None:
+        limits = StoreLimits(max_keys=1, max_bytes=4, eviction_policy="reject")
+        store = Store(self.clock, limits=limits)
+        store.set("k", b"old")
+        with self.assertRaises(CapacityError):
+            store.set("x", b"new")
+        with self.assertRaisesRegex(ValueError, "not both"):
+            Store(limits=limits, max_keys=2)
+
+    def test_reject_reclaims_expired_entries_before_refusing_a_write(self) -> None:
+        store = Store(self.clock, max_keys=1, max_bytes=4, eviction_policy="reject")
+        store.set("old", b"v")
+        store.expire("old", 1)
+        self.clock.advance(1)
+        store.set("new", b"v")
+        self.assertIsNone(store.get("old"))
+        self.assertEqual(store.get("new"), b"v")
+        self.assertEqual(store.stored_bytes, 4)
 
     def setUp(self) -> None:
         self.clock = ManualClock(1_000)
@@ -130,7 +197,7 @@ class StoreTests(unittest.TestCase):
         self.store.expire("key", 100)
         for ms in (-1, MAX_TTL_MS + 1):
             with self.subTest(ms=ms):
-                with self.assertRaisesRegex(ValueError, "ttl out of range"):
+                with self.assertRaisesRegex(CommandError, "ttl out of range"):
                     self.store.expire("key", ms)
                 self.assertEqual(self.store.get("key"), b"value")
         self.clock.advance(100)
@@ -139,7 +206,7 @@ class StoreTests(unittest.TestCase):
 
     def test_invalid_ttl_is_rejected_for_missing_keys(self) -> None:
         for ms in (-1, MAX_TTL_MS + 1):
-            with self.subTest(ms=ms), self.assertRaises(ValueError):
+            with self.subTest(ms=ms), self.assertRaises(CommandError):
                 self.store.expire("missing", ms)
 
     def test_maximum_ttl_expires_at_its_deadline(self) -> None:
@@ -163,7 +230,7 @@ class StoreTests(unittest.TestCase):
         self.store.set("key", b"value")
         for ms in range(10_000, 20_000):
             self.store.expire("key", ms)
-        self.assertLessEqual(len(self.store._expiry_heap), 1024)
+        self.assertLessEqual(len(self.store._expiry._heap), 1024)
         self.clock.advance(19_998)
         self.assertEqual(self.store.get("key"), b"value")
         self.clock.advance(1)
@@ -176,7 +243,7 @@ class StoreTests(unittest.TestCase):
             self.store.expire(str(i), 100_000)
         for i in range(2_000):
             self.store.set(str(i), b"replacement")
-        self.assertLessEqual(len(self.store._expiry_heap), 1024)
+        self.assertLessEqual(len(self.store._expiry._heap), 1024)
         self.clock.advance(100_000)
         self.assertEqual(self.store.sweep(), 0)
         self.assertEqual(self.store.get("0"), b"replacement")

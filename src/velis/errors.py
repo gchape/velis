@@ -12,3 +12,7 @@ class ProtocolError(VelisError):
 
 class CommandError(VelisError):
     """A well-formed request that can't be honoured; reply ERR, keep going."""
+
+
+class CapacityError(CommandError):
+    """A write or subscription would exceed a configured resource limit."""

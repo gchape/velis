@@ -13,7 +13,7 @@ log = logging.getLogger(__name__)
 
 
 class TcpServer:
-    """Serve commands over TCP and track active subscriber connections."""
+    """Serve commands over TCP within a configured connection limit."""
 
     def __init__(
         self,
@@ -26,7 +26,7 @@ class TcpServer:
         self._engine = engine
         self._config = config
         self._listener: asyncio.Server | None = None
-        self._connections: set[Connection] = set()
+        self._connection_count = 0
 
     @property
     def port(self) -> int:
@@ -46,8 +46,7 @@ class TcpServer:
         if self._listener is None:
             return
         self._listener.close()
-        for connection in list(self._connections):
-            connection.close()
+        self._listener.close_clients()
         await self._listener.wait_closed()
         self._listener = None
 
@@ -62,7 +61,15 @@ class TcpServer:
         connection = Connection(
             reader, writer, self._config.max_buffer, wire=self._wire
         )
-        self._connections.add(connection)
+        if self._connection_count >= self._config.max_connections:
+            try:
+                with contextlib.suppress(ProtocolError, ConnectionError):
+                    connection.write_reply(Err("connection limit exceeded"))
+            finally:
+                connection.close()
+                await connection.wait_closed()
+            return
+        self._connection_count += 1
         log.info("connected: %s", peer)
         try:
             await self._serve_commands(connection)
@@ -77,7 +84,7 @@ class TcpServer:
         except Exception:
             log.exception("unexpected error serving %s", peer)
         finally:
-            self._connections.discard(connection)
+            self._connection_count -= 1
             self._engine.disconnect(connection)
             connection.close()
             await connection.wait_closed()

@@ -2,9 +2,32 @@ import unittest
 
 from tests.helpers import RecordingSubscriber
 from velis.core.broker import Broker
+from velis.errors import CapacityError
 
 
 class BrokerTests(unittest.TestCase):
+    def test_subscription_limit_preserves_membership_and_allows_reuse(self) -> None:
+        broker = Broker(max_subscriptions=1)
+        first, second = RecordingSubscriber(), RecordingSubscriber()
+        broker.subscribe("a", first)
+        broker.subscribe("a", first)
+        broker.subscribe("b", second)
+        with self.assertRaisesRegex(CapacityError, "subscription limit"):
+            broker.subscribe("b", first)
+        self.assertEqual(broker.publish("a", b"first"), 1)
+        self.assertEqual(broker.publish("b", b"second"), 1)
+        broker.unsubscribe("a", first)
+        broker.subscribe("b", first)
+        self.assertEqual(broker.publish("b", b"both"), 2)
+        broker.unsubscribe_all(first)
+        broker.subscribe("c", first)
+        self.assertEqual(broker.subscribers("c"), 1)
+
+    def test_subscription_limit_must_be_positive(self) -> None:
+        for limit in (0, -1):
+            with self.subTest(limit=limit), self.assertRaises(ValueError):
+                Broker(max_subscriptions=limit)
+
     def test_publish_counts_deliveries(self) -> None:
         b, a1, a2 = Broker(), RecordingSubscriber(), RecordingSubscriber()
         b.subscribe("c", a1)

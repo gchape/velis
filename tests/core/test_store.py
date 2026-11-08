@@ -2,9 +2,59 @@ import unittest
 
 from tests.helpers import ManualClock
 from velis.core.store import MAX_TTL_MS, Store
+from velis.errors import CapacityError
 
 
 class StoreTests(unittest.TestCase):
+    def test_key_limit_allows_replacement_and_reclaims_expired_capacity(self) -> None:
+        store = Store(self.clock, max_keys=1)
+        store.set("a", b"old")
+        with self.assertRaisesRegex(CapacityError, "key limit"):
+            store.set("b", b"new")
+        self.assertEqual(store.get("a"), b"old")
+        store.set("a", b"replacement")
+        store.expire("a", 1)
+        self.clock.advance(1)
+        store.sweep()
+        self.assertEqual(store.stored_bytes, 0)
+        store.set("b", b"new")
+        self.assertEqual(store.get("b"), b"new")
+
+    def test_byte_limit_counts_utf8_keys_and_replacement_deltas(self) -> None:
+        store = Store(self.clock, max_bytes=6)
+        store.set("é", b"1234")
+        self.assertEqual(store.stored_bytes, 6)
+        with self.assertRaisesRegex(CapacityError, "byte limit"):
+            store.set("x", b"")
+        store.set("é", b"1")
+        store.set("x", b"12")
+        self.assertEqual(store.stored_bytes, 6)
+        store.expire("é", 0)
+        self.assertIsNone(store.get("é"))
+        self.assertEqual(store.stored_bytes, 3)
+        store.set("x", b"")
+        self.assertEqual(store.stored_bytes, 1)
+        store.expire("x", 0)
+        store.sweep()
+        self.assertEqual(store.stored_bytes, 0)
+
+    def test_rejected_replacement_preserves_value_and_deadline(self) -> None:
+        store = Store(self.clock, max_bytes=4)
+        store.set("k", b"old")
+        store.expire("k", 100)
+        with self.assertRaises(CapacityError):
+            store.set("k", b"oversized")
+        self.assertEqual(store.stored_bytes, 4)
+        self.assertEqual(store.get("k"), b"old")
+        self.clock.advance(100)
+        self.assertIsNone(store.get("k"))
+        self.assertEqual(store.stored_bytes, 0)
+
+    def test_store_limits_must_be_positive(self) -> None:
+        for keys, size in ((0, 1), (1, 0), (1, -1)):
+            with self.subTest(keys=keys, size=size), self.assertRaises(ValueError):
+                Store(max_keys=keys, max_bytes=size)
+
     def setUp(self) -> None:
         self.clock = ManualClock(1_000)
         self.store = Store(self.clock)

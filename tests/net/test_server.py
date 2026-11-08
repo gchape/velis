@@ -1,12 +1,13 @@
 import asyncio
 import struct
 import unittest
+from unittest.mock import patch
 
 from tests.codec.helpers import Reverse
 from tests.helpers import ManualClock
 from velis.app import serve
 from velis.codec import Codec, CodecChain, Validate
-from velis.config import Config
+from velis.config import Cache, Config
 from velis.config import Server as ServerConfig
 from velis.core.broker import Broker
 from velis.core.commands import Command, Err, Get, Message
@@ -19,6 +20,40 @@ from velis.net.server import TcpServer
 
 
 class ServerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_connection_limit_rejects_excess_and_reuses_closed_slot(self) -> None:
+        server = TcpServer(self.engine, ServerConfig("127.0.0.1", 0, max_connections=1))
+        await server.start()
+        self.addAsyncCleanup(server.close)
+        first = await Client.connect("127.0.0.1", server.port)
+        self.addAsyncCleanup(first.close)
+        await first.set("key", b"value")
+        reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+        try:
+            async with asyncio.timeout(1):
+                self.assertEqual(
+                    await protocol.DEFAULT_PROTOCOL.read_frame(reader),
+                    Err("connection limit exceeded"),
+                )
+                self.assertEqual(await reader.read(), b"")
+            self.assertEqual(await first.get("key"), b"value")
+        finally:
+            writer.close()
+            await writer.wait_closed()
+        disconnected = asyncio.Event()
+        disconnect = self.engine.disconnect
+
+        def on_disconnect(subscriber) -> None:
+            disconnect(subscriber)
+            disconnected.set()
+
+        with patch.object(self.engine, "disconnect", side_effect=on_disconnect):
+            await first.close()
+            async with asyncio.timeout(1):
+                await disconnected.wait()
+        async with asyncio.timeout(1):
+            async with await Client.connect("127.0.0.1", server.port) as replacement:
+                self.assertEqual(await replacement.get("key"), b"value")
+
     async def asyncSetUp(self) -> None:
         self.engine = Engine(Store(), Broker())
         self.server = TcpServer(self.engine, ServerConfig("127.0.0.1", 0))
@@ -191,6 +226,35 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
 
 
 class RuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_capacity_errors_keep_connection_and_existing_state_usable(
+        self,
+    ) -> None:
+        config = Config(
+            "INFO",
+            ServerConfig("127.0.0.1", 0, max_subscriptions=1),
+            cache=Cache(max_keys=1, max_bytes=4),
+        )
+        async with (
+            serve(config) as server,
+            await Client.connect("127.0.0.1", server.port) as client,
+        ):
+            await client.set("k", b"old")
+            await client.expire("k", 60_000)
+            with self.assertRaisesRegex(CommandError, "key limit"):
+                await client.set("other", b"")
+            with self.assertRaisesRegex(CommandError, "byte limit"):
+                await client.set("k", b"large")
+            self.assertEqual(await client.get("k"), b"old")
+            await client.subscribe("a")
+            await client.subscribe("a")
+            with self.assertRaisesRegex(CommandError, "subscription limit"):
+                await client.subscribe("b")
+            await client.unsubscribe("a")
+            await client.subscribe("b")
+            self.assertEqual(await client.publish("b", b"v"), 1)
+            async with asyncio.timeout(1):
+                self.assertEqual(await client.next_message(), Message("b", b"v"))
+
     async def test_runtime_uses_supplied_engine_and_clock(self) -> None:
         clock = ManualClock()
         store = Store(clock)

@@ -1,6 +1,8 @@
 import heapq
 
+from velis.config import DEFAULT_MAX_BYTES, DEFAULT_MAX_KEYS
 from velis.core.clock import Clock, SystemClock
+from velis.errors import CapacityError
 
 MAX_TTL_MS = 1 << 62
 
@@ -8,8 +10,19 @@ MAX_TTL_MS = 1 << 62
 class Store:
     """Store opaque bytes and monotonic TTLs on one owning thread."""
 
-    def __init__(self, clock: Clock | None = None) -> None:
-        self._clock: Clock = SystemClock if clock is None else clock
+    def __init__(
+        self,
+        clock: Clock | None = None,
+        *,
+        max_keys: int = DEFAULT_MAX_KEYS,
+        max_bytes: int = DEFAULT_MAX_BYTES,
+    ) -> None:
+        if max_keys <= 0 or max_bytes <= 0:
+            raise ValueError("store limits must be positive")
+        self._clock: Clock = SystemClock() if clock is None else clock
+        self._max_keys = max_keys
+        self._max_bytes = max_bytes
+        self._stored_bytes = 0
         self._values: dict[str, bytes] = {}
         self._deadlines: dict[str, int] = {}
         self._expiry_heap: list[tuple[int, str]] = []
@@ -19,8 +32,15 @@ class Store:
         return len(self._values)
 
     def _remove(self, key: str) -> None:
-        self._values.pop(key, None)
+        value = self._values.pop(key, None)
+        if value is not None:
+            self._stored_bytes -= len(key.encode()) + len(value)
         self._deadlines.pop(key, None)
+
+    @property
+    def stored_bytes(self) -> int:
+        """Retained UTF-8 key and value bytes, excluding Python object overhead."""
+        return self._stored_bytes
 
     def _remove_if_expired(self, key: str) -> None:
         deadline = self._deadlines.get(key)
@@ -33,8 +53,23 @@ class Store:
         return self._values.get(key)
 
     def set(self, key: str, value: bytes) -> None:
-        """Store a value and clear any previous TTL."""
+        """Store a value and clear its TTL, or reject it without changing state.
+
+        Capacity counts retained entries, including expired keys awaiting cleanup.
+        No live entry is evicted to make room.
+        """
+        previous = self._values.get(key)
+        size = len(key.encode()) + len(value)
+        if previous is None:
+            if len(self._values) >= self._max_keys:
+                raise CapacityError("store key limit exceeded")
+            stored_bytes = self._stored_bytes + size
+        else:
+            stored_bytes = self._stored_bytes - len(previous) + len(value)
+        if stored_bytes > self._max_bytes:
+            raise CapacityError("store byte limit exceeded")
         self._values[key] = value
+        self._stored_bytes = stored_bytes
         self._deadlines.pop(key, None)
         self._compact_expiry_heap()
 

@@ -15,9 +15,14 @@ from velis.net.server import TcpServer
 log = logging.getLogger(__name__)
 
 
-def build_engine() -> Engine:
+def build_engine(config: Config | None = None) -> Engine:
     """Create an engine with an empty in-memory store and pub-sub broker."""
-    return Engine(Store(), Broker())
+    if config is None:
+        return Engine(Store(), Broker())
+    return Engine(
+        Store(max_keys=config.cache.max_keys, max_bytes=config.cache.max_bytes),
+        Broker(max_subscriptions=config.server.max_subscriptions),
+    )
 
 
 async def _maintain(engine: Engine, interval: float) -> None:
@@ -43,7 +48,7 @@ async def serve(
     reports worker or caller failures in an ExceptionGroup after cleanup.
     """
     if engine is None:
-        engine = build_engine()
+        engine = build_engine(config)
     server = TcpServer(engine, config.server, wire=wire)
     async with AsyncExitStack() as resources:
         resources.push_async_callback(server.close)

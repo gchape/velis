@@ -1,6 +1,9 @@
 from collections import defaultdict
 from typing import Protocol
 
+from velis.config import DEFAULT_MAX_SUBSCRIPTIONS
+from velis.errors import CapacityError
+
 
 class Subscriber(Protocol):
     """Delivery interface implemented by subscriber connections."""
@@ -18,7 +21,10 @@ class Subscriber(Protocol):
 class Broker:
     """Track channel membership and deliver messages to live subscribers."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, max_subscriptions: int = DEFAULT_MAX_SUBSCRIPTIONS) -> None:
+        if max_subscriptions <= 0:
+            raise ValueError("subscription limit must be positive")
+        self._max_subscriptions = max_subscriptions
         self._subscribers: dict[str, set[Subscriber]] = defaultdict(set)
         self._subscriptions: dict[Subscriber, set[str]] = defaultdict(set)
 
@@ -28,6 +34,12 @@ class Broker:
 
     def subscribe(self, channel: str, subscriber: Subscriber) -> None:
         """Join a channel; repeated subscriptions have no additional effect."""
+        channels = self._subscriptions.get(subscriber)
+        if channels is not None:
+            if channel in channels:
+                return
+            if len(channels) >= self._max_subscriptions:
+                raise CapacityError("subscription limit exceeded")
         self._subscriptions[subscriber].add(channel)
         self._subscribers[channel].add(subscriber)
 

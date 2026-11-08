@@ -10,9 +10,9 @@ Velis is a lightweight in-memory key-value store with TTL expiration, pub-sub, a
 
 | Area | Description |
 | --- | --- |
-| **Store** | `GET` / `SET` / `EXPIRE` on opaque `bytes` values. Single-owner, so no locks. |
+| **Store** | `GET` / `SET` / `EXPIRE` on opaque `bytes` values, with key-count and byte limits. Single-owner, so no locks. |
 | **TTL** | Monotonic deadlines, expired lazily on read **and** actively by a background sweep, so keys nobody reads are still freed. |
-| **Pub-sub** | `SUBSCRIBE` / `UNSUBSCRIBE` / `PUBLISH`. Live delivery to connected subscribers on one server. Slow network connections are disconnected when their server write buffer exceeds the configured limit. |
+| **Pub-sub** | `SUBSCRIBE` / `UNSUBSCRIBE` / `PUBLISH`. At-most-once delivery to connected subscribers on one server. Slow network connections are disconnected when their server write buffer exceeds the configured limit. |
 | **Network** | Length-prefixed binary protocol over TCP, an asyncio server and an async `Client`. |
 | **Codecs** | Typed `CodecChain`s for payload transforms, wire serialization and validation. Stored values remain opaque bytes. |
 | **Config** | Frozen, validated `Config` loaded from `VELIS_*` environment variables. |
@@ -314,7 +314,11 @@ Request keys contain 1–512 characters and request channels contain 1–256 cha
 
 The cache is entirely in memory. Keys and TTLs are discarded on restart. There is no cache WAL, recovery or compaction.
 
-Pub-sub currently delivers messages only to connected subscribers on the same server. Messages are not persisted or replayed, and no server-to-server replication is implemented. Future replication should carry pub-sub messages, not cache state.
+The default store retains at most 100,000 keys and 64 MiB of UTF-8 key plus encoded value bytes. The byte budget excludes Python object overhead; the key-count limit also bounds entry metadata. Expired entries count until lazy expiry or maintenance removes them. The policy is to reject writes that exceed either limit, without evicting live keys. Rejected replacements preserve the previous value and TTL; successful replacements clear the TTL. A capacity error produces `ERR` and keeps the connection usable. Direct `Store` and `Broker` callers receive `CapacityError`, a `CommandError` subclass.
+
+Each connection can subscribe to at most 1,024 channels by default. Repeating an existing subscription uses no extra capacity; unsubscribing frees a slot. The listener admits at most 1,024 active connections by default. Excess connections receive a best-effort `ERR` and are closed, leaving admitted clients usable.
+
+Pub-sub provides at-most-once delivery to connected subscribers on the same server. Messages are not persisted, retried or replayed, and no server-to-server replication is implemented. Slow subscribers are disconnected when server write buffers or client unread-message queues overflow. Messages may be lost on disconnect; `PUBLISH` counts accepted deliveries, without acknowledging application processing. Future replication should carry pub-sub messages, not cache state.
 
 The former `VELIS_WAL_PATH`, `VELIS_FSYNC` and `VELIS_COMPACT_BYTES` settings are no longer used. Existing WAL files are left untouched and are not loaded.
 
@@ -322,9 +326,9 @@ The former `VELIS_WAL_PATH`, `VELIS_FSYNC` and `VELIS_COMPACT_BYTES` settings ar
 
 ## Configuration
 
-The entry point loads a frozen `Config` from environment variables. `Config.server` holds a `Server` configuration, and `Config.sweep_interval_ms` holds the expiry sweep interval.
+The entry point loads a frozen `Config` from environment variables. `Config.server` holds listener, write-buffer and subscription limits; `Config.cache` holds a `Cache` configuration for retained key and byte limits. `Config.sweep_interval_ms` holds the expiry sweep interval.
 
-Unknown log levels, ports outside `0–65535`, nonpositive buffer sizes or sweep intervals, and non-integer numeric settings raise `ValueError` at startup. Integer parsing errors include the environment variable name.
+Unknown log levels, ports outside `0–65535`, nonpositive limits or sweep intervals, and non-integer numeric settings raise `ValueError` at startup. Integer parsing errors include the environment variable name.
 
 | Variable | Default | Description |
 | --- | --- | --- |
@@ -332,7 +336,13 @@ Unknown log levels, ports outside `0–65535`, nonpositive buffer sizes or sweep
 | `VELIS_HOST` | `127.0.0.1` | Interface to listen on. |
 | `VELIS_PORT` | `9000` | Port to listen on (`0` picks a free port). |
 | `VELIS_MAX_BUFFER` | `8388608` (8 MiB) | Server write buffer limit checked when pushing a message. Must be positive; allow room for both the channel and payload plus framing. |
+| `VELIS_MAX_KEYS` | `100000` | Maximum retained cache keys; excess writes are rejected. |
+| `VELIS_MAX_BYTES` | `67108864` (64 MiB) | Maximum retained UTF-8 key plus encoded value bytes; excludes Python object overhead. |
+| `VELIS_MAX_CONNECTIONS` | `1024` | Maximum admitted TCP connections; excess connections are closed after a best-effort error. |
+| `VELIS_MAX_SUBSCRIPTIONS` | `1024` | Maximum distinct channels per subscriber connection. |
 | `VELIS_SWEEP_MS` | `100` | Milliseconds between expiry sweeps; must be positive. |
+
+`serve(config)` applies all limits to the engine it builds. When supplying your own engine, configure its store and broker explicitly with `Store(max_keys=..., max_bytes=...)` and `Broker(max_subscriptions=...)`; the server still applies its connection and write-buffer limits.
 
 ---
 
@@ -495,8 +505,8 @@ Migration from the earlier API: use `Codec[T, Encoded]` and `CodecChain[T, Encod
 src/velis/
   __main__.py         # CLI: configuration, logging, signals and runtime startup
   app.py             # composition root: serve() owns networking and maintenance
-  config.py          # Config / Server, loaded from VELIS_* env vars
-  errors.py          # VelisError, ProtocolError, CommandError
+  config.py          # Config / Server / Cache, loaded from VELIS_* env vars
+  errors.py          # VelisError, ProtocolError, CommandError, CapacityError
   banner.py          # startup banner (honours NO_COLOR)
   core/              # no sockets, no wire format
     commands.py      # Command / Reply / Message dataclasses
@@ -548,7 +558,7 @@ The core is deliberately easy to test without sockets or real time: the `Store` 
 
 * **Single-threaded by design.** The event-loop thread owns the `Engine`, `Store` and `Broker`, which is why none of them take locks. Don't call them from other threads.
 * **TTLs use monotonic time.** Deadlines are internal to the running process and are discarded on restart.
-* **No auth or TLS**, and no limits on connections or total memory yet. Don't expose it to untrusted networks.
+* **No auth or TLS.** Resource limits bound retained cache data, connection count, subscriptions and message buffers; they do not impose an exact process-memory ceiling. Don't expose it to untrusted networks.
 * **One command at a time per client.** An asyncio lock serializes requests around one pending reply future; server pushes use a separate bounded queue. There are no request IDs.
 * **Separate buffer limits.** Server write buffers and client unread-message buffers have independent limits. Client byte budgets count UTF-8 channel bytes and payload-encoded bytes after wire decoding; decoded values and application-held messages use additional memory.
 

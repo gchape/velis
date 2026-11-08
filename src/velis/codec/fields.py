@@ -1,34 +1,34 @@
-"""Explicit record boundaries around reversible value codecs."""
+"""Cursor-readable fields with explicit byte boundaries."""
 
 from dataclasses import dataclass, field
 from typing import Protocol
 
-from velis.codec.binary import U32, LengthPrefix
-from velis.codec.chain import Codec
+from velis.codec.base import Codec
 from velis.codec.cursor import Cursor
+from velis.codec.values import UInt
 from velis.errors import ProtocolError
 
 
 class Field[T](Codec[T, bytes], Protocol):
-    """A codec that also knows how to consume one field from a record."""
+    """A codec that can read one complete field from a record cursor."""
 
     def read(self, cursor: Cursor) -> T: ...
 
 
 @dataclass(frozen=True, slots=True)
-class Fixed[T]:
-    """Encode or consume exactly width bytes around a value codec."""
+class FixedLengthField[T]:
+    """A field of exactly length bytes, interpreted by the inner value codec."""
 
     codec: Codec[T, bytes]
-    width: int
+    length: int
 
     def __post_init__(self) -> None:
-        if self.width <= 0:
-            raise ValueError("field width must be positive")
+        if self.length <= 0:
+            raise ValueError("field length must be positive")
 
     def _check(self, data: bytes) -> None:
-        if len(data) != self.width:
-            raise ProtocolError(f"expected {self.width} field bytes")
+        if len(data) != self.length:
+            raise ProtocolError(f"expected {self.length} field bytes")
 
     def encode(self, value: T) -> bytes:
         data = self.codec.encode(value)
@@ -40,26 +40,41 @@ class Fixed[T]:
         return self.codec.decode(data)
 
     def read(self, cursor: Cursor) -> T:
-        return self.codec.decode(cursor.take(self.width))
+        return self.codec.decode(cursor.take(self.length))
 
 
 @dataclass(frozen=True, slots=True)
-class Prefixed[T]:
-    """Bound a value's encoded bytes with a u32 prefix checked before reading."""
+class LengthPrefixedField[T]:
+    """A field whose encoded byte length precedes its encoded value.
+
+    prefix explicitly selects the unsigned integer codec for the length.
+    max_length bounds the encoded value in bytes, excluding the prefix.
+    Check this limit before consuming and decoding the field body.
+    """
 
     codec: Codec[T, bytes]
     max_length: int
-    _framing: LengthPrefix = field(init=False, repr=False)
+    prefix: UInt = field(kw_only=True)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "_framing", LengthPrefix(self.max_length))
+        if not 0 <= self.max_length <= self.prefix.max_value:
+            raise ValueError("length limit must fit the prefix codec")
+
+    def check_length(self, length: int) -> None:
+        """Enforce the encoded body's byte limit."""
+        if length > self.max_length:
+            raise ProtocolError(f"field too long: {length}")
 
     def encode(self, value: T) -> bytes:
-        return self._framing.encode(self.codec.encode(value))
-
-    def decode(self, data: bytes) -> T:
-        return self.codec.decode(self._framing.decode(data))
+        data = self.codec.encode(value)
+        self.check_length(len(data))
+        return self.prefix.encode(len(data)) + data
 
     def read(self, cursor: Cursor) -> T:
-        length = self._framing.decode_length(cursor.take(U32.width))
+        length = self.prefix.decode(cursor.take(self.prefix.length))
+        self.check_length(length)
         return self.codec.decode(cursor.take(length))
+
+    def decode(self, data: bytes) -> T:
+        with Cursor(data) as cursor:
+            return self.read(cursor)

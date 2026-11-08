@@ -1,6 +1,6 @@
 """Composable command/frame codecs and bounded TCP message framing.
 
-Each message is a u32 body length followed by the encoded body. Default bodies
+Default messages use a u32 body length followed by the encoded body. Bodies
 use a text tag and ordered fields; tagged tables map each tag to its dataclass
 variant and explicit field layouts. The server answers commands in order, so
 replies carry no request identifiers.
@@ -12,18 +12,18 @@ from dataclasses import dataclass, field
 from functools import cached_property
 
 from velis.codec import (
+    U32,
+    U64,
+    Choice,
     Codec,
-    CodecChain,
-    Fixed,
-    FrameDecoder,
+    CompositeCodec,
+    FixedLengthField,
     Identity,
-    LengthPrefix,
-    Prefixed,
-    TaggedUnion,
+    LengthPrefixedField,
+    Record,
     Utf8,
     Validate,
 )
-from velis.codec.binary import U32, U64
 from velis.core.commands import (
     Command,
     Delete,
@@ -51,12 +51,11 @@ from velis.errors import ProtocolError
 
 MAX_LEN = 1 << 20
 MAX_FRAME_LEN = 2 * MAX_LEN
-READ_SIZE = 64 * 1024
 
 type Frame = Reply | Message
 
-BYTES = Prefixed(Identity(), MAX_LEN)
-TEXT = Prefixed(Utf8(), MAX_LEN)
+BYTES = LengthPrefixedField(Identity(), MAX_LEN, prefix=U32)
+TEXT = LengthPrefixedField(Utf8(), MAX_LEN, prefix=U32)
 
 
 def _text_rule(what: str, max_chars: int) -> Callable[[str], None]:
@@ -69,45 +68,46 @@ def _text_rule(what: str, max_chars: int) -> Callable[[str], None]:
     return check
 
 
-def _text_field(what: str, max_chars: int) -> Prefixed[str]:
+def _text_field(what: str, max_chars: int) -> LengthPrefixedField[str]:
     """Bound text by characters and allow up to four UTF-8 bytes per character."""
-    return Prefixed(
-        CodecChain.of(Validate(_text_rule(what, max_chars))) | Utf8(),
+    return LengthPrefixedField(
+        CompositeCodec.of(Validate(_text_rule(what, max_chars))) | Utf8(),
         max_chars * 4,
+        prefix=U32,
     )
 
 
 KEY = _text_field("key", 512)
 CHANNEL = _text_field("channel", 256)
 
-COMMANDS: TaggedUnion[Command] = TaggedUnion(
+COMMANDS: Choice[Command] = Choice(
     "command",
     {
-        "GET": (Get, (KEY,)),
-        "SET": (Set, (KEY, BYTES)),
-        "EXPIRE": (Expire, (KEY, Fixed(U64, 8))),
-        "DEL": (Delete, (KEY,)),
-        "TTL": (Ttl, (KEY,)),
-        "PERSIST": (Persist, (KEY,)),
-        "SUBSCRIBE": (Subscribe, (CHANNEL,)),
-        "UNSUBSCRIBE": (Unsubscribe, (CHANNEL,)),
-        "PUBLISH": (Publish, (CHANNEL, BYTES)),
+        "GET": Record(Get, KEY),
+        "SET": Record(Set, KEY, BYTES),
+        "EXPIRE": Record(Expire, KEY, FixedLengthField(U64, 8)),
+        "DEL": Record(Delete, KEY),
+        "TTL": Record(Ttl, KEY),
+        "PERSIST": Record(Persist, KEY),
+        "SUBSCRIBE": Record(Subscribe, CHANNEL),
+        "UNSUBSCRIBE": Record(Unsubscribe, CHANNEL),
+        "PUBLISH": Record(Publish, CHANNEL, BYTES),
     },
 )
 
-FRAMES: TaggedUnion[Frame] = TaggedUnion(
+FRAMES: Choice[Frame] = Choice(
     "frame",
     {
-        "OK": (Ok, ()),
-        "NIL": (Nil, ()),
-        "VALUE": (Value, (BYTES,)),
-        "ERR": (Err, (TEXT,)),
-        "SUBSCRIBED": (Subscribed, (TEXT,)),
-        "UNSUBSCRIBED": (Unsubscribed, (TEXT,)),
-        "DELIVERED": (Delivered, (Fixed(U32, 4),)),
-        "TTL_VALUE": (TtlValue, (Fixed(U64, 8),)),
-        "PERSISTENT": (Persistent, ()),
-        "MESSAGE": (Message, (TEXT, BYTES)),
+        "OK": Record(Ok),
+        "NIL": Record(Nil),
+        "VALUE": Record(Value, BYTES),
+        "ERR": Record(Err, TEXT),
+        "SUBSCRIBED": Record(Subscribed, TEXT),
+        "UNSUBSCRIBED": Record(Unsubscribed, TEXT),
+        "DELIVERED": Record(Delivered, FixedLengthField(U32, 4)),
+        "TTL_VALUE": Record(TtlValue, FixedLengthField(U64, 8)),
+        "PERSISTENT": Record(Persistent),
+        "MESSAGE": Record(Message, TEXT, BYTES),
     },
 )
 
@@ -123,35 +123,50 @@ class WireProtocol:
 
     command_codec: Codec[Command, bytes] = COMMANDS
     frame_codec: Codec[Frame, bytes] = FRAMES
-    framing: LengthPrefix = field(default_factory=lambda: LengthPrefix(MAX_FRAME_LEN))
+    framing: LengthPrefixedField[bytes] = field(
+        default_factory=lambda: LengthPrefixedField(
+            Identity(), MAX_FRAME_LEN, prefix=U32
+        )
+    )
 
     @cached_property
-    def commands(self) -> CodecChain[Command, bytes]:
-        return CodecChain.of(self.command_codec) | self.framing
+    def commands(self) -> CompositeCodec[Command, bytes]:
+        """Encode and decode whole framed commands."""
+        return CompositeCodec.of(self.command_codec) | self.framing
 
     @cached_property
-    def frames(self) -> CodecChain[Frame, bytes]:
-        return CodecChain.of(self.frame_codec) | self.framing
+    def frames(self) -> CompositeCodec[Frame, bytes]:
+        """Encode and decode whole framed replies and pushes."""
+        return CompositeCodec.of(self.frame_codec) | self.framing
 
-    async def _read_bodies(self, reader: asyncio.StreamReader) -> AsyncGenerator[bytes]:
-        """Yield frame bodies until EOF; raise if EOF interrupts a frame."""
-        decoder = FrameDecoder(self.framing)
-        while chunk := await reader.read(READ_SIZE):
-            decoder.feed(chunk)
-            for body in decoder.bodies():
-                yield body
-        if decoder.pending:
-            raise asyncio.IncompleteReadError(decoder.pending, None)
+    async def _read_body(self, reader: asyncio.StreamReader) -> bytes | None:
+        """Return one frame body, or None on EOF at a frame boundary.
 
-    async def read_commands(
-        self, reader: asyncio.StreamReader
-    ) -> AsyncGenerator[Command]:
-        async for body in self._read_bodies(reader):
-            yield self.command_codec.decode(body)
+        Raise IncompleteReadError if EOF interrupts a frame.
+        """
+        try:
+            header = await reader.readexactly(self.framing.prefix.length)
+        except asyncio.IncompleteReadError as exc:
+            if exc.partial:
+                raise
+            return None
+        length = self.framing.prefix.decode(header)
+        self.framing.check_length(length)
+        return self.framing.codec.decode(await reader.readexactly(length))
 
-    async def read_frames(self, reader: asyncio.StreamReader) -> AsyncGenerator[Frame]:
-        async for body in self._read_bodies(reader):
-            yield self.frame_codec.decode(body)
+    async def _read[T](
+        self, reader: asyncio.StreamReader, codec: Codec[T, bytes]
+    ) -> AsyncGenerator[T]:
+        while (body := await self._read_body(reader)) is not None:
+            yield codec.decode(body)
+
+    def read_commands(self, reader: asyncio.StreamReader) -> AsyncGenerator[Command]:
+        """Yield decoded commands until the peer disconnects cleanly."""
+        return self._read(reader, self.command_codec)
+
+    def read_frames(self, reader: asyncio.StreamReader) -> AsyncGenerator[Frame]:
+        """Yield decoded replies and pushes until the server disconnects cleanly."""
+        return self._read(reader, self.frame_codec)
 
 
 DEFAULT_PROTOCOL = WireProtocol()

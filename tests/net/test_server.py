@@ -6,7 +6,14 @@ from unittest.mock import AsyncMock, Mock, patch
 from tests.codec.helpers import Reverse
 from tests.helpers import ManualClock
 from velis.app import serve
-from velis.codec import Codec, CodecChain, Deflate, Validate
+from velis.codec import (
+    Codec,
+    CompositeCodec,
+    Identity,
+    LengthPrefixedField,
+    UInt,
+    Validate,
+)
 from velis.config import Config
 from velis.config import Server as ServerConfig
 from velis.core.broker import Broker
@@ -21,25 +28,25 @@ from velis.net.server import TcpServer
 
 
 class ServerTests(unittest.IsolatedAsyncioTestCase):
-    async def test_compression_for_values_and_publications(self) -> None:
-        codec = Deflate()
+    async def test_payload_codec_for_values_and_publications(self) -> None:
+        codec = LengthPrefixedField(Identity(), 1024, prefix=UInt(4))
         coded = await self.client(codec)
         raw = await self.client()
-        payload = b"compressible value" * 1000
-        await coded.set("compressed", payload)
-        encoded = await raw.get("compressed")
+        payload = b"encoded value" * 10
+        await coded.set("coded", payload)
+        encoded = await raw.get("coded")
         self.assertIsNotNone(encoded)
         assert encoded is not None
-        self.assertLess(len(encoded), len(payload))
+        self.assertEqual(encoded, codec.encode(payload))
         self.assertEqual(codec.decode(encoded), payload)
-        self.assertEqual(await coded.get("compressed"), payload)
-        await coded.subscribe("compressed")
-        self.assertEqual(await coded.publish("compressed", payload), 1)
+        self.assertEqual(await coded.get("coded"), payload)
+        await coded.subscribe("coded")
+        self.assertEqual(await coded.publish("coded", payload), 1)
         async with asyncio.timeout(1):
-            self.assertEqual(await coded.next_message(), Message("compressed", payload))
+            self.assertEqual(await coded.next_message(), Message("coded", payload))
         with self.assertRaises(ProtocolError):
             await coded.set("oversized", b"x" * (codec.max_length + 1))
-        self.assertEqual(await coded.get("compressed"), payload)
+        self.assertEqual(await coded.get("coded"), payload)
 
     async def test_slow_subscriber_is_aborted_without_blocking_publisher(self) -> None:
         writer = Mock(spec=asyncio.StreamWriter)
@@ -64,7 +71,8 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         wire = protocol.WireProtocol(
-            frame_codec=CodecChain.of(protocol.FRAMES) | Deflate(max_length=64)
+            frame_codec=CompositeCodec.of(protocol.FRAMES)
+            | LengthPrefixedField(Identity(), 64, prefix=UInt(4))
         )
         server = TcpServer(self.engine, ServerConfig("127.0.0.1", 0), wire=wire)
         await server.start()
@@ -243,8 +251,9 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         wire = protocol.WireProtocol(
-            command_codec=CodecChain.of(protocol.COMMANDS) | Reverse(),
-            frame_codec=CodecChain.of(protocol.FRAMES) | Reverse(),
+            command_codec=CompositeCodec.of(protocol.COMMANDS) | Reverse(),
+            frame_codec=CompositeCodec.of(protocol.FRAMES) | Reverse(),
+            framing=LengthPrefixedField(Identity(), 65535, prefix=UInt(2)),
         )
         store = Store()
         server = TcpServer(
@@ -273,7 +282,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
                 raise ProtocolError("blocked key")
 
         wire = protocol.WireProtocol(
-            command_codec=CodecChain.of(Validate(allow)) | protocol.COMMANDS,
+            command_codec=CompositeCodec.of(Validate(allow)) | protocol.COMMANDS,
         )
         async with await Client.connect(
             "127.0.0.1", self.server.port, wire=wire
@@ -289,8 +298,8 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
                 raise ProtocolError("blocked key")
 
         wire = protocol.WireProtocol(
-            command_codec=CodecChain.of(Validate(allow)) | protocol.COMMANDS,
-            frame_codec=CodecChain.of(protocol.FRAMES) | Reverse(),
+            command_codec=CompositeCodec.of(Validate(allow)) | protocol.COMMANDS,
+            frame_codec=CompositeCodec.of(protocol.FRAMES) | Reverse(),
         )
         server = TcpServer(self.engine, ServerConfig("127.0.0.1", 0), wire=wire)
         await server.start()
@@ -365,46 +374,6 @@ class RuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     await operation("")
             await client.set("k", b"still usable")
             self.assertEqual(await client.get("k"), b"still usable")
-
-    async def test_compressed_wire_and_oversized_decompression(self) -> None:
-        wire = protocol.WireProtocol(
-            command_codec=CodecChain.of(protocol.COMMANDS)
-            | Deflate(max_length=protocol.MAX_FRAME_LEN),
-            frame_codec=CodecChain.of(protocol.FRAMES)
-            | Deflate(max_length=protocol.MAX_FRAME_LEN),
-        )
-        config = Config("INFO", ServerConfig("127.0.0.1", 0))
-        async with serve(config, wire=wire) as server:
-            async with await Client.connect(
-                "127.0.0.1", server.port, wire=wire
-            ) as client:
-                payload = b"x" * protocol.MAX_LEN
-                await client.set("key", payload)
-                self.assertEqual(await client.get("key"), payload)
-                await client.subscribe("ch")
-                self.assertEqual(await client.publish("ch", payload), 1)
-                async with asyncio.timeout(1):
-                    self.assertEqual(
-                        await client.next_message(), Message("ch", payload)
-                    )
-                with self.assertRaises(CommandError):
-                    await client.expire("key", 1 << 63)
-                self.assertEqual(await client.get("key"), payload)
-            reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
-            try:
-                compressed = Deflate(max_length=3 << 20).encode(
-                    b"x" * (protocol.MAX_FRAME_LEN + 1)
-                )
-                writer.write(wire.framing.encode(compressed))
-                async with asyncio.timeout(1):
-                    self.assertEqual(
-                        await anext(wire.read_frames(reader)),
-                        Err("uncompressed data exceeds limit"),
-                    )
-                    self.assertEqual(await reader.read(), b"")
-            finally:
-                writer.close()
-                await writer.wait_closed()
 
     async def test_capacity_errors_keep_connection_and_existing_state_usable(
         self,
@@ -507,8 +476,8 @@ class RuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_runtime_scope_serves_and_closes_live_connections(self) -> None:
         config = Config("INFO", ServerConfig("127.0.0.1", 0))
         wire = protocol.WireProtocol(
-            command_codec=CodecChain.of(protocol.COMMANDS) | Reverse(),
-            frame_codec=CodecChain.of(protocol.FRAMES) | Reverse(),
+            command_codec=CompositeCodec.of(protocol.COMMANDS) | Reverse(),
+            frame_codec=CompositeCodec.of(protocol.FRAMES) | Reverse(),
         )
         async with serve(config, wire=wire) as server:
             client = await Client.connect("127.0.0.1", server.port, wire=wire)

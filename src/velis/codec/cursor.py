@@ -1,14 +1,27 @@
-from dataclasses import dataclass, field
+from typing import Self
 
 from velis.errors import ProtocolError
 
 
-@dataclass(slots=True, eq=False)
 class Cursor:
-    """Sequential reader over one encoded record."""
+    """Sequential reader over one encoded record.
 
-    _data: bytes = field(repr=False)
-    _offset: int = field(default=0, init=False)
+    Used as a context manager, it requires the whole record to be consumed:
+    leaving the block normally calls finish().
+    """
+
+    __slots__ = ("_data", "_offset")
+
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+        self._offset = 0
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, exc_type: object, *_: object) -> None:
+        if exc_type is None:
+            self.finish()
 
     def take(self, size: int) -> bytes:
         """Consume exactly size bytes, preserving position on truncation."""
@@ -16,7 +29,7 @@ class Cursor:
             raise ValueError("read size must be nonnegative")
         end = self._offset + size
         if end > len(self._data):
-            raise ProtocolError("truncated record")
+            raise ProtocolError(f"truncated record: need {size} bytes")
         chunk = self._data[self._offset : end]
         self._offset = end
         return chunk

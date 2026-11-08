@@ -2,7 +2,8 @@ import asyncio
 import contextlib
 import unittest
 
-from velis.codec import CodecChain, Deflate
+from tests.codec.helpers import Reverse
+from velis.codec import CompositeCodec
 from velis.config import Server as ServerConfig
 from velis.core.broker import Broker
 from velis.core.commands import (
@@ -62,18 +63,16 @@ class PipelineIntegrationTests(unittest.IsolatedAsyncioTestCase):
             writer.close()
             await writer.wait_closed()
 
-    async def test_concurrent_commands_and_pushes_with_default_and_compressed_wires(
+    async def test_concurrent_commands_and_pushes_with_default_and_custom_wires(
         self,
     ) -> None:
-        compressed = protocol.WireProtocol(
-            command_codec=CodecChain.of(protocol.COMMANDS)
-            | Deflate(max_length=protocol.MAX_FRAME_LEN),
-            frame_codec=CodecChain.of(protocol.FRAMES)
-            | Deflate(max_length=protocol.MAX_FRAME_LEN),
+        transformed = protocol.WireProtocol(
+            command_codec=CompositeCodec.of(protocol.COMMANDS) | Reverse(),
+            frame_codec=CompositeCodec.of(protocol.FRAMES) | Reverse(),
         )
         for i in range(16):
             self.store.set(str(i), str(i).encode())
-        for wire in (protocol.DEFAULT_PROTOCOL, compressed):
+        for wire in (protocol.DEFAULT_PROTOCOL, transformed):
             with self.subTest(wire=wire):
                 server = TcpServer(self.engine, ServerConfig("127.0.0.1", 0), wire=wire)
                 await server.start()

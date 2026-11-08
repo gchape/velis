@@ -2,7 +2,7 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock, Mock
 
-from velis.codec import LengthPrefix
+from velis.codec import Identity, LengthPrefixedField, UInt
 from velis.config import Server as ServerConfig
 from velis.core.engine import Engine
 from velis.net.protocol import WireProtocol
@@ -14,7 +14,9 @@ class ServerErrorTests(unittest.IsolatedAsyncioTestCase):
         for max_frame, write_error in ((0, None), (1024, ConnectionResetError("gone"))):
             with self.subTest(max_frame=max_frame, write_error=write_error):
                 engine = Mock(spec=Engine)
-                wire = WireProtocol(framing=LengthPrefix(max_frame))
+                wire = WireProtocol(
+                    framing=LengthPrefixedField(Identity(), max_frame, prefix=UInt(4))
+                )
                 server = TcpServer(engine, ServerConfig("127.0.0.1", 0), wire=wire)
                 reader = asyncio.StreamReader()
                 reader.feed_data(b"\x00\x00\x00\x00")

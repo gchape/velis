@@ -5,7 +5,14 @@ import struct
 import unittest
 from collections.abc import AsyncGenerator, Callable
 
-from velis.codec import Codec
+from tests.codec.helpers import Reverse
+from velis.codec import (
+    Codec,
+    CompositeCodec,
+    Identity,
+    LengthPrefixedField,
+    UInt,
+)
 from velis.core.commands import (
     Delete,
     Delivered,
@@ -40,6 +47,47 @@ def stream(data: bytes) -> asyncio.StreamReader:
 
 
 class ProtocolTests(unittest.IsolatedAsyncioTestCase):
+    async def test_custom_outer_prefixes_match_sync_and_stream_decoding(self) -> None:
+        for prefix_length in (1, 2, 3, 4, 8):
+            for value_codec in (Identity(), Reverse()):
+                with self.subTest(prefix_length=prefix_length, codec=value_codec):
+                    framing = LengthPrefixedField(
+                        value_codec, 255, prefix=UInt(prefix_length)
+                    )
+                    wire = protocol.WireProtocol(framing=framing)
+                    commands = [Set("key", b"value"), Get("key")]
+                    for command in commands:
+                        self.assertEqual(
+                            wire.commands.decode(wire.commands.encode(command)), command
+                        )
+                    encoded = b"".join(wire.commands.encode(cmd) for cmd in commands)
+                    self.assertEqual(
+                        [cmd async for cmd in wire.read_commands(stream(encoded))],
+                        commands,
+                    )
+                    frames = [Value(b"value"), Message("news", b"hello")]
+                    for frame in frames:
+                        self.assertEqual(
+                            wire.frames.decode(wire.frames.encode(frame)), frame
+                        )
+                    encoded = b"".join(wire.frames.encode(frame) for frame in frames)
+                    self.assertEqual(
+                        [frame async for frame in wire.read_frames(stream(encoded))],
+                        frames,
+                    )
+
+    async def test_composite_body_codec_works_with_framing_and_streams(self) -> None:
+        codec = CompositeCodec.of(protocol.COMMANDS) | Reverse()
+        wire = protocol.WireProtocol(command_codec=codec)
+        self.assertIsInstance(wire.commands, CompositeCodec)
+        self.assertIs(wire.commands, wire.commands)
+        command = Set("key", b"hello")
+        encoded = wire.commands.encode(command)
+        self.assertEqual(wire.commands.decode(encoded), command)
+        self.assertEqual(
+            [value async for value in wire.read_commands(stream(encoded))], [command]
+        )
+
     def test_arbitrary_and_mutated_bytes_only_raise_protocol_errors(self) -> None:
         rng = random.Random(0)
 

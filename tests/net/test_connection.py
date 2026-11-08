@@ -4,7 +4,7 @@ from unittest.mock import Mock
 
 from tests.codec.helpers import Reverse
 from tests.helpers import RecordingSubscriber
-from velis.codec import CodecChain, Deflate
+from velis.codec import CompositeCodec, Identity, LengthPrefixedField, UInt
 from velis.core.broker import Broker
 from velis.core.commands import Message
 from velis.net import protocol
@@ -21,7 +21,7 @@ class ConnectionDeliveryTests(unittest.TestCase):
                 wire = protocol.WireProtocol(frame_codec=codec)
                 if transformed:
                     wire = protocol.WireProtocol(
-                        frame_codec=CodecChain.of(codec) | Reverse()
+                        frame_codec=CompositeCodec.of(codec) | Reverse()
                     )
                 other_codec = Mock(wraps=protocol.FRAMES)
                 other_wire = protocol.WireProtocol(frame_codec=other_codec)
@@ -82,7 +82,8 @@ class ConnectionDeliveryTests(unittest.TestCase):
 
     def test_encoding_failure_drops_only_subscriber_and_preserves_fanout(self) -> None:
         wire = protocol.WireProtocol(
-            frame_codec=CodecChain.of(protocol.FRAMES) | Deflate(max_length=64)
+            frame_codec=CompositeCodec.of(protocol.FRAMES)
+            | LengthPrefixedField(Identity(), 64, prefix=UInt(4))
         )
         failing = Connection(Mock(), self.writer, 16, wire=wire)
         broker, healthy = Broker(), RecordingSubscriber()

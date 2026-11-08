@@ -1,7 +1,8 @@
 import unittest
 
-from tests.codec.helpers import Reverse
+from tests.codec.helpers import Prefix, Reverse
 from tests.helpers import RecordingSubscriber
+from velis.codec import CompositeCodec
 from velis.core.broker import Broker
 from velis.core.commands import Command, Err, Message, Reply
 from velis.core.engine import Engine
@@ -35,6 +36,20 @@ class LocalSession:
 
 
 class ClientCompositionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_composite_codec_handles_payloads_and_publications(self) -> None:
+        codec: CompositeCodec[bytes, bytes] = CompositeCodec(
+            (CompositeCodec((Prefix(),)), Reverse())
+        )
+        store = Store()
+        session = LocalSession(Engine(store, Broker()))
+        async with Client(session, codec) as client:
+            await client.set("key", b"hello")
+            self.assertEqual(store.get("key"), codec.encode(b"hello"))
+            self.assertEqual(await client.get("key"), b"hello")
+            await client.subscribe("news")
+            self.assertEqual(await client.publish("news", b"hello"), 1)
+            self.assertEqual(await client.next_message(), Message("news", b"hello"))
+
     async def test_commands_and_codecs_work_over_an_independent_session(self) -> None:
         store = Store()
         session = LocalSession(Engine(store, Broker()))

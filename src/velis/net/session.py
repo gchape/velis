@@ -1,4 +1,4 @@
-"""Transport sessions for serialized commands and asynchronous server messages."""
+"""Transport sessions for correlated commands and asynchronous server messages."""
 
 import asyncio
 import contextlib
@@ -6,13 +6,21 @@ from typing import Protocol
 
 from velis.core.commands import Command, Err, Message, Reply
 from velis.errors import ProtocolError
-from velis.net.protocol import DEFAULT_PROTOCOL, WireProtocol
+from velis.net.protocol import (
+    DEFAULT_PROTOCOL,
+    MAX_REQUEST_ID,
+    Request,
+    Response,
+    WireProtocol,
+)
+
+DEFAULT_MAX_PENDING_REQUESTS = 128
 
 
 class Session(Protocol):
     """Exchange encoded application data independently of client codecs.
 
-    Implementations own request ordering, message delivery and shutdown.
+    Implementations own request correlation, message delivery and shutdown.
     Replies include server errors; the client translates them for callers.
     """
 
@@ -30,10 +38,10 @@ class Session(Protocol):
 
 
 class TcpSession:
-    """Serialize TCP requests and bound unread server messages.
+    """Correlate bounded in-flight TCP requests and buffer server messages.
 
-    Limit both message count and channel/payload bytes. Closing wakes waiting
-    readers and lets already queued messages drain before reporting closure.
+    Bound in-flight requests, message count and channel/payload bytes. Closing
+    wakes waiters and lets queued messages drain before reporting closure.
     Construction starts the reader task and requires a running event loop.
     """
 
@@ -43,17 +51,22 @@ class TcpSession:
         writer: asyncio.StreamWriter,
         *,
         wire: WireProtocol = DEFAULT_PROTOCOL,
+        max_pending_requests: int = DEFAULT_MAX_PENDING_REQUESTS,
         max_pending_messages: int = 1024,
         max_pending_bytes: int = 8 << 20,
     ) -> None:
-        if max_pending_messages <= 0 or max_pending_bytes <= 0:
-            raise ValueError("pending message limits must be positive")
+        if (
+            max_pending_requests <= 0
+            or max_pending_messages <= 0
+            or max_pending_bytes <= 0
+        ):
+            raise ValueError("pending request and message limits must be positive")
         self._wire = wire
         self._reader = reader
         self._writer = writer
-        self._request_lock = asyncio.Lock()
-        self._replies: asyncio.Queue[Reply] = asyncio.Queue(maxsize=1)
-        self._awaiting_reply = False
+        self._request_slots = asyncio.Semaphore(max_pending_requests)
+        self._pending: dict[int, asyncio.Queue[Reply] | None] = {}
+        self._next_request_id = 1
         self._max_pending_bytes = max_pending_bytes
         self._queued_bytes = 0
         self._messages: asyncio.Queue[Message] = asyncio.Queue(
@@ -70,6 +83,7 @@ class TcpSession:
         port: int,
         *,
         wire: WireProtocol = DEFAULT_PROTOCOL,
+        max_pending_requests: int = DEFAULT_MAX_PENDING_REQUESTS,
         max_pending_messages: int = 1024,
         max_pending_bytes: int = 8 << 20,
     ) -> TcpSession:
@@ -80,6 +94,7 @@ class TcpSession:
                 reader,
                 writer,
                 wire=wire,
+                max_pending_requests=max_pending_requests,
                 max_pending_messages=max_pending_messages,
                 max_pending_bytes=max_pending_bytes,
             )
@@ -114,14 +129,18 @@ class TcpSession:
         self._messages.put_nowait(message)
         self._queued_bytes += size
 
-    def _resolve_reply(self, reply: Reply) -> None:
-        """Complete the active request, rejecting unsolicited or duplicate replies."""
-        if not self._awaiting_reply or not self._replies.empty():
-            if not self._awaiting_reply and isinstance(reply, Err):
-                self._begin_close(reply.message)
-                return
-            raise ProtocolError("reply received without a pending request")
-        self._replies.put_nowait(reply)
+    def _resolve_reply(self, response: Response) -> None:
+        """Match replies by ID and discard one late reply for cancelled requests."""
+        request_id, reply = response.request_id, response.reply
+        if request_id == 0 and isinstance(reply, Err):
+            self._begin_close(reply.message)
+            return
+        if request_id not in self._pending:
+            raise ProtocolError(f"unexpected reply ID: {request_id}")
+        queue = self._pending.pop(request_id)
+        self._request_slots.release()
+        if queue is not None:
+            queue.put_nowait(reply)
 
     @staticmethod
     def _message_size(message: Message) -> int:
@@ -135,32 +154,55 @@ class TcpSession:
         self._closed = True
         self._close_reason = reason
         self._writer.close()
-        self._replies.shutdown()
+        for queue in self._pending.values():
+            if queue is not None:
+                queue.shutdown()
+            self._request_slots.release()
+        self._pending.clear()
         self._messages.shutdown()
 
     async def request(self, command: Command) -> Reply:
-        """Send one command and wait for its reply under the request lock.
+        """Send a command and await the reply carrying its connection-local ID.
 
-        Cancellation after sending closes the stream: replies have no IDs,
-        so an abandoned reply cannot safely be reused for another command.
+        Cancellation abandons the reply without closing the stream. A sent
+        request retains its slot until its reply arrives, bounding cancelled
+        request bookkeeping even when the peer stops responding.
         """
-        async with self._request_lock:
+        if self._closed:
+            raise ConnectionError(self._close_reason)
+        await self._request_slots.acquire()
+        request_id: int | None = None
+        try:
             if self._closed:
                 raise ConnectionError(self._close_reason)
-            encoded_command = self._wire.commands.encode(command)
-            self._awaiting_reply = True
+            if self._next_request_id > MAX_REQUEST_ID:
+                self._begin_close("request ID space exhausted")
+                raise ConnectionError(self._close_reason)
+            encoded_command = self._wire.commands.encode(
+                Request(self._next_request_id, command)
+            )
+            queue: asyncio.Queue[Reply] = asyncio.Queue(maxsize=1)
+            request_id = self._next_request_id
+            self._next_request_id += 1
+            self._pending[request_id] = queue
+            # Encoding, ID allocation and the complete write are synchronous;
+            # concurrent requests cannot interleave frames before drain yields.
+            self._writer.write(encoded_command)
+            await self._writer.drain()
             try:
-                self._writer.write(encoded_command)
-                await self._writer.drain()
-                try:
-                    return await self._replies.get()
-                except asyncio.QueueShutDown:
-                    raise ConnectionError(self._close_reason) from None
-            except asyncio.CancelledError, ConnectionError:
-                await self.close()
-                raise
-            finally:
-                self._awaiting_reply = False
+                return await queue.get()
+            except asyncio.QueueShutDown:
+                raise ConnectionError(self._close_reason) from None
+        except ConnectionError:
+            await self.close()
+            raise
+        finally:
+            if request_id is None:
+                self._request_slots.release()
+            elif request_id in self._pending:
+                # Keep only the ID until the peer replies; discard payloads and
+                # distinguish a late cancelled reply from an unknown ID.
+                self._pending[request_id] = None
 
     async def next_message(self) -> Message:
         """Wait for the next encoded message.

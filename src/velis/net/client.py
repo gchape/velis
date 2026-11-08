@@ -28,7 +28,7 @@ from velis.core.commands import (
 from velis.core.expiry import MISSING, NO_EXPIRY
 from velis.errors import CommandError, ProtocolError
 from velis.net.protocol import DEFAULT_PROTOCOL, WireProtocol
-from velis.net.session import Session, TcpSession
+from velis.net.session import DEFAULT_MAX_PENDING_REQUESTS, Session, TcpSession
 
 
 def _unexpected(command: Command, reply: Reply) -> ProtocolError:
@@ -54,14 +54,16 @@ class Client:
         codec: Codec[bytes, bytes] | None = None,
         *,
         wire: WireProtocol = DEFAULT_PROTOCOL,
+        max_pending_requests: int = DEFAULT_MAX_PENDING_REQUESTS,
         max_pending_messages: int = 1024,
         max_pending_bytes: int = 8 << 20,
     ) -> Client:
-        """Create a client backed by a TCP session with bounded unread messages."""
+        """Create a TCP client with bounded requests and unread messages."""
         session = await TcpSession.connect(
             host,
             port,
             wire=wire,
+            max_pending_requests=max_pending_requests,
             max_pending_messages=max_pending_messages,
             max_pending_bytes=max_pending_bytes,
         )

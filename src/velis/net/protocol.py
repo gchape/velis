@@ -1,7 +1,7 @@
 """Composable command/frame codecs and bounded TCP message framing.
 
-Each message is a u32 body length followed by the encoded body. A body is
-a length-prefixed text tag followed by that tag's fields.
+Each message is a u32 body length, a u64 request ID and the encoded body.
+ID zero is reserved for server pushes and connection-wide errors.
 """
 
 import asyncio
@@ -40,8 +40,28 @@ from velis.errors import ProtocolError
 
 MAX_LEN = 1 << 20
 MAX_FRAME_LEN = 2 * MAX_LEN
+MAX_REQUEST_ID = (1 << 64) - 1
 
 type Frame = Reply | Message
+
+
+@dataclass(frozen=True, slots=True)
+class Request:
+    """A connection-local, nonzero request ID and its command."""
+
+    request_id: int
+    command: Command
+
+
+@dataclass(frozen=True, slots=True)
+class Response:
+    """A reply echoing its request ID; zero denotes a connection-wide Err."""
+
+    request_id: int
+    reply: Reply
+
+
+type WireFrame = Response | Message
 
 BYTES = LengthPrefix(MAX_LEN)
 TEXT = CodecChain.of(Utf8()) | BYTES
@@ -193,11 +213,59 @@ class FrameCodec:
         return frame
 
 
+@dataclass(frozen=True, slots=True)
+class _RequestCodec:
+    body: Codec[Command, bytes]
+
+    @property
+    def name(self) -> str:
+        return f"request_{self.body.name}"
+
+    def encode(self, request: Request) -> bytes:
+        if request.request_id == 0:
+            raise ProtocolError("request ID must be nonzero")
+        return U64.encode(request.request_id) + self.body.encode(request.command)
+
+    def decode(self, data: bytes) -> Request:
+        request_id = U64.decode(data[: U64.width])
+        if request_id == 0:
+            raise ProtocolError("request ID must be nonzero")
+        return Request(request_id, self.body.decode(data[U64.width :]))
+
+
+@dataclass(frozen=True, slots=True)
+class _ResponseCodec:
+    body: Codec[Frame, bytes]
+
+    @property
+    def name(self) -> str:
+        return f"response_{self.body.name}"
+
+    def encode(self, frame: WireFrame) -> bytes:
+        if isinstance(frame, Message):
+            return U64.encode(0) + self.body.encode(frame)
+        if frame.request_id == 0 and not isinstance(frame.reply, Err):
+            raise ProtocolError("only connection errors may use reply ID zero")
+        return U64.encode(frame.request_id) + self.body.encode(frame.reply)
+
+    def decode(self, data: bytes) -> WireFrame:
+        request_id = U64.decode(data[: U64.width])
+        frame = self.body.decode(data[U64.width :])
+        if isinstance(frame, Message):
+            if request_id != 0:
+                raise ProtocolError("server pushes must use request ID zero")
+            return frame
+        if request_id == 0 and not isinstance(frame, Err):
+            raise ProtocolError("only connection errors may use reply ID zero")
+        return Response(request_id, frame)
+
+
 @dataclass(frozen=True)
 class WireProtocol:
     """Use matching body codecs on both peers; framing is always outermost.
 
-    Lengths are bounded before reading bodies. Codec and rule failures on
+    Request IDs wrap the body codecs and precede their encoded output, including
+    any compression. Lengths are bounded before reading bodies. Failures on
     malformed input should raise ProtocolError. Codecs must be stateless or
     safe to share across connections.
     """
@@ -207,23 +275,31 @@ class WireProtocol:
     framing: LengthPrefix = field(default_factory=lambda: LengthPrefix(MAX_FRAME_LEN))
 
     @cached_property
-    def commands(self) -> CodecChain[Command, bytes]:
-        return CodecChain.of(self.command_codec) | self.framing
+    def _requests(self) -> _RequestCodec:
+        return _RequestCodec(self.command_codec)
 
     @cached_property
-    def frames(self) -> CodecChain[Frame, bytes]:
-        return CodecChain.of(self.frame_codec) | self.framing
+    def _responses(self) -> _ResponseCodec:
+        return _ResponseCodec(self.frame_codec)
+
+    @cached_property
+    def commands(self) -> CodecChain[Request, bytes]:
+        return CodecChain.of(self._requests) | self.framing
+
+    @cached_property
+    def frames(self) -> CodecChain[WireFrame, bytes]:
+        return CodecChain.of(self._responses) | self.framing
 
     async def _read(self, reader: asyncio.StreamReader) -> bytes:
         header = await reader.readexactly(U32.width)
         length = self.framing.decode_length(header)
         return await reader.readexactly(length)
 
-    async def read_command(self, reader: asyncio.StreamReader) -> Command:
-        return self.command_codec.decode(await self._read(reader))
+    async def read_command(self, reader: asyncio.StreamReader) -> Request:
+        return self._requests.decode(await self._read(reader))
 
-    async def read_frame(self, reader: asyncio.StreamReader) -> Frame:
-        return self.frame_codec.decode(await self._read(reader))
+    async def read_frame(self, reader: asyncio.StreamReader) -> WireFrame:
+        return self._responses.decode(await self._read(reader))
 
 
 DEFAULT_PROTOCOL = WireProtocol()

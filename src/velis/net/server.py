@@ -75,7 +75,7 @@ class TcpServer:
             # The same codec/transport may also reject the error reply.
             # Closing the malformed connection must still complete normally.
             with contextlib.suppress(ProtocolError, ConnectionError):
-                connection.write_reply(Err(str(exc)))
+                connection.write_reply(Err(str(exc)), request_id=0)
         except Exception:
             log.exception("unexpected error serving %s", peer)
         finally:
@@ -89,7 +89,7 @@ class TcpServer:
         """Best-effort admission error followed by connection cleanup."""
         try:
             with contextlib.suppress(ProtocolError, ConnectionError):
-                connection.write_reply(Err("connection limit exceeded"))
+                connection.write_reply(Err("connection limit exceeded"), request_id=0)
         finally:
             connection.close()
             await connection.wait_closed()
@@ -97,11 +97,11 @@ class TcpServer:
     async def _serve_commands(self, connection: Connection) -> None:
         """Read commands and reply until the connection ends or misbehaves."""
         while True:
-            command = await connection.read_command()
+            request = await connection.read_command()
             try:
                 with share_message_encodings():
-                    reply = self._engine.execute(command, connection)
+                    reply = self._engine.execute(request.command, connection)
             except CommandError as exc:
                 reply = Err(str(exc))
-            connection.write_reply(reply)
+            connection.write_reply(reply, request_id=request.request_id)
             await connection.drain()

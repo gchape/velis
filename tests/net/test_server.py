@@ -17,6 +17,7 @@ from velis.errors import CommandError, ProtocolError
 from velis.net import protocol
 from velis.net.client import Client
 from velis.net.connection import Connection
+from velis.net.protocol import Request, Response
 from velis.net.server import TcpServer
 
 
@@ -113,7 +114,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             async with asyncio.timeout(1):
                 self.assertEqual(
                     await protocol.DEFAULT_PROTOCOL.read_frame(reader),
-                    Err("connection limit exceeded"),
+                    Response(0, Err("connection limit exceeded")),
                 )
                 self.assertEqual(await reader.read(), b"")
             self.assertEqual(await first.get("key"), b"value")
@@ -164,12 +165,16 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
     async def test_empty_key_from_raw_socket_gets_err_then_eof(self) -> None:
         reader, writer = await asyncio.open_connection("127.0.0.1", self.server.port)
         try:
-            body = protocol.TEXT.encode("GET") + struct.pack(">I", 0)
+            body = (
+                struct.pack(">Q", 1)
+                + protocol.TEXT.encode("GET")
+                + struct.pack(">I", 0)
+            )
             writer.write(protocol.DEFAULT_PROTOCOL.framing.encode(body))
             async with asyncio.timeout(1):
                 self.assertEqual(
                     await protocol.DEFAULT_PROTOCOL.read_frame(reader),
-                    Err("key must not be empty"),
+                    Response(0, Err("key must not be empty")),
                 )
                 self.assertEqual(await reader.read(), b"")
         finally:
@@ -212,10 +217,10 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
     async def test_unknown_command_gets_err_then_close(self) -> None:
         reader, writer = await asyncio.open_connection("127.0.0.1", self.server.port)
         writer.write(
-            protocol.DEFAULT_PROTOCOL.framing.encode(struct.pack(">I", 4) + b"NOPE")
+            protocol.DEFAULT_PROTOCOL.framing.encode(struct.pack(">QI", 1, 4) + b"NOPE")
         )
         frame = await asyncio.wait_for(protocol.DEFAULT_PROTOCOL.read_frame(reader), 1)
-        self.assertEqual(frame, Err("unknown command: 'NOPE'"))
+        self.assertEqual(frame, Response(0, Err("unknown command: 'NOPE'")))
         self.assertEqual(await asyncio.wait_for(reader.read(), 1), b"")
         writer.close()
 
@@ -297,9 +302,13 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(server.close)
         reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
         try:
-            writer.write(protocol.DEFAULT_PROTOCOL.commands.encode(Get("blocked")))
+            writer.write(
+                protocol.DEFAULT_PROTOCOL.commands.encode(Request(1, Get("blocked")))
+            )
             async with asyncio.timeout(1):
-                self.assertEqual(await wire.read_frame(reader), Err("blocked key"))
+                self.assertEqual(
+                    await wire.read_frame(reader), Response(0, Err("blocked key"))
+                )
                 self.assertEqual(await reader.read(), b"")
         finally:
             writer.close()
@@ -393,11 +402,11 @@ class RuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 compressed = Deflate(max_length=3 << 20).encode(
                     b"x" * (protocol.MAX_FRAME_LEN + 1)
                 )
-                writer.write(wire.framing.encode(compressed))
+                writer.write(wire.framing.encode(struct.pack(">Q", 1) + compressed))
                 async with asyncio.timeout(1):
                     self.assertEqual(
                         await wire.read_frame(reader),
-                        Err("uncompressed data exceeds limit"),
+                        Response(0, Err("uncompressed data exceeds limit")),
                     )
                     self.assertEqual(await reader.read(), b"")
             finally:

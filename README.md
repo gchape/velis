@@ -542,19 +542,18 @@ tests/
 Tests use the standard library's `unittest`.
 
 ```bash
-make test   # uv run python -m unittest discover -s tests -v
-make lint   # ruff check, ruff format --check, ty check
-
-# Format code and fix supported lint issues:
-uv run ruff format .
-uv run ruff check --fix .
+make check      # lint and tests; also the default when running make
+make test       # uv run python -m unittest discover -s tests -v
+make lint       # ruff check, ruff format --check, ty check
+make fmt        # fix supported lint issues, then format
+make benchmark  # compare per-subscriber and shared publish encoding
 ```
 
 `unittest discover` only descends into directories that contain an `__init__.py`, so every `tests/` subdirectory needs one.
 
 The core is deliberately easy to test without sockets or real time: the `Store` accepts any object implementing the `Clock` protocol's `now_ms()` method, without requiring inheritance. The `ManualClock` in `tests/helpers.py` makes TTLs deterministic. Decoder tests exercise seeded random bytes and mutations of every command and frame type. Network tests bind to localhost on an automatically selected port, so the test environment must allow local sockets.
 
-Run `uv run python benchmarks/publish.py --subscribers 1000 --repeats 3` to compare per-subscriber encoding with dispatch-scoped shared encoding for small and maximum-size payloads. The benchmark measures encoding and fan-out through in-memory sinks, excluding socket I/O and transport buffers.
+Run `make benchmark` to compare per-subscriber encoding with dispatch-scoped shared encoding for small and maximum-size payloads. Customize the run with `make benchmark BENCHMARK_ARGS="--subscribers 1000 --repeats 3"`. The benchmark measures encoding and fan-out through in-memory sinks, excluding socket I/O and transport buffers.
 
 ---
 

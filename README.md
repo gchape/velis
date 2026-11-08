@@ -10,7 +10,7 @@ Velis is a lightweight in-memory key-value store with TTL expiration, pub-sub, a
 
 | Area | Description |
 | --- | --- |
-| **Store** | `GET` / `SET` / `EXPIRE` on opaque `bytes` values, with key-count and byte limits. Single-owner, so no locks. |
+| **Store** | `GET` / `SET` / `DEL` / `EXPIRE` / `TTL` / `PERSIST` on opaque `bytes` values, with key-count and byte limits. Single-owner, so no locks. |
 | **TTL** | Monotonic deadlines, expired lazily on read **and** actively by a background sweep, so keys nobody reads are still freed. |
 | **Pub-sub** | `SUBSCRIBE` / `UNSUBSCRIBE` / `PUBLISH`. At-most-once delivery to connected subscribers on one server. Slow network connections are disconnected when their server write buffer exceeds the configured limit. |
 | **Network** | Length-prefixed binary protocol over TCP, an asyncio server and an async `Client`. |
@@ -28,7 +28,7 @@ cd velis
 uv sync
 ```
 
-Python **3.15.2 or newer** is required, as specified in `pyproject.toml`. There are no runtime dependencies; `uv sync` also installs Ruff and ty for development.
+Python **3.15.2 or newer** is required, as specified in `pyproject.toml`. `cachetools` provides optional eviction strategies; `uv sync` installs it along with Ruff and ty for development.
 
 ---
 
@@ -137,9 +137,12 @@ Requests and replies are plain frozen dataclasses (`velis.core.commands`). `net/
 
 ### Request lifecycle
 
-Cache mutations only change memory. The engine calls `Store.expire(key, ms)` and translates validation failures into command errors. The store validates the TTL range, owns its monotonic clock and calculates an internal deadline for its expiry heap. Direct store callers receive `ValueError` for invalid TTLs without changing existing values or deadlines. System wall-clock adjustments do not change TTL duration.
+Cache mutations only change memory. The store validates the TTL range and raises `CommandError` for invalid TTLs without changing existing values or deadlines. The engine lets command errors reach the transport, which replies with `ERR` and keeps the connection open. The store owns its monotonic clock and delegates deadline indexing, stale-entry compaction and bounded sweeps to `ExpiryIndex`. System wall-clock adjustments do not change TTL duration.
 
 `SET` clears any previous TTL. `EXPIRE` returns `NIL` for a missing or already expired key, so it cannot revive expired data. A zero TTL expires a live key immediately. Accepted TTLs are between `0` and `2**62` milliseconds, inclusive.
+
+`await client.delete(key)` returns `True` when a live key was deleted, freeing its key and byte capacity; missing or expired keys return `False`. `await client.ttl(key)` returns remaining milliseconds, `-1` for a live key without expiry, or `-2` for a missing or expired key. TTL reads remove expired values without refreshing their deadlines. `await client.persist(key)` removes a live key's TTL while keeping its value and returns whether a deadline was removed. It returns `False` for missing, expired or already persistent keys. On the wire, `TTL` uses `TTL_VALUE` for remaining milliseconds, `PERSISTENT` for no expiry and `NIL` for missing keys; the client maps these to the integer API above. These commands use the same key validation as `GET`.
+
 
 ```mermaid
 sequenceDiagram
@@ -286,6 +289,9 @@ The following tables describe the default body codecs (`CommandCodec` and `Frame
 | `GET` | `key: str` | `VALUE` or `NIL` |
 | `SET` | `key: str`, `value: bytes` | `OK` |
 | `EXPIRE` | `key: str`, `ms: u64` | `OK`, or `NIL` if the key doesn't exist |
+| `DEL` | `key: str` | `OK` if deleted, otherwise `NIL` |
+| `TTL` | `key: str` | `TTL_VALUE`, `PERSISTENT`, or `NIL` |
+| `PERSIST` | `key: str` | `OK` if a TTL was removed, otherwise `NIL` |
 | `SUBSCRIBE` | `channel: str` | `SUBSCRIBED` |
 | `UNSUBSCRIBE` | `channel: str` | `UNSUBSCRIBED` |
 | `PUBLISH` | `channel: str`, `payload: bytes` | `DELIVERED` |
@@ -300,6 +306,8 @@ Request keys contain 1–512 characters and request channels contain 1–256 cha
 | --- | --- |
 | `OK` / `NIL` | none |
 | `VALUE` | `value: bytes` |
+| `TTL_VALUE` | `ms: u64` |
+| `PERSISTENT` | none; the key exists without a TTL |
 | `ERR` | `message: str` |
 | `SUBSCRIBED` / `UNSUBSCRIBED` | `channel: str` |
 | `DELIVERED` | `count: u32` |
@@ -309,6 +317,7 @@ Request keys contain 1–512 characters and request channels contain 1–256 cha
 
 * `ERR` with the connection kept open: a valid request that can't be honoured (for example a TTL out of range).
 * Best-effort `ERR` followed by the server closing the connection: the message violates the protocol (unknown tag, oversized field/frame, invalid UTF-8, truncated record, trailing bytes or a failed wire rule). The server deliberately closes on these errors, including when the configured codec or disconnected peer prevents sending the error reply. An incomplete TCP frame at EOF closes the connection without a reply.
+* Admission rejection: an excess connection receives best-effort `ERR("connection limit exceeded")` before closure. A client receiving this error without an active request preserves that reason in its `ConnectionError`.
 
 ---
 
@@ -316,11 +325,25 @@ Request keys contain 1–512 characters and request channels contain 1–256 cha
 
 The cache is entirely in memory. Keys and TTLs are discarded on restart. There is no cache WAL, recovery or compaction.
 
-The default store retains at most 100,000 keys and 64 MiB of UTF-8 key plus encoded value bytes. The byte budget excludes Python object overhead; the key-count limit also bounds entry metadata. Expired entries count until lazy expiry or maintenance removes them. The policy is to reject writes that exceed either limit, without evicting live keys. Rejected replacements preserve the previous value and TTL; successful replacements clear the TTL. A capacity error produces `ERR` and keeps the connection usable. Direct `Store` and `Broker` callers receive `CapacityError`, a `CommandError` subclass.
+The default store retains at most 100,000 keys and 64 MiB of UTF-8 key plus encoded value bytes. The byte budget excludes Python object overhead; the key-count limit also bounds entry metadata. Expired entries count until cleanup removes them. The default `lru` policy evicts the least recently used entries to make room when either limit is reached. Select `reject` explicitly to reject writes that exceed the limits while retaining live entries. Rejected replacements preserve the previous value and TTL; successful replacements clear the TTL. A capacity error produces `ERR` and keeps the connection usable. Direct `Store` and `Broker` callers receive `CapacityError`, a `CommandError` subclass.
+
+Select a [cachetools](https://cachetools.readthedocs.io/en/stable/)-backed eviction policy with `VELIS_EVICTION_POLICY` or `Store(limits=StoreLimits(eviction_policy="lru"))` for direct embedding. `StoreLimits` lives in `velis.core.store`; `velis.config.Cache` remains an alias, and individual `Store(max_keys=..., max_bytes=..., eviction_policy=...)` keywords remain supported:
+
+| Policy | Behavior when full |
+| --- | --- |
+| `lru` (default) | Evict the least recently used entry. |
+| `reject` | Reject the write without evicting values. |
+| `lfu` | Evict the least frequently used entry; recency breaks ties. |
+| `fifo` | Evict the oldest inserted entry; updates count as reinsertions. |
+| `rr` | Select a victim at random. |
+
+Eviction may remove several entries to fit the byte budget. Each victim's deadline and cached entry size are removed together. An entry whose own UTF-8 key plus value exceeds the entire byte budget is rejected before any eviction, preserving existing values and TTLs. Under capacity pressure, every policy, including `reject`, performs one bounded expiry sweep when due entries exist before making room or refusing the write. Remaining expired entries are reclaimed by later reads or maintenance. `GET` reads and successful `SET` operations update the selected cachetools policy; TTL inspection and expiry changes do not count as reads. The explicit `reject` policy uses a cache whose eviction method raises `CapacityError("store limit exceeded")`. Velis retains its per-key monotonic TTL implementation so `EXPIRE`, `TTL`, `PERSIST` and bounded maintenance keep their existing semantics. Cachetools policies do not make operations thread-safe or guarantee higher throughput.
+
+Running `uv run velis` uses LRU by default. To retain entries and reject writes when full, use `VELIS_EVICTION_POLICY=reject uv run velis`.
 
 Each connection can subscribe to at most 1,024 channels by default. Repeating an existing subscription uses no extra capacity; unsubscribing frees a slot. The listener admits at most 1,024 active connections by default. Excess connections receive a best-effort `ERR` and are closed, leaving admitted clients usable.
 
-Pub-sub provides at-most-once delivery to connected subscribers on the same server. Messages are not persisted, retried or replayed, and no server-to-server replication is implemented. Slow subscribers are disconnected when server write buffers or client unread-message queues overflow. Messages may be lost on disconnect; `PUBLISH` counts accepted deliveries, without acknowledging application processing. Future replication should carry pub-sub messages, not cache state.
+Pub-sub provides at-most-once delivery to connected subscribers on the same server. Messages are not persisted, retried or replayed, and no server-to-server replication is implemented. Slow subscribers are disconnected when server write buffers or client unread-message queues overflow. A subscriber whose custom wire cannot encode a push is disconnected and removed from every channel; delivery continues to healthy subscribers and the publisher remains usable. Messages may be lost on disconnect; `PUBLISH` counts accepted deliveries, without acknowledging application processing. Future replication should carry pub-sub messages, not cache state.
 
 The former `VELIS_WAL_PATH`, `VELIS_FSYNC` and `VELIS_COMPACT_BYTES` settings are no longer used. Existing WAL files are left untouched and are not loaded.
 
@@ -328,7 +351,7 @@ The former `VELIS_WAL_PATH`, `VELIS_FSYNC` and `VELIS_COMPACT_BYTES` settings ar
 
 ## Configuration
 
-The entry point loads a frozen `Config` from environment variables. `Config.server` holds listener, write-buffer and subscription limits; `Config.cache` holds a `Cache` configuration for retained key and byte limits. `Config.sweep_interval_ms` holds the expiry sweep interval.
+The entry point loads a frozen `Config` from environment variables. `Config.server` holds listener, write-buffer and subscription limits; `Config.cache` holds core-owned `StoreLimits` for retained key and byte limits and the eviction policy. Environment parsing stays in `config.py`, while `StoreLimits` owns store validation. `Config.sweep_interval_ms` holds the expiry sweep interval.
 
 Unknown log levels, ports outside `0–65535`, nonpositive limits or sweep intervals, and non-integer numeric settings raise `ValueError` at startup. Integer parsing errors include the environment variable name.
 
@@ -338,13 +361,14 @@ Unknown log levels, ports outside `0–65535`, nonpositive limits or sweep inter
 | `VELIS_HOST` | `127.0.0.1` | Interface to listen on. |
 | `VELIS_PORT` | `9000` | Port to listen on (`0` picks a free port). |
 | `VELIS_MAX_BUFFER` | `8388608` (8 MiB) | Server write buffer limit checked when pushing a message. Must be positive; allow room for both the channel and payload plus framing. |
-| `VELIS_MAX_KEYS` | `100000` | Maximum retained cache keys; excess writes are rejected. |
+| `VELIS_MAX_KEYS` | `100000` | Maximum retained cache keys; the eviction policy controls behavior when full. |
 | `VELIS_MAX_BYTES` | `67108864` (64 MiB) | Maximum retained UTF-8 key plus encoded value bytes; excludes Python object overhead. |
+| `VELIS_EVICTION_POLICY` | `lru` | One of `reject`, `lru`, `lfu`, `fifo`, `rr`; applies to both key-count and byte pressure. |
 | `VELIS_MAX_CONNECTIONS` | `1024` | Maximum admitted TCP connections; excess connections are closed after a best-effort error. |
 | `VELIS_MAX_SUBSCRIPTIONS` | `1024` | Maximum distinct channels per subscriber connection. |
 | `VELIS_SWEEP_MS` | `100` | Milliseconds between expiry sweeps; must be positive. |
 
-`serve(config)` applies all limits to the engine it builds. When supplying your own engine, configure its store and broker explicitly with `Store(max_keys=..., max_bytes=...)` and `Broker(max_subscriptions=...)`; the server still applies its connection and write-buffer limits.
+`serve(config)` applies all limits to the engine it builds. When supplying your own engine, configure its store and broker explicitly with `Store(limits=config.cache)` and `Broker(max_subscriptions=config.server.max_subscriptions)`; the server still applies its connection and write-buffer limits.
 
 ---
 
@@ -370,19 +394,8 @@ Codecs are combined into a `CodecChain` with `|`. Encoding runs the codecs left 
 
 ```python
 import base64
-import zlib
 
-from velis.codec import CodecChain
-
-
-class Deflate:
-    name = "deflate"
-
-    def encode(self, data: bytes) -> bytes:
-        return zlib.compress(data)
-
-    def decode(self, data: bytes) -> bytes:
-        return zlib.decompress(data)
+from velis.codec import CodecChain, Deflate
 
 
 class B64:
@@ -414,6 +427,10 @@ finally:
 ```
 
 Readers of a key and subscribers to a channel must use the same codec chain as their writers or publishers. Payload codecs do not transform keys or channel names; wire codecs serialize the entire command or frame, including those fields.
+
+`Deflate(level=-1, max_length=1 << 20)` uses the standard library's [zlib-wrapped DEFLATE format](https://docs.python.org/3/library/zlib.html). Pass `codec=Deflate()` directly to `Client.connect()` for compression alone, or compose it with other codecs as above. Each value or publication is a separate compressed stream. Levels range from `0` (no compression) to `9`, with `-1` selecting zlib's default. Compression runs synchronously and trades CPU time for fewer stored and transmitted bytes; small or incompressible values may grow.
+
+`max_length` caps uncompressed input before encoding and output during decompression; the default is 1 MiB. Invalid, truncated, concatenated or trailing streams and output exceeding the limit raise `ProtocolError`. Compressed payloads must still fit the wire's 1 MiB field limit, so an incompressible value near the limit may be rejected. The store byte budget counts compressed bytes; client message queues count payload bytes before payload decompression. Readers should choose a decompression limit large enough for their writers. Existing uncompressed values require readers using the original codec; compression is not automatically detected or negotiated.
 
 ### Typed representations and rules
 
@@ -493,7 +510,7 @@ async def with_custom_wire() -> None:
 
 Set `WireProtocol(framing=LengthPrefix(max_length))` to change the outer body limit. This limit is independent of `VELIS_MAX_BUFFER` and the client queue limits; the default body codecs retain their field limits for tags, request names, payloads and general text.
 
-Append byte transforms to the body chains, for example `CodecChain.of(CommandCodec()) | Deflate()` and `CodecChain.of(FrameCodec()) | Deflate()` using the example codec above. `WireProtocol` always appends the outer length prefix last, allowing TCP to read one complete body before reversing the transformations. Both peers must agree on representations; there is no codec negotiation. The minimal `Deflate` example needs additional handling for use on the wire: custom wire codecs must raise `ProtocolError` for malformed input, bound any decompressed output themselves, and be safe to share across connections.
+Append byte transforms to the body chains. For whole-message compression, use `CodecChain.of(CommandCodec()) | Deflate(max_length=MAX_FRAME_LEN)` and `CodecChain.of(FrameCodec()) | Deflate(max_length=MAX_FRAME_LEN)`, importing these constants and codecs from `velis.net.protocol` and `velis.codec` respectively. The larger decompression limit allows command tags and fields around a maximum-size payload. `WireProtocol` always appends the outer length prefix last, allowing TCP to read one complete body before reversing the transformations. Both peers must agree on representations; there is no codec negotiation. Custom wire codecs must raise `ProtocolError` for malformed input, bound any decompressed output themselves, and be safe to share across connections.
 
 Wire rules validate representations and decoded commands. Stateful command semantics and access policies belong in the engine or a command validation layer, where they also apply to non-TCP sessions. Payload codecs configured with `codec=` remain independent from wire codecs configured with `wire=`.
 
@@ -513,7 +530,8 @@ src/velis/
   core/              # no sockets, no wire format
     commands.py      # Command / Reply / Message dataclasses
     engine.py        # validate -> apply -> reply
-    store.py         # key/value map, TTL heap
+    store.py         # StoreLimits, eviction policies and byte accounting
+    expiry.py        # deadline index, TTL sentinels and bounded expiry heap
     broker.py        # pub-sub over the Subscriber protocol
     clock.py         # structural Clock protocol and monotonic SystemClock
   net/
@@ -525,6 +543,7 @@ src/velis/
   codec/
     chain.py         # typed Codec protocol and CodecChain
     binary.py        # Identity, UTF-8, unsigned integers and length framing
+    compression.py   # bounded zlib-wrapped DEFLATE codec
     cursor.py        # sequential bounded reads of binary fields
     rules.py         # bidirectional Validate stages
 tests/
@@ -546,14 +565,11 @@ make check      # lint and tests; also the default when running make
 make test       # uv run python -m unittest discover -s tests -v
 make lint       # ruff check, ruff format --check, ty check
 make fmt        # fix supported lint issues, then format
-make benchmark  # compare per-subscriber and shared publish encoding
 ```
 
 `unittest discover` only descends into directories that contain an `__init__.py`, so every `tests/` subdirectory needs one.
 
 The core is deliberately easy to test without sockets or real time: the `Store` accepts any object implementing the `Clock` protocol's `now_ms()` method, without requiring inheritance. The `ManualClock` in `tests/helpers.py` makes TTLs deterministic. Decoder tests exercise seeded random bytes and mutations of every command and frame type. Network tests bind to localhost on an automatically selected port, so the test environment must allow local sockets.
-
-Run `make benchmark` to compare per-subscriber encoding with dispatch-scoped shared encoding for small and maximum-size payloads. Customize the run with `make benchmark BENCHMARK_ARGS="--subscribers 1000 --repeats 3"`. The benchmark measures encoding and fan-out through in-memory sinks, excluding socket I/O and transport buffers.
 
 ---
 
@@ -562,17 +578,18 @@ Run `make benchmark` to compare per-subscriber encoding with dispatch-scoped sha
 * **Single-threaded by design.** The event-loop thread owns the `Engine`, `Store` and `Broker`, which is why none of them take locks. Don't call them from other threads.
 * **TTLs use monotonic time.** Deadlines are internal to the running process and are discarded on restart.
 * **No auth or TLS.** Resource limits bound retained cache data, connection count, subscriptions and message buffers; they do not impose an exact process-memory ceiling. Don't expose it to untrusted networks.
-* **One command at a time per client.** An asyncio lock serializes requests around one pending reply future; server pushes use a separate bounded queue. There are no request IDs.
+* **One command at a time per client.** An asyncio lock serializes requests around a one-slot reply queue; server pushes use a separate bounded queue. Closing shuts down both queues and wakes waiting readers. There are no request IDs, so cancelling a sent request closes the connection.
 * **Separate buffer limits.** Server write buffers and client unread-message buffers have independent limits. Client byte budgets count UTF-8 channel bytes and payload-encoded bytes after wire decoding; decoded values and application-held messages use additional memory.
 
 ---
 
 ## Roadmap
 
-- [ ] `DEL`, `TTL` and `PERSIST` commands.
+- [x] `DEL`, `TTL` and `PERSIST` commands.
 - [ ] Request IDs to support pipelining and safer request cancellation.
 - [ ] Pub-sub message replication between servers, independent of cache state.
 - [x] Connection and memory limits.
-- [ ] Cache eviction policy.
-- [ ] Built-in codecs (compression, encryption) to compose with `CodecChain`.
+- [x] Cache eviction policies (reject, LRU, LFU, FIFO, random replacement).
+- [x] Built-in compression codec to compose with `CodecChain`.
+- [ ] Built-in encryption codec to compose with `CodecChain`.
 - [ ] Authentication and TLS.

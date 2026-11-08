@@ -18,7 +18,6 @@ class Deflate:
 
     level: int = -1
     max_length: int = 1 << 20
-    name: str = "deflate"
 
     def __post_init__(self) -> None:
         if not -1 <= self.level <= 9:
@@ -37,9 +36,9 @@ class Deflate:
             raise ProtocolError("compression failed") from None
 
     def decode(self, data: bytes) -> bytes:
+        """Decode one complete stream, allowing one extra byte to detect overflow."""
         decoder = zlib.decompressobj()
         try:
-            # One extra byte detects overflow without expanding the entire stream.
             decoded = decoder.decompress(data, self.max_length + 1)
         except zlib.error:
             raise ProtocolError("invalid compressed data") from None

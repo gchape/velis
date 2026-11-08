@@ -19,13 +19,17 @@ _DEFAULT_CONFIG = Config()
 def build_engine(config: Config = _DEFAULT_CONFIG) -> Engine:
     """Create an engine with an empty in-memory store and pub-sub broker."""
     return Engine(
-        Store(limits=config.cache),
+        Store(limits=config.store),
         Broker(max_subscriptions=config.server.max_subscriptions),
     )
 
 
 async def _maintain(engine: Engine, interval: float) -> None:
-    """Sweep expired keys periodically, with interval measured in seconds."""
+    """Sweep periodically and yield between rounds while ready timers remain.
+
+    The interval is in seconds. Cascades count as maintenance work even when a
+    round expires no values.
+    """
     while True:
         await asyncio.sleep(interval)
         engine.sweep()

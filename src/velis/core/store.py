@@ -1,47 +1,51 @@
 from dataclasses import dataclass
-
-from cachetools import Cache, FIFOCache, LFUCache, LRUCache, RRCache
+from enum import StrEnum
 
 from velis.core.clock import Clock, SystemClock
-from velis.core.expiry import MISSING, NO_EXPIRY, ExpiryIndex
+from velis.core.commands import MISSING, NO_EXPIRY
+from velis.core.eviction import Eviction, Lru, Sieve
+from velis.core.timing_wheel import TimingWheel
 from velis.errors import CapacityError, CommandError
+from velis.validation import require_positive
 
 MAX_TTL_MS = 1 << 62
 DEFAULT_MAX_KEYS = 100_000
 DEFAULT_MAX_BYTES = 64 << 20
-DEFAULT_EVICTION_POLICY = "lru"
 
 
-class _Reject(Cache[str, bytes]):
-    def popitem(self) -> tuple[str, bytes]:
-        raise CapacityError("store limit exceeded")
+class EvictionPolicy(StrEnum):
+    REJECT = "reject"
+    LRU = "lru"
+    SIEVE = "sieve"
 
 
-_CACHE_FACTORIES: dict[str, type[Cache[str, bytes]]] = {
-    "reject": _Reject,
-    "lru": LRUCache,
-    "lfu": LFUCache,
-    "fifo": FIFOCache,
-    "rr": RRCache,
-}
-EVICTION_POLICIES = tuple(_CACHE_FACTORIES)
+DEFAULT_EVICTION_POLICY = EvictionPolicy.LRU
 
 
 @dataclass(frozen=True, slots=True)
 class StoreLimits:
-    """Limits on retained keys and UTF-8 key plus value bytes."""
+    """Bound retained keys and UTF-8 key plus value bytes.
+
+    Policy string values are normalized to EvictionPolicy during construction.
+    """
 
     max_keys: int = DEFAULT_MAX_KEYS
     max_bytes: int = DEFAULT_MAX_BYTES
-    eviction_policy: str = DEFAULT_EVICTION_POLICY
+    eviction_policy: EvictionPolicy = DEFAULT_EVICTION_POLICY
 
     def __post_init__(self) -> None:
-        if self.max_keys <= 0:
-            raise ValueError(f"invalid max_keys: {self.max_keys}")
-        if self.max_bytes <= 0:
-            raise ValueError(f"invalid max_bytes: {self.max_bytes}")
-        if self.eviction_policy not in _CACHE_FACTORIES:
-            raise ValueError(f"invalid eviction_policy: {self.eviction_policy}")
+        require_positive("max_keys", self.max_keys)
+        require_positive("max_bytes", self.max_bytes)
+        try:
+            policy = EvictionPolicy(self.eviction_policy)
+        except ValueError:
+            raise ValueError(
+                f"invalid eviction_policy: {self.eviction_policy!r}"
+            ) from None
+        object.__setattr__(self, "eviction_policy", policy)
+
+
+DEFAULT_LIMITS = StoreLimits()
 
 
 def _entry_size(key: str, value: bytes) -> int:
@@ -59,38 +63,23 @@ class Store:
         self,
         clock: Clock | None = None,
         *,
-        limits: StoreLimits | None = None,
-        max_keys: int | None = None,
-        max_bytes: int | None = None,
-        eviction_policy: str | None = None,
+        limits: StoreLimits = DEFAULT_LIMITS,
     ) -> None:
-        # Keep the direct keyword API; all validation belongs to StoreLimits.
-        if limits is None:
-            limits = StoreLimits(
-                DEFAULT_MAX_KEYS if max_keys is None else max_keys,
-                DEFAULT_MAX_BYTES if max_bytes is None else max_bytes,
-                DEFAULT_EVICTION_POLICY if eviction_policy is None else eviction_policy,
-            )
-        elif any(value is not None for value in (max_keys, max_bytes, eviction_policy)):
-            raise ValueError("pass limits or individual store settings, not both")
         self._clock: Clock = SystemClock() if clock is None else clock
         self._limits = limits
         self._stored_bytes = 0
         self._sizes: dict[str, int] = {}
-        self._values = _CACHE_FACTORIES[limits.eviction_policy](limits.max_keys)
-        self._expiry = ExpiryIndex()
+        self._values: dict[str, bytes] = {}
+        self._eviction: Eviction | None = None
+        if limits.eviction_policy == EvictionPolicy.LRU:
+            self._eviction = Lru()
+        elif limits.eviction_policy == EvictionPolicy.SIEVE:
+            self._eviction = Sieve()
+        self._expiry = TimingWheel(self._clock.now_ms())
 
     def __len__(self) -> int:
         """Return the stored key count without purging expired entries."""
         return len(self._values)
-
-    def _remove(self, key: str) -> bool:
-        self._expiry.clear(key)
-        if key not in self._values:
-            return False
-        del self._values[key]
-        self._stored_bytes -= self._sizes.pop(key)
-        return True
 
     @property
     def stored_bytes(self) -> int:
@@ -99,8 +88,19 @@ class Store:
 
     @property
     def has_due_expirations(self) -> bool:
-        """Whether another bounded sweep can process due or stale heap entries."""
+        """Whether due timers or wheel cascades need another bounded sweep."""
         return self._expiry.has_due(self._clock.now_ms())
+
+    def _remove(self, key: str) -> bool:
+        """Remove a value, its timer, size accounting and eviction metadata."""
+        self._expiry.clear(key)
+        if key not in self._values:
+            return False
+        del self._values[key]
+        self._stored_bytes -= self._sizes.pop(key)
+        if self._eviction is not None:
+            self._eviction.discard(key)
+        return True
 
     def _remove_if_expired(self, key: str, *, now: int | None = None) -> None:
         deadline = self._expiry.deadline(key)
@@ -108,11 +108,6 @@ class Store:
             self._clock.now_ms() if now is None else now
         ):
             self._remove(key)
-
-    def get(self, key: str) -> bytes | None:
-        """Return a live value, or None if the key is missing or expired."""
-        self._remove_if_expired(key)
-        return self._values.get(key)
 
     def _exceeds_limits(self, key: str, size: int) -> bool:
         return (
@@ -125,9 +120,17 @@ class Store:
         if self._exceeds_limits(key, size) and self.has_due_expirations:
             self.sweep()
         while self._exceeds_limits(key, size):
-            victim, _ = self._values.popitem()
-            self._stored_bytes -= self._sizes.pop(victim)
-            self._expiry.clear(victim)
+            if self._eviction is None:
+                raise CapacityError("store limit exceeded")
+            self._remove(self._eviction.victim())
+
+    def get(self, key: str) -> bytes | None:
+        """Return a live value, or None if the key is missing or expired."""
+        self._remove_if_expired(key)
+        value = self._values.get(key)
+        if value is not None and self._eviction is not None:
+            self._eviction.access(key)
+        return value
 
     def set(self, key: str, value: bytes) -> None:
         """Store a value and clear its TTL, applying the capacity policy.
@@ -144,7 +147,8 @@ class Store:
         self._stored_bytes += size - self._sizes.get(key, 0)
         self._sizes[key] = size
         self._expiry.clear(key)
-        self._expiry.compact()
+        if self._eviction is not None:
+            self._eviction.access(key)
 
     def expire(self, key: str, ms: int) -> bool:
         """Set a relative TTL on a live key; expired keys stay missing.
@@ -163,9 +167,7 @@ class Store:
     def delete(self, key: str) -> bool:
         """Delete a live key; return False for missing or expired keys."""
         self._remove_if_expired(key)
-        removed = self._remove(key)
-        self._expiry.compact()
-        return removed
+        return self._remove(key)
 
     def ttl(self, key: str) -> int:
         """Remaining milliseconds; MISSING (-2) or NO_EXPIRY (-1) otherwise."""
@@ -179,12 +181,10 @@ class Store:
     def persist(self, key: str) -> bool:
         """Remove a live key's TTL; return whether a deadline was removed."""
         self._remove_if_expired(key)
-        changed = self._expiry.clear(key)
-        self._expiry.compact()
-        return changed
+        return self._expiry.clear(key)
 
     def sweep(self, limit: int = 1000) -> int:
-        """Remove due keys, processing at most limit heap entries, including stale."""
+        """Remove due keys, processing at most limit timers, including cascades."""
         return sum(
             self._remove(key)
             for key in self._expiry.pop_due(self._clock.now_ms(), limit)

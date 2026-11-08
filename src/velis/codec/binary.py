@@ -7,8 +7,6 @@ from velis.errors import ProtocolError
 
 @dataclass(frozen=True, slots=True)
 class Identity:
-    name: str = "identity"
-
     def encode(self, value: bytes) -> bytes:
         return value
 
@@ -26,15 +24,13 @@ class UInt:
         if self.width <= 0:
             raise ValueError("integer width must be positive")
 
-    @property
-    def name(self) -> str:
-        return f"u{self.width * 8}"
-
     def encode(self, value: int) -> bytes:
         try:
-            return value.to_bytes(self.width)  # big-endian is the default
+            return value.to_bytes(self.width)
         except OverflowError:
-            raise ProtocolError(f"{self.name} integer out of range: {value}") from None
+            raise ProtocolError(
+                f"u{self.width * 8} integer out of range: {value}"
+            ) from None
 
     def decode(self, data: bytes) -> int:
         if len(data) != self.width:
@@ -48,8 +44,6 @@ U64 = UInt(8)
 
 @dataclass(frozen=True, slots=True)
 class Utf8:
-    name: str = "utf8"
-
     def encode(self, value: str) -> bytes:
         try:
             return value.encode()
@@ -68,7 +62,6 @@ class LengthPrefix:
     """One u32 length and exactly that many bytes, with a bounded body."""
 
     max_length: int
-    name: str = "length"
 
     def __post_init__(self) -> None:
         if not 0 <= self.max_length < 1 << (U32.width * 8):

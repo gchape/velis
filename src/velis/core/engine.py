@@ -2,6 +2,8 @@ from typing import assert_never
 
 from velis.core.broker import Broker, Subscriber
 from velis.core.commands import (
+    MISSING,
+    NO_EXPIRY,
     Command,
     Delete,
     Delivered,
@@ -22,7 +24,6 @@ from velis.core.commands import (
     Unsubscribed,
     Value,
 )
-from velis.core.expiry import MISSING, NO_EXPIRY
 from velis.core.store import Store
 
 
@@ -31,10 +32,11 @@ def _ok_or_nil(found: bool) -> Ok | Nil:
 
 
 class Engine:
-    """Executes commands: validate -> apply -> reply.
+    """Apply decoded commands to the store and broker and produce replies.
 
-    Owned by a single thread (the event loop); no locking needed. Knows
-    nothing about sockets or wire formats.
+    Store owns TTL and capacity validation; network codecs own field rules.
+    One event-loop thread owns the engine, so commands execute without locks.
+    The engine has no dependency on sockets or wire formats.
     """
 
     def __init__(self, store: Store, broker: Broker) -> None:
@@ -42,7 +44,7 @@ class Engine:
         self._broker = broker
 
     def execute(self, command: Command, subscriber: Subscriber) -> Reply:
-        """Validate and execute a command for the requesting subscriber."""
+        """Execute a command for a subscriber, allowing command errors to propagate."""
         match command:
             case Get(key):
                 value = self._store.get(key)

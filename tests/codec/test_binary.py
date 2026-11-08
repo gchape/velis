@@ -27,7 +27,7 @@ class BinaryCodecTests(unittest.TestCase):
             if not value:
                 raise ValueError("empty text")
 
-        chain = CodecChain.of(Validate("nonempty", nonempty)) | Utf8() | Reverse()
+        chain = CodecChain.of(Validate(nonempty)) | Utf8() | Reverse()
         assert_type(chain, CodecChain[str, bytes])
         self.assertEqual(chain.decode(chain.encode("hello")), "hello")
         with self.assertRaisesRegex(ValueError, "empty text"):
@@ -39,7 +39,6 @@ class BinaryCodecTests(unittest.TestCase):
         for width in (1, 3, 4, 8):
             codec = UInt(width)
             bits = width * 8
-            self.assertEqual(codec.name, f"u{bits}")
             for value in (0, (1 << bits) - 1):
                 encoded = codec.encode(value)
                 self.assertEqual(len(encoded), width)

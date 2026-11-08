@@ -3,10 +3,7 @@ from typing import Any, Protocol, cast
 
 
 class Codec[T, Encoded](Protocol):
-    """A named, reversible representation of a value."""
-
-    @property
-    def name(self) -> str: ...
+    """A reversible representation of a value."""
 
     def encode(self, value: T, /) -> Encoded: ...
 
@@ -33,10 +30,6 @@ class CodecChain[T, Encoded]:
     @staticmethod
     def of[A, B](codec: Codec[A, B]) -> CodecChain[A, B]:
         return CodecChain(_steps(codec))
-
-    @property
-    def name(self) -> str:
-        return "_".join(codec.name for codec in self.codecs)
 
     def encode(self, value: T) -> Encoded:
         current: Any = value

@@ -3,6 +3,8 @@ from typing import final
 
 from velis.codec import Codec, Identity
 from velis.core.commands import (
+    MISSING,
+    NO_EXPIRY,
     Command,
     Delete,
     Delivered,
@@ -25,15 +27,15 @@ from velis.core.commands import (
     Unsubscribed,
     Value,
 )
-from velis.core.expiry import MISSING, NO_EXPIRY
 from velis.errors import CommandError, ProtocolError
 from velis.net.protocol import DEFAULT_PROTOCOL, WireProtocol
-from velis.net.session import DEFAULT_MAX_PENDING_REQUESTS, Session, TcpSession
+from velis.net.session import DEFAULT_LIMITS, Session, SessionLimits, TcpSession
 
 
 def _unexpected(command: Command, reply: Reply) -> ProtocolError:
-    name = "DEL" if isinstance(command, Delete) else type(command).__name__.upper()
-    return ProtocolError(f"unexpected reply to {name}: {reply!r}")
+    return ProtocolError(
+        f"unexpected reply to {type(command).__name__.upper()}: {reply!r}"
+    )
 
 
 @final
@@ -54,19 +56,10 @@ class Client:
         codec: Codec[bytes, bytes] | None = None,
         *,
         wire: WireProtocol = DEFAULT_PROTOCOL,
-        max_pending_requests: int = DEFAULT_MAX_PENDING_REQUESTS,
-        max_pending_messages: int = 1024,
-        max_pending_bytes: int = 8 << 20,
+        limits: SessionLimits = DEFAULT_LIMITS,
     ) -> Client:
         """Create a TCP client with bounded requests and unread messages."""
-        session = await TcpSession.connect(
-            host,
-            port,
-            wire=wire,
-            max_pending_requests=max_pending_requests,
-            max_pending_messages=max_pending_messages,
-            max_pending_bytes=max_pending_bytes,
-        )
+        session = await TcpSession.connect(host, port, wire=wire, limits=limits)
         return cls(session, codec)
 
     async def __aenter__(self) -> Client:
@@ -89,15 +82,32 @@ class Client:
             raise CommandError(reply.message)
         return reply
 
+    async def _flag(self, command: Command) -> bool:
+        """Interpret the common mutation acknowledgment: Ok is True, Nil False."""
+        match await self._request(command):
+            case Ok():
+                return True
+            case Nil():
+                return False
+            case other:
+                raise _unexpected(command, other)
+
+    async def _expect_reply(self, command: Command, expected: Reply) -> None:
+        """Validate acknowledgments, including the channel for subscriptions."""
+        reply = await self._request(command)
+        if reply != expected:
+            raise _unexpected(command, reply)
+
     async def get(self, key: str) -> bytes | None:
         """Return the decoded value, or None for a missing or expired key."""
-        match await self._request(Get(key)):
+        command = Get(key)
+        match await self._request(command):
             case Value(value):
                 return self._codec.decode(value)
             case Nil():
                 return None
             case other:
-                raise _unexpected(Get(key), other)
+                raise _unexpected(command, other)
 
     async def set(self, key: str, value: bytes) -> None:
         """Encode and store a value, clearing any previous TTL."""
@@ -115,19 +125,10 @@ class Client:
         """Remove a live key's TTL; return whether it changed."""
         return await self._flag(Persist(key))
 
-    async def _flag(self, command: Command) -> bool:
-        """Interpret the common mutation acknowledgment."""
-        match await self._request(command):
-            case Ok():
-                return True
-            case Nil():
-                return False
-            case other:
-                raise _unexpected(command, other)
-
     async def ttl(self, key: str) -> int:
-        """Remaining milliseconds; -2 means missing, -1 means no expiry."""
-        match await self._request(Ttl(key)):
+        """Remaining milliseconds; MISSING (-2) or NO_EXPIRY (-1) otherwise."""
+        command = Ttl(key)
+        match await self._request(command):
             case TtlValue(ms):
                 return ms
             case Persistent():
@@ -135,7 +136,7 @@ class Client:
             case Nil():
                 return MISSING
             case other:
-                raise _unexpected(Ttl(key), other)
+                raise _unexpected(command, other)
 
     async def subscribe(self, channel: str) -> None:
         """Join a channel to receive server pushes."""
@@ -162,12 +163,6 @@ class Client:
         """
         message = await self._session.next_message()
         return Message(message.channel, self._codec.decode(message.payload))
-
-    async def _expect_reply(self, command: Command, expected: Reply) -> None:
-        """Validate acknowledgments, including the channel for subscriptions."""
-        reply = await self._request(command)
-        if reply != expected:
-            raise _unexpected(command, reply)
 
     async def close(self) -> None:
         """Close the owned session and wake waiting operations."""

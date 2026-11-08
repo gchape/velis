@@ -12,7 +12,6 @@ class Validate[T]:
     being validated.
     """
 
-    name: str
     rule: Callable[[T], None]
 
     def encode(self, value: T) -> T:

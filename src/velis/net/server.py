@@ -10,6 +10,7 @@ from velis.net.connection import Connection, share_message_encodings
 from velis.net.protocol import DEFAULT_PROTOCOL, WireProtocol
 
 log = logging.getLogger(__name__)
+COMMANDS_PER_TURN = 64
 
 
 class TcpServer:
@@ -56,6 +57,7 @@ class TcpServer:
         """Serve a client and clean up its subscriptions on disconnect.
 
         Send a protocol error before closing a malformed stream when possible.
+        Cleanup still runs if the same codec or transport rejects the error reply.
         """
         peer = writer.get_extra_info("peername")
         connection = Connection(
@@ -72,10 +74,8 @@ class TcpServer:
             pass
         except ProtocolError as exc:
             log.warning("protocol error from %s: %s", peer, exc)
-            # The same codec/transport may also reject the error reply.
-            # Closing the malformed connection must still complete normally.
             with contextlib.suppress(ProtocolError, ConnectionError):
-                connection.write_reply(Err(str(exc)), request_id=0)
+                connection.write_reply(Err(str(exc)))
         except Exception:
             log.exception("unexpected error serving %s", peer)
         finally:
@@ -89,19 +89,23 @@ class TcpServer:
         """Best-effort admission error followed by connection cleanup."""
         try:
             with contextlib.suppress(ProtocolError, ConnectionError):
-                connection.write_reply(Err("connection limit exceeded"), request_id=0)
+                connection.write_reply(Err("connection limit exceeded"))
         finally:
             connection.close()
             await connection.wait_closed()
 
     async def _serve_commands(self, connection: Connection) -> None:
-        """Read commands and reply until the connection ends or misbehaves."""
-        while True:
-            request = await connection.read_command()
+        """Execute in order, yielding after each bounded batch of ready commands."""
+        processed = 0
+        async for command in connection.read_commands():
             try:
                 with share_message_encodings():
-                    reply = self._engine.execute(request.command, connection)
+                    reply = self._engine.execute(command, connection)
             except CommandError as exc:
                 reply = Err(str(exc))
-            connection.write_reply(reply, request_id=request.request_id)
+            connection.write_reply(reply)
             await connection.drain()
+            processed += 1
+            if processed == COMMANDS_PER_TURN:
+                processed = 0
+                await asyncio.sleep(0)

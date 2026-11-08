@@ -1,10 +1,14 @@
 """Requests and replies as plain data.
 
-The net layer turns bytes into these and back; the Engine only ever sees
-these.
+The network layer translates bytes into these values. The engine receives
+commands and returns replies. TTL queries use MISSING (-2) and NO_EXPIRY (-1)
+when there is no remaining-milliseconds value.
 """
 
 from dataclasses import dataclass
+
+MISSING = -2
+NO_EXPIRY = -1
 
 
 @dataclass(frozen=True, slots=True)

@@ -17,13 +17,13 @@ class ConnectionDeliveryTests(unittest.TestCase):
     ) -> None:
         for transformed in (False, True):
             with self.subTest(transformed=transformed):
-                codec = Mock(wraps=protocol.FrameCodec())
+                codec = Mock(wraps=protocol.FRAMES)
                 wire = protocol.WireProtocol(frame_codec=codec)
                 if transformed:
                     wire = protocol.WireProtocol(
                         frame_codec=CodecChain.of(codec) | Reverse()
                     )
-                other_codec = Mock(wraps=protocol.FrameCodec())
+                other_codec = Mock(wraps=protocol.FRAMES)
                 other_wire = protocol.WireProtocol(frame_codec=other_codec)
                 first = Connection(Mock(), self.writer, 16, wire=wire)
                 second = Connection(Mock(), self.writer, 16, wire=wire)
@@ -82,7 +82,7 @@ class ConnectionDeliveryTests(unittest.TestCase):
 
     def test_encoding_failure_drops_only_subscriber_and_preserves_fanout(self) -> None:
         wire = protocol.WireProtocol(
-            frame_codec=CodecChain.of(protocol.FrameCodec()) | Deflate(max_length=64)
+            frame_codec=CodecChain.of(protocol.FRAMES) | Deflate(max_length=64)
         )
         failing = Connection(Mock(), self.writer, 16, wire=wire)
         broker, healthy = Broker(), RecordingSubscriber()

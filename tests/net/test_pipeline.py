@@ -1,5 +1,5 @@
 import asyncio
-import struct
+import contextlib
 import unittest
 
 from velis.codec import CodecChain, Deflate
@@ -20,11 +20,11 @@ from velis.core.engine import Engine
 from velis.core.store import MAX_TTL_MS, Store
 from velis.net import protocol
 from velis.net.client import Client
-from velis.net.protocol import Request, Response
 from velis.net.server import TcpServer
+from velis.net.session import SessionLimits
 
 
-class RequestIdIntegrationTests(unittest.IsolatedAsyncioTestCase):
+class PipelineIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.store = Store()
         self.engine = Engine(self.store, Broker())
@@ -32,13 +32,13 @@ class RequestIdIntegrationTests(unittest.IsolatedAsyncioTestCase):
         await self.server.start()
         self.addAsyncCleanup(self.server.close)
 
-    async def test_raw_pipeline_echoes_each_id_including_command_errors(self) -> None:
+    async def test_raw_pipeline_replies_in_order_including_command_errors(self) -> None:
         wire = protocol.DEFAULT_PROTOCOL
         requests = (
-            Request(19, Set("key", b"value")),
-            Request(3, Get("key")),
-            Request(protocol.MAX_REQUEST_ID, Expire("key", MAX_TTL_MS + 1)),
-            Request(42, Ttl("key")),
+            Set("key", b"value"),
+            Get("key"),
+            Expire("key", MAX_TTL_MS + 1),
+            Ttl("key"),
         )
         reader, writer = await asyncio.open_connection("127.0.0.1", self.server.port)
         try:
@@ -46,37 +46,18 @@ class RequestIdIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 b"".join(wire.commands.encode(request) for request in requests)
             )
             async with asyncio.timeout(1):
-                responses = [await wire.read_frame(reader) for _ in requests]
+                frames = wire.read_frames(reader)
+                await self.enterAsyncContext(contextlib.aclosing(frames))
+                responses = [await anext(frames) for _ in requests]
             self.assertEqual(
                 responses,
                 [
-                    Response(19, Ok()),
-                    Response(3, Value(b"value")),
-                    Response(protocol.MAX_REQUEST_ID, Err("ttl out of range")),
-                    Response(42, Persistent()),
+                    Ok(),
+                    Value(b"value"),
+                    Err("ttl out of range"),
+                    Persistent(),
                 ],
             )
-        finally:
-            writer.close()
-            await writer.wait_closed()
-
-    async def test_request_id_zero_gets_connection_error_then_eof(self) -> None:
-        wire = protocol.DEFAULT_PROTOCOL
-        reader, writer = await asyncio.open_connection("127.0.0.1", self.server.port)
-        try:
-            writer.write(
-                wire.framing.encode(
-                    struct.pack(">Q", 0)
-                    + protocol.CommandCodec().encode(Set("key", b"value"))
-                )
-            )
-            async with asyncio.timeout(1):
-                self.assertEqual(
-                    await wire.read_frame(reader),
-                    Response(0, Err("request ID must be nonzero")),
-                )
-                self.assertEqual(await reader.read(), b"")
-            self.assertIsNone(self.store.get("key"))
         finally:
             writer.close()
             await writer.wait_closed()
@@ -85,9 +66,9 @@ class RequestIdIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         compressed = protocol.WireProtocol(
-            command_codec=CodecChain.of(protocol.CommandCodec())
+            command_codec=CodecChain.of(protocol.COMMANDS)
             | Deflate(max_length=protocol.MAX_FRAME_LEN),
-            frame_codec=CodecChain.of(protocol.FrameCodec())
+            frame_codec=CodecChain.of(protocol.FRAMES)
             | Deflate(max_length=protocol.MAX_FRAME_LEN),
         )
         for i in range(16):
@@ -98,12 +79,13 @@ class RequestIdIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 await server.start()
                 try:
                     async with await Client.connect(
-                        "127.0.0.1", server.port, wire=wire, max_pending_requests=3
+                        "127.0.0.1",
+                        server.port,
+                        wire=wire,
+                        limits=SessionLimits(max_pending_requests=3),
                     ) as client:
                         await client.subscribe("news")
                         async with asyncio.timeout(5):
-                            # More operations than slots exercise pipelining and
-                            # capacity waiters while pushes share the same stream.
                             results = await asyncio.gather(
                                 *(client.get(str(i % 16)) for i in range(64)),
                                 client.publish("news", b"hello"),
@@ -118,7 +100,7 @@ class RequestIdIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 finally:
                     await server.close()
 
-    async def test_timed_out_request_keeps_tcp_session_usable_for_reordered_replies(
+    async def test_timed_out_request_keeps_tcp_session_usable_for_late_replies(
         self,
     ) -> None:
         wire = protocol.DEFAULT_PROTOCOL
@@ -128,16 +110,17 @@ class RequestIdIntegrationTests(unittest.IsolatedAsyncioTestCase):
             reader: asyncio.StreamReader, writer: asyncio.StreamWriter
         ) -> None:
             try:
-                first = await wire.read_command(reader)
-                self.assertEqual(first, Request(1, Get("first")))
+                commands = wire.read_commands(reader)
+                first = await anext(commands)
+                self.assertEqual(first, Get("first"))
                 first_seen.set()
                 await send_replies.wait()
-                second = await wire.read_command(reader)
-                self.assertEqual(second, Request(2, Get("second")))
+                second = await anext(commands)
+                self.assertEqual(second, Get("second"))
                 writer.write(
-                    wire.frames.encode(Response(second.request_id, Value(b"current")))
+                    wire.frames.encode(Value(b"late"))
                     + wire.frames.encode(Message("news", b"push"))
-                    + wire.frames.encode(Response(first.request_id, Value(b"late")))
+                    + wire.frames.encode(Value(b"current"))
                 )
                 await writer.drain()
                 await reader.read()

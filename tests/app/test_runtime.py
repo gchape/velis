@@ -8,7 +8,7 @@ from velis.app import _maintain, serve
 from velis.config import Config, Server
 from velis.core.broker import Broker
 from velis.core.engine import Engine
-from velis.core.store import Store
+from velis.core.store import EvictionPolicy, Store, StoreLimits
 from velis.net.server import TcpServer
 
 
@@ -17,8 +17,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         clock = ManualClock()
-        # Keep due entries until the maintenance task processes the backlog.
-        store = Store(clock, eviction_policy="reject")
+        store = Store(clock, limits=StoreLimits(eviction_policy=EvictionPolicy.REJECT))
         for index in range(3001):
             key = str(index)
             store.set(key, b"v")
@@ -46,19 +45,18 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(store), 0)
         self.assertEqual(store.stored_bytes, 0)
 
-    async def test_maintenance_continues_after_round_removing_only_stale_entries(
+    async def test_maintenance_continues_after_round_only_cascading_timers(
         self,
     ) -> None:
         clock = ManualClock()
-        # Preserve stale entries for the maintenance continuation check.
-        store = Store(clock, eviction_policy="reject")
+        store = Store(clock, limits=StoreLimits(eviction_policy=EvictionPolicy.REJECT))
         for index in range(1000):
             key = f"a{index}"
             store.set(key, b"v")
-            store.expire(key, 0)
-            store.set(key, b"live")
+            store.expire(key, 65)
         store.set("z", b"due")
-        store.expire("z", 0)
+        store.expire("z", 64)
+        clock.advance(64)
         intervals = 0
         yields = 0
 

@@ -1,12 +1,12 @@
 import asyncio
 import contextlib
 import logging
-from collections.abc import Generator
+from collections.abc import AsyncGenerator, Generator
 from contextvars import ContextVar
 
-from velis.core.commands import Message, Reply
+from velis.core.commands import Command, Message, Reply
 from velis.errors import ProtocolError
-from velis.net.protocol import DEFAULT_PROTOCOL, Request, Response, WireProtocol
+from velis.net.protocol import DEFAULT_PROTOCOL, WireProtocol
 
 log = logging.getLogger(__name__)
 
@@ -47,12 +47,13 @@ class Connection:
         self._writer = writer
         self._max_buffer = max_buffer
 
-    async def read_command(self) -> Request:
-        return await self._wire.read_command(self._reader)
+    def read_commands(self) -> AsyncGenerator[Command]:
+        """Yield commands until the peer disconnects cleanly."""
+        return self._wire.read_commands(self._reader)
 
-    def write_reply(self, reply: Reply, *, request_id: int) -> None:
+    def write_reply(self, reply: Reply) -> None:
         """Validate and encode the complete reply before writing any bytes."""
-        self._writer.write(self._wire.frames.encode(Response(request_id, reply)))
+        self._writer.write(self._wire.frames.encode(reply))
 
     def _encode_push(self, channel: str, payload: bytes) -> bytes:
         """Encode once per wire protocol within the current dispatch scope."""

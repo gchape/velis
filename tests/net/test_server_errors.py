@@ -17,7 +17,6 @@ class ServerErrorTests(unittest.IsolatedAsyncioTestCase):
                 wire = WireProtocol(framing=LengthPrefix(max_frame))
                 server = TcpServer(engine, ServerConfig("127.0.0.1", 0), wire=wire)
                 reader = asyncio.StreamReader()
-                # A complete empty frame cannot contain a command tag.
                 reader.feed_data(b"\x00\x00\x00\x00")
                 reader.feed_eof()
                 writer = Mock(spec=asyncio.StreamWriter)

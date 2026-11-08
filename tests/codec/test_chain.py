@@ -15,7 +15,6 @@ class CodecChainTests(unittest.TestCase):
 
     def test_encode_order_and_reverse_decode_order(self) -> None:
         chain = CodecChain.of(Prefix()) | Reverse()
-        self.assertEqual(chain.name, "testprefix_testreverse")
         self.assertEqual(chain.encode(b"ab"), b"bax")
         self.assertEqual(chain.decode(b"bax"), b"ab")
 
@@ -28,7 +27,6 @@ class CodecChainTests(unittest.TestCase):
     def test_appending_codec_preserves_previous_steps(self) -> None:
         original = CodecChain.of(Prefix())
         extended = original | Reverse()
-        self.assertEqual(extended.name, "testprefix_testreverse")
         self.assertEqual(extended.encode(b"ab"), b"bax")
         self.assertEqual(extended.decode(b"bax"), b"ab")
         self.assertEqual(original.encode(b"ab"), b"xab")
@@ -42,7 +40,6 @@ class CodecChainTests(unittest.TestCase):
 
     def test_build_chain_from_identity(self) -> None:
         chain = CodecChain.of(Identity()) | Prefix() | Reverse()
-        self.assertEqual(chain.name, "identity_testprefix_testreverse")
         self.assertEqual(chain.encode(b"ab"), b"bax")
         self.assertEqual(chain.decode(b"bax"), b"ab")
 

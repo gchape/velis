@@ -1,0 +1,1085 @@
+{
+  "environment": {
+    "recorded_at_utc": "2026-11-08T12:25:37.490079+00:00",
+    "python": "3.15.2",
+    "implementation": "CPython",
+    "platform": "Linux-7.2.15-200.fc44.x86_64-x86_64-with-glibc2.43",
+    "cpu": "AMD Ryzen 5 7535HS with Radeon Graphics",
+    "logical_cpus": 12,
+    "available_cpus": 12,
+    "event_loop": "_UnixSelectorEventLoop",
+    "event_loop_debug": false,
+    "gc_enabled": true,
+    "collect_before_trial": true,
+    "python_hash_seed": "randomized",
+    "assertions_enabled": true,
+    "source_sha256": "75894b7803e7af17fb99281b5282a60236b57030180d86fccd15d80b163a6ab5",
+    "benchmark_sha256": "6ca31984656a1d16b89262ce79ef413401e9897c991326aea98176e51d9cc507"
+  },
+  "configuration": {
+    "output": "benchmarks/results.json",
+    "repeats": 5,
+    "warmups": 1,
+    "core_operations": 100000,
+    "network_operations": 5000,
+    "publications": 1000
+  },
+  "results": {
+    "store_lru_get_hit": {
+      "parameters": {
+        "payload_bytes": 256,
+        "capacity": 4096
+      },
+      "median_operations_per_second": 4601403.851503863,
+      "min_operations_per_second": 3132608.8131250045,
+      "max_operations_per_second": 4620892.07892687,
+      "median_ns_per_operation": 217.32498,
+      "trials": [
+        {
+          "seconds": 0.031922275,
+          "operations": 100000,
+          "operations_per_second": 3132608.8131250045
+        },
+        {
+          "seconds": 0.024230097,
+          "operations": 100000,
+          "operations_per_second": 4127098.624491681
+        },
+        {
+          "seconds": 0.021640843,
+          "operations": 100000,
+          "operations_per_second": 4620892.07892687
+        },
+        {
+          "seconds": 0.021732498,
+          "operations": 100000,
+          "operations_per_second": 4601403.851503863
+        },
+        {
+          "seconds": 0.021654721,
+          "operations": 100000,
+          "operations_per_second": 4617930.658169182
+        }
+      ]
+    },
+    "store_lru_evict_set": {
+      "parameters": {
+        "payload_bytes": 256,
+        "capacity": 4096
+      },
+      "median_operations_per_second": 730182.4485708952,
+      "min_operations_per_second": 670524.2418015286,
+      "max_operations_per_second": 759129.1370744528,
+      "median_ns_per_operation": 1369.52073,
+      "trials": [
+        {
+          "seconds": 0.149137039,
+          "operations": 100000,
+          "operations_per_second": 670524.2418015286
+        },
+        {
+          "seconds": 0.138674696,
+          "operations": 100000,
+          "operations_per_second": 721112.0909902698
+        },
+        {
+          "seconds": 0.133055744,
+          "operations": 100000,
+          "operations_per_second": 751564.6975751757
+        },
+        {
+          "seconds": 0.131729893,
+          "operations": 100000,
+          "operations_per_second": 759129.1370744528
+        },
+        {
+          "seconds": 0.136952073,
+          "operations": 100000,
+          "operations_per_second": 730182.4485708952
+        }
+      ]
+    },
+    "store_sieve_get_hit": {
+      "parameters": {
+        "payload_bytes": 256,
+        "capacity": 4096
+      },
+      "median_operations_per_second": 4866344.391387233,
+      "min_operations_per_second": 4466378.930625612,
+      "max_operations_per_second": 4990156.6664675595,
+      "median_ns_per_operation": 205.49306,
+      "trials": [
+        {
+          "seconds": 0.020549306,
+          "operations": 100000,
+          "operations_per_second": 4866344.391387233
+        },
+        {
+          "seconds": 0.021015429,
+          "operations": 100000,
+          "operations_per_second": 4758408.691062172
+        },
+        {
+          "seconds": 0.020241264,
+          "operations": 100000,
+          "operations_per_second": 4940402.931358437
+        },
+        {
+          "seconds": 0.020039451,
+          "operations": 100000,
+          "operations_per_second": 4990156.6664675595
+        },
+        {
+          "seconds": 0.022389502,
+          "operations": 100000,
+          "operations_per_second": 4466378.930625612
+        }
+      ]
+    },
+    "store_sieve_evict_set": {
+      "parameters": {
+        "payload_bytes": 256,
+        "capacity": 4096
+      },
+      "median_operations_per_second": 598101.4024586717,
+      "min_operations_per_second": 564134.4611328958,
+      "max_operations_per_second": 627777.7557009268,
+      "median_ns_per_operation": 1671.95729,
+      "trials": [
+        {
+          "seconds": 0.167195729,
+          "operations": 100000,
+          "operations_per_second": 598101.4024586717
+        },
+        {
+          "seconds": 0.160596181,
+          "operations": 100000,
+          "operations_per_second": 622679.8132889598
+        },
+        {
+          "seconds": 0.175330565,
+          "operations": 100000,
+          "operations_per_second": 570351.2105832774
+        },
+        {
+          "seconds": 0.159292041,
+          "operations": 100000,
+          "operations_per_second": 627777.7557009268
+        },
+        {
+          "seconds": 0.177262704,
+          "operations": 100000,
+          "operations_per_second": 564134.4611328958
+        }
+      ]
+    },
+    "wheel_schedule": {
+      "parameters": {
+        "timers": 100000,
+        "sweep_budget": 1000,
+        "deadline_range_ms": [
+          1,
+          4096
+        ]
+      },
+      "median_operations_per_second": 1072426.8629545283,
+      "min_operations_per_second": 956854.8319461028,
+      "max_operations_per_second": 1138521.9116511552,
+      "median_ns_per_operation": 932.46452,
+      "trials": [
+        {
+          "seconds": 0.08783318,
+          "operations": 100000,
+          "operations_per_second": 1138521.9116511552
+        },
+        {
+          "seconds": 0.104509061,
+          "operations": 100000,
+          "operations_per_second": 956854.8319461028
+        },
+        {
+          "seconds": 0.093246452,
+          "operations": 100000,
+          "operations_per_second": 1072426.8629545283
+        },
+        {
+          "seconds": 0.094220897,
+          "operations": 100000,
+          "operations_per_second": 1061335.682253163
+        },
+        {
+          "seconds": 0.092225178,
+          "operations": 100000,
+          "operations_per_second": 1084302.596846167
+        }
+      ]
+    },
+    "wheel_reschedule": {
+      "parameters": {
+        "timers": 100000,
+        "sweep_budget": 1000,
+        "deadline_range_ms": [
+          4097,
+          8192
+        ]
+      },
+      "median_operations_per_second": 911362.5049899375,
+      "min_operations_per_second": 842926.6605842765,
+      "max_operations_per_second": 924509.2268193433,
+      "median_ns_per_operation": 1097.25822,
+      "trials": [
+        {
+          "seconds": 0.11055417,
+          "operations": 100000,
+          "operations_per_second": 904533.9492847715
+        },
+        {
+          "seconds": 0.109725822,
+          "operations": 100000,
+          "operations_per_second": 911362.5049899375
+        },
+        {
+          "seconds": 0.108165497,
+          "operations": 100000,
+          "operations_per_second": 924509.2268193433
+        },
+        {
+          "seconds": 0.118634283,
+          "operations": 100000,
+          "operations_per_second": 842926.6605842765
+        },
+        {
+          "seconds": 0.109586918,
+          "operations": 100000,
+          "operations_per_second": 912517.6784331136
+        }
+      ]
+    },
+    "wheel_cancel": {
+      "parameters": {
+        "timers": 100000,
+        "sweep_budget": 1000,
+        "deadline_range_ms": [
+          1,
+          4096
+        ]
+      },
+      "median_operations_per_second": 4790498.792961972,
+      "min_operations_per_second": 4290030.976168663,
+      "max_operations_per_second": 5159566.02890131,
+      "median_ns_per_operation": 208.74653,
+      "trials": [
+        {
+          "seconds": 0.020874653,
+          "operations": 100000,
+          "operations_per_second": 4790498.792961972
+        },
+        {
+          "seconds": 0.019613594,
+          "operations": 100000,
+          "operations_per_second": 5098504.639180356
+        },
+        {
+          "seconds": 0.021081695,
+          "operations": 100000,
+          "operations_per_second": 4743451.605765096
+        },
+        {
+          "seconds": 0.019381475,
+          "operations": 100000,
+          "operations_per_second": 5159566.02890131
+        },
+        {
+          "seconds": 0.023309855,
+          "operations": 100000,
+          "operations_per_second": 4290030.976168663
+        }
+      ]
+    },
+    "wheel_expire": {
+      "parameters": {
+        "timers": 100000,
+        "sweep_budget": 1000,
+        "deadline_range_ms": [
+          1,
+          4096
+        ]
+      },
+      "median_operations_per_second": 2681926.111058292,
+      "min_operations_per_second": 2425687.0164180687,
+      "max_operations_per_second": 2830538.464371177,
+      "median_ns_per_operation": 372.86635,
+      "trials": [
+        {
+          "seconds": 0.041225434,
+          "operations": 100000,
+          "operations_per_second": 2425687.0164180687
+        },
+        {
+          "seconds": 0.035328967,
+          "operations": 100000,
+          "operations_per_second": 2830538.464371177
+        },
+        {
+          "seconds": 0.040499088,
+          "operations": 100000,
+          "operations_per_second": 2469191.405001515
+        },
+        {
+          "seconds": 0.037286635,
+          "operations": 100000,
+          "operations_per_second": 2681926.111058292
+        },
+        {
+          "seconds": 0.035390924,
+          "operations": 100000,
+          "operations_per_second": 2825583.1918940577
+        }
+      ]
+    },
+    "wire_roundtrip": {
+      "parameters": {
+        "payload_bytes": 256
+      },
+      "median_operations_per_second": 212824.98694744357,
+      "min_operations_per_second": 208167.16822811126,
+      "max_operations_per_second": 220904.25100740345,
+      "median_ns_per_operation": 4698.6964,
+      "trials": [
+        {
+          "seconds": 0.46986964,
+          "operations": 100000,
+          "operations_per_second": 212824.98694744357
+        },
+        {
+          "seconds": 0.474115441,
+          "operations": 100000,
+          "operations_per_second": 210919.0955457618
+        },
+        {
+          "seconds": 0.465644509,
+          "operations": 100000,
+          "operations_per_second": 214756.10270752705
+        },
+        {
+          "seconds": 0.48038315,
+          "operations": 100000,
+          "operations_per_second": 208167.16822811126
+        },
+        {
+          "seconds": 0.452684815,
+          "operations": 100000,
+          "operations_per_second": 220904.25100740345
+        }
+      ]
+    },
+    "deflate_repeated_roundtrip": {
+      "parameters": {
+        "payload_bytes": 1024
+      },
+      "median_operations_per_second": 159286.15844378955,
+      "min_operations_per_second": 148505.40595318968,
+      "max_operations_per_second": 160171.99396849933,
+      "median_ns_per_operation": 6278.009399999999,
+      "trials": [
+        {
+          "seconds": 0.062536023,
+          "operations": 10000,
+          "operations_per_second": 159907.83424139395
+        },
+        {
+          "seconds": 0.062780094,
+          "operations": 10000,
+          "operations_per_second": 159286.15844378955
+        },
+        {
+          "seconds": 0.0637863,
+          "operations": 10000,
+          "operations_per_second": 156773.4764361626
+        },
+        {
+          "seconds": 0.067337616,
+          "operations": 10000,
+          "operations_per_second": 148505.40595318968
+        },
+        {
+          "seconds": 0.062432887,
+          "operations": 10000,
+          "operations_per_second": 160171.99396849933
+        }
+      ]
+    },
+    "deflate_random_roundtrip": {
+      "parameters": {
+        "payload_bytes": 1024
+      },
+      "median_operations_per_second": 55521.87691038633,
+      "min_operations_per_second": 54722.527590646954,
+      "max_operations_per_second": 56344.216192396925,
+      "median_ns_per_operation": 18010.9185,
+      "trials": [
+        {
+          "seconds": 0.177642934,
+          "operations": 10000,
+          "operations_per_second": 56292.69780018382
+        },
+        {
+          "seconds": 0.180109185,
+          "operations": 10000,
+          "operations_per_second": 55521.87691038633
+        },
+        {
+          "seconds": 0.177480506,
+          "operations": 10000,
+          "operations_per_second": 56344.216192396925
+        },
+        {
+          "seconds": 0.180397842,
+          "operations": 10000,
+          "operations_per_second": 55433.035612477004
+        },
+        {
+          "seconds": 0.182740097,
+          "operations": 10000,
+          "operations_per_second": 54722.527590646954
+        }
+      ]
+    },
+    "tcp_get_lru_64b_depth1": {
+      "parameters": {
+        "payload_bytes": 64,
+        "pipeline_depth": 1,
+        "resident_keys": 1024
+      },
+      "median_operations_per_second": 15449.844437679336,
+      "min_operations_per_second": 15251.99092321076,
+      "max_operations_per_second": 15935.445027755037,
+      "median_ns_per_operation": 64725.5708,
+      "trials": [
+        {
+          "seconds": 0.313765947,
+          "operations": 5000,
+          "operations_per_second": 15935.445027755037,
+          "p50_us": 59.994,
+          "p95_us": 74.301,
+          "p99_us": 85.803
+        },
+        {
+          "seconds": 0.327826054,
+          "operations": 5000,
+          "operations_per_second": 15251.99092321076,
+          "p50_us": 60.494,
+          "p95_us": 83.489,
+          "p99_us": 100.761
+        },
+        {
+          "seconds": 0.314354982,
+          "operations": 5000,
+          "operations_per_second": 15905.585361456113,
+          "p50_us": 59.643,
+          "p95_us": 74.25,
+          "p99_us": 87.266
+        },
+        {
+          "seconds": 0.323627854,
+          "operations": 5000,
+          "operations_per_second": 15449.844437679336,
+          "p50_us": 59.783,
+          "p95_us": 84.47,
+          "p99_us": 95.771
+        },
+        {
+          "seconds": 0.325152591,
+          "operations": 5000,
+          "operations_per_second": 15377.395531810478,
+          "p50_us": 60.124,
+          "p95_us": 86.574,
+          "p99_us": 106.873
+        }
+      ],
+      "median_p50_us": 59.994,
+      "median_p95_us": 83.489,
+      "median_p99_us": 95.771
+    },
+    "tcp_get_lru_64b_depth32": {
+      "parameters": {
+        "payload_bytes": 64,
+        "pipeline_depth": 32,
+        "resident_keys": 1024
+      },
+      "median_operations_per_second": 31271.17332056569,
+      "min_operations_per_second": 30993.83479316568,
+      "max_operations_per_second": 32072.696949916666,
+      "median_ns_per_operation": 31978.3332,
+      "trials": [
+        {
+          "seconds": 0.159098955,
+          "operations": 5000,
+          "operations_per_second": 31426.982031403037,
+          "p50_us": 768.506,
+          "p95_us": 981.378,
+          "p99_us": 1204.992
+        },
+        {
+          "seconds": 0.161322406,
+          "operations": 5000,
+          "operations_per_second": 30993.83479316568,
+          "p50_us": 774.787,
+          "p95_us": 1001.016,
+          "p99_us": 1305.172
+        },
+        {
+          "seconds": 0.160959188,
+          "operations": 5000,
+          "operations_per_second": 31063.774998666122,
+          "p50_us": 772.132,
+          "p95_us": 1013.048,
+          "p99_us": 1254.686
+        },
+        {
+          "seconds": 0.159891666,
+          "operations": 5000,
+          "operations_per_second": 31271.17332056569,
+          "p50_us": 777.392,
+          "p95_us": 984.625,
+          "p99_us": 1073.543
+        },
+        {
+          "seconds": 0.155895839,
+          "operations": 5000,
+          "operations_per_second": 32072.696949916666,
+          "p50_us": 758.607,
+          "p95_us": 907.388,
+          "p99_us": 1004.973
+        }
+      ],
+      "median_p50_us": 772.132,
+      "median_p95_us": 984.625,
+      "median_p99_us": 1204.992
+    },
+    "tcp_get_lru_64b_depth128": {
+      "parameters": {
+        "payload_bytes": 64,
+        "pipeline_depth": 128,
+        "resident_keys": 1024
+      },
+      "median_operations_per_second": 35464.805751704895,
+      "min_operations_per_second": 35315.52824695223,
+      "max_operations_per_second": 35663.015798566215,
+      "median_ns_per_operation": 28196.9682,
+      "trials": [
+        {
+          "seconds": 0.141281372,
+          "operations": 5000,
+          "operations_per_second": 35390.36979340773,
+          "p50_us": 2749.968,
+          "p95_us": 3272.287,
+          "p99_us": 3393.677
+        },
+        {
+          "seconds": 0.140503549,
+          "operations": 5000,
+          "operations_per_second": 35586.289710020064,
+          "p50_us": 2734.468,
+          "p95_us": 3237.982,
+          "p99_us": 3344.824
+        },
+        {
+          "seconds": 0.140984841,
+          "operations": 5000,
+          "operations_per_second": 35464.805751704895,
+          "p50_us": 2755.949,
+          "p95_us": 3243.743,
+          "p99_us": 3339.564
+        },
+        {
+          "seconds": 0.141580779,
+          "operations": 5000,
+          "operations_per_second": 35315.52824695223,
+          "p50_us": 2773.232,
+          "p95_us": 3271.485,
+          "p99_us": 3395.009
+        },
+        {
+          "seconds": 0.140201267,
+          "operations": 5000,
+          "operations_per_second": 35663.015798566215,
+          "p50_us": 2732.365,
+          "p95_us": 3223.274,
+          "p99_us": 3325.938
+        }
+      ],
+      "median_p50_us": 2749.968,
+      "median_p95_us": 3243.743,
+      "median_p99_us": 3344.824
+    },
+    "tcp_get_lru_1024b_depth1": {
+      "parameters": {
+        "payload_bytes": 1024,
+        "pipeline_depth": 1,
+        "resident_keys": 1024
+      },
+      "median_operations_per_second": 14605.79946286413,
+      "min_operations_per_second": 14484.623928582507,
+      "max_operations_per_second": 14768.40465466561,
+      "median_ns_per_operation": 68465.9544,
+      "trials": [
+        {
+          "seconds": 0.343771713,
+          "operations": 5000,
+          "operations_per_second": 14544.535838526075,
+          "p50_us": 63.019,
+          "p95_us": 89.87,
+          "p99_us": 117.603
+        },
+        {
+          "seconds": 0.341393498,
+          "operations": 5000,
+          "operations_per_second": 14645.85596764939,
+          "p50_us": 63.67,
+          "p95_us": 85.532,
+          "p99_us": 101.022
+        },
+        {
+          "seconds": 0.345193636,
+          "operations": 5000,
+          "operations_per_second": 14484.623928582507,
+          "p50_us": 63.109,
+          "p95_us": 91.303,
+          "p99_us": 114.236
+        },
+        {
+          "seconds": 0.338560604,
+          "operations": 5000,
+          "operations_per_second": 14768.40465466561,
+          "p50_us": 63.38,
+          "p95_us": 80.743,
+          "p99_us": 100.42
+        },
+        {
+          "seconds": 0.342329772,
+          "operations": 5000,
+          "operations_per_second": 14605.79946286413,
+          "p50_us": 62.999,
+          "p95_us": 90.461,
+          "p99_us": 110.339
+        }
+      ],
+      "median_p50_us": 63.109,
+      "median_p95_us": 89.87,
+      "median_p99_us": 110.339
+    },
+    "tcp_get_lru_1024b_depth32": {
+      "parameters": {
+        "payload_bytes": 1024,
+        "pipeline_depth": 32,
+        "resident_keys": 1024
+      },
+      "median_operations_per_second": 29296.81554806376,
+      "min_operations_per_second": 28820.687498709194,
+      "max_operations_per_second": 30522.531143405213,
+      "median_ns_per_operation": 34133.4026,
+      "trials": [
+        {
+          "seconds": 0.173486493,
+          "operations": 5000,
+          "operations_per_second": 28820.687498709194,
+          "p50_us": 842.265,
+          "p95_us": 1103.179,
+          "p99_us": 1275.396
+        },
+        {
+          "seconds": 0.170667013,
+          "operations": 5000,
+          "operations_per_second": 29296.81554806376,
+          "p50_us": 839.701,
+          "p95_us": 1028.087,
+          "p99_us": 1113.259
+        },
+        {
+          "seconds": 0.173301121,
+          "operations": 5000,
+          "operations_per_second": 28851.515622913947,
+          "p50_us": 843.558,
+          "p95_us": 1063.524,
+          "p99_us": 1301.194
+        },
+        {
+          "seconds": 0.163813413,
+          "operations": 5000,
+          "operations_per_second": 30522.531143405213,
+          "p50_us": 807.78,
+          "p95_us": 932.746,
+          "p99_us": 980.006
+        },
+        {
+          "seconds": 0.166453394,
+          "operations": 5000,
+          "operations_per_second": 30038.43826699022,
+          "p50_us": 812.278,
+          "p95_us": 1008.941,
+          "p99_us": 1280.204
+        }
+      ],
+      "median_p50_us": 839.701,
+      "median_p95_us": 1028.087,
+      "median_p99_us": 1275.396
+    },
+    "tcp_get_lru_1024b_depth128": {
+      "parameters": {
+        "payload_bytes": 1024,
+        "pipeline_depth": 128,
+        "resident_keys": 1024
+      },
+      "median_operations_per_second": 31815.72252067774,
+      "min_operations_per_second": 27751.939950796368,
+      "max_operations_per_second": 31929.38262737873,
+      "median_ns_per_operation": 31431.0008,
+      "trials": [
+        {
+          "seconds": 0.156906272,
+          "operations": 5000,
+          "operations_per_second": 31866.157651110338,
+          "p50_us": 3145.878,
+          "p95_us": 3642.809,
+          "p99_us": 3745.985
+        },
+        {
+          "seconds": 0.157155004,
+          "operations": 5000,
+          "operations_per_second": 31815.72252067774,
+          "p50_us": 3155.055,
+          "p95_us": 3656.695,
+          "p99_us": 3770.05
+        },
+        {
+          "seconds": 0.156595574,
+          "operations": 5000,
+          "operations_per_second": 31929.38262737873,
+          "p50_us": 3138.083,
+          "p95_us": 3659.27,
+          "p99_us": 3851.825
+        },
+        {
+          "seconds": 0.157968274,
+          "operations": 5000,
+          "operations_per_second": 31651.92524671125,
+          "p50_us": 3163.902,
+          "p95_us": 3750.603,
+          "p99_us": 4190.215
+        },
+        {
+          "seconds": 0.180167585,
+          "operations": 5000,
+          "operations_per_second": 27751.939950796368,
+          "p50_us": 3484.689,
+          "p95_us": 4770.144,
+          "p99_us": 5563.396
+        }
+      ],
+      "median_p50_us": 3155.055,
+      "median_p95_us": 3659.27,
+      "median_p99_us": 3851.825
+    },
+    "tcp_get_sieve_1024b_depth32": {
+      "parameters": {
+        "payload_bytes": 1024,
+        "pipeline_depth": 32,
+        "resident_keys": 1024
+      },
+      "median_operations_per_second": 31285.519427878953,
+      "min_operations_per_second": 31063.15627984509,
+      "max_operations_per_second": 31414.562436549655,
+      "median_ns_per_operation": 31963.6694,
+      "trials": [
+        {
+          "seconds": 0.16032138,
+          "operations": 5000,
+          "operations_per_second": 31187.356296459024,
+          "p50_us": 790.006,
+          "p95_us": 917.467,
+          "p99_us": 958.886
+        },
+        {
+          "seconds": 0.160962394,
+          "operations": 5000,
+          "operations_per_second": 31063.15627984509,
+          "p50_us": 793.443,
+          "p95_us": 916.997,
+          "p99_us": 954.368
+        },
+        {
+          "seconds": 0.159161854,
+          "operations": 5000,
+          "operations_per_second": 31414.562436549655,
+          "p50_us": 783.033,
+          "p95_us": 911.326,
+          "p99_us": 966.49
+        },
+        {
+          "seconds": 0.159818347,
+          "operations": 5000,
+          "operations_per_second": 31285.519427878953,
+          "p50_us": 787.451,
+          "p95_us": 916.836,
+          "p99_us": 960.509
+        },
+        {
+          "seconds": 0.159369457,
+          "operations": 5000,
+          "operations_per_second": 31373.640182510004,
+          "p50_us": 786.149,
+          "p95_us": 909.673,
+          "p99_us": 959.347
+        }
+      ],
+      "median_p50_us": 787.451,
+      "median_p95_us": 916.836,
+      "median_p99_us": 959.347
+    },
+    "pubsub_64b_fanout1": {
+      "parameters": {
+        "payload_bytes": 64,
+        "subscribers": 1
+      },
+      "median_operations_per_second": 10149.682544826657,
+      "min_operations_per_second": 9538.20385434621,
+      "max_operations_per_second": 10428.456144968304,
+      "median_ns_per_operation": 98525.249,
+      "trials": [
+        {
+          "seconds": 0.098525249,
+          "operations": 1000,
+          "operations_per_second": 10149.682544826657,
+          "p50_us": 94.72,
+          "p95_us": 115.188,
+          "p99_us": 139.053,
+          "deliveries_per_second": 10149.682544826657
+        },
+        {
+          "seconds": 0.095891471,
+          "operations": 1000,
+          "operations_per_second": 10428.456144968304,
+          "p50_us": 93.377,
+          "p95_us": 110.409,
+          "p99_us": 116.731,
+          "deliveries_per_second": 10428.456144968304
+        },
+        {
+          "seconds": 0.097074051,
+          "operations": 1000,
+          "operations_per_second": 10301.414123533385,
+          "p50_us": 93.437,
+          "p95_us": 112.113,
+          "p99_us": 129.516,
+          "deliveries_per_second": 10301.414123533385
+        },
+        {
+          "seconds": 0.104841542,
+          "operations": 1000,
+          "operations_per_second": 9538.20385434621,
+          "p50_us": 95.13,
+          "p95_us": 138.863,
+          "p99_us": 228.102,
+          "deliveries_per_second": 9538.20385434621
+        },
+        {
+          "seconds": 0.101873721,
+          "operations": 1000,
+          "operations_per_second": 9816.074157142057,
+          "p50_us": 94.829,
+          "p95_us": 126.59,
+          "p99_us": 210.138,
+          "deliveries_per_second": 9816.074157142057
+        }
+      ],
+      "median_p50_us": 94.72,
+      "median_p95_us": 115.188,
+      "median_p99_us": 139.053,
+      "median_deliveries_per_second": 10149.682544826657
+    },
+    "pubsub_64b_fanout8": {
+      "parameters": {
+        "payload_bytes": 64,
+        "subscribers": 8
+      },
+      "median_operations_per_second": 4262.071648799977,
+      "min_operations_per_second": 4240.524194603388,
+      "max_operations_per_second": 4292.485221241664,
+      "median_ns_per_operation": 234627.684,
+      "trials": [
+        {
+          "seconds": 0.232965275,
+          "operations": 1000,
+          "operations_per_second": 4292.485221241664,
+          "p50_us": 228.092,
+          "p95_us": 252.438,
+          "p99_us": 268.289,
+          "deliveries_per_second": 34339.88176993331
+        },
+        {
+          "seconds": 0.235819902,
+          "operations": 1000,
+          "operations_per_second": 4240.524194603388,
+          "p50_us": 229.004,
+          "p95_us": 266.565,
+          "p99_us": 307.232,
+          "deliveries_per_second": 33924.19355682711
+        },
+        {
+          "seconds": 0.233479609,
+          "operations": 1000,
+          "operations_per_second": 4283.029273018869,
+          "p50_us": 228.723,
+          "p95_us": 254.331,
+          "p99_us": 285.741,
+          "deliveries_per_second": 34264.234184150955
+        },
+        {
+          "seconds": 0.235413251,
+          "operations": 1000,
+          "operations_per_second": 4247.849242776907,
+          "p50_us": 229.314,
+          "p95_us": 258.83,
+          "p99_us": 294.568,
+          "deliveries_per_second": 33982.793942215256
+        },
+        {
+          "seconds": 0.234627684,
+          "operations": 1000,
+          "operations_per_second": 4262.071648799977,
+          "p50_us": 228.774,
+          "p95_us": 258.329,
+          "p99_us": 283.427,
+          "deliveries_per_second": 34096.57319039982
+        }
+      ],
+      "median_p50_us": 228.774,
+      "median_p95_us": 258.329,
+      "median_p99_us": 285.741,
+      "median_deliveries_per_second": 34096.57319039982
+    },
+    "pubsub_1024b_fanout1": {
+      "parameters": {
+        "payload_bytes": 1024,
+        "subscribers": 1
+      },
+      "median_operations_per_second": 9693.504944559938,
+      "min_operations_per_second": 9622.096027363701,
+      "max_operations_per_second": 9791.2284887934,
+      "median_ns_per_operation": 103161.86,
+      "trials": [
+        {
+          "seconds": 0.102900044,
+          "operations": 1000,
+          "operations_per_second": 9718.168827993894,
+          "p50_us": 98.456,
+          "p95_us": 121.791,
+          "p99_us": 139.414,
+          "deliveries_per_second": 9718.168827993894
+        },
+        {
+          "seconds": 0.10316186,
+          "operations": 1000,
+          "operations_per_second": 9693.504944559938,
+          "p50_us": 98.937,
+          "p95_us": 120.107,
+          "p99_us": 136.509,
+          "deliveries_per_second": 9693.504944559938
+        },
+        {
+          "seconds": 0.103248515,
+          "operations": 1000,
+          "operations_per_second": 9685.369324682297,
+          "p50_us": 98.767,
+          "p95_us": 121.219,
+          "p99_us": 136.208,
+          "deliveries_per_second": 9685.369324682297
+        },
+        {
+          "seconds": 0.10392746,
+          "operations": 1000,
+          "operations_per_second": 9622.096027363701,
+          "p50_us": 98.897,
+          "p95_us": 121.561,
+          "p99_us": 136.378,
+          "deliveries_per_second": 9622.096027363701
+        },
+        {
+          "seconds": 0.10213223,
+          "operations": 1000,
+          "operations_per_second": 9791.2284887934,
+          "p50_us": 98.236,
+          "p95_us": 119.546,
+          "p99_us": 132.31,
+          "deliveries_per_second": 9791.2284887934
+        }
+      ],
+      "median_p50_us": 98.767,
+      "median_p95_us": 121.219,
+      "median_p99_us": 136.378,
+      "median_deliveries_per_second": 9693.504944559938
+    },
+    "pubsub_1024b_fanout8": {
+      "parameters": {
+        "payload_bytes": 1024,
+        "subscribers": 8
+      },
+      "median_operations_per_second": 4046.650974050944,
+      "min_operations_per_second": 3945.5403224337374,
+      "max_operations_per_second": 4073.216141609758,
+      "median_ns_per_operation": 247117.927,
+      "trials": [
+        {
+          "seconds": 0.253450711,
+          "operations": 1000,
+          "operations_per_second": 3945.5403224337374,
+          "p50_us": 244.684,
+          "p95_us": 297.714,
+          "p99_us": 354.081,
+          "deliveries_per_second": 31564.3225794699
+        },
+        {
+          "seconds": 0.247607425,
+          "operations": 1000,
+          "operations_per_second": 4038.651102647669,
+          "p50_us": 242.299,
+          "p95_us": 272.386,
+          "p99_us": 303.886,
+          "deliveries_per_second": 32309.208821181353
+        },
+        {
+          "seconds": 0.246000221,
+          "operations": 1000,
+          "operations_per_second": 4065.0369984830218,
+          "p50_us": 241.387,
+          "p95_us": 267.357,
+          "p99_us": 289.328,
+          "deliveries_per_second": 32520.295987864174
+        },
+        {
+          "seconds": 0.245506245,
+          "operations": 1000,
+          "operations_per_second": 4073.216141609758,
+          "p50_us": 241.177,
+          "p95_us": 268.489,
+          "p99_us": 289.719,
+          "deliveries_per_second": 32585.729132878063
+        },
+        {
+          "seconds": 0.247117927,
+          "operations": 1000,
+          "operations_per_second": 4046.650974050944,
+          "p50_us": 241.357,
+          "p95_us": 271.684,
+          "p99_us": 299.307,
+          "deliveries_per_second": 32373.207792407553
+        }
+      ],
+      "median_p50_us": 241.387,
+      "median_p95_us": 271.684,
+      "median_p99_us": 299.307,
+      "median_deliveries_per_second": 32373.207792407553
+    }
+  }
+}

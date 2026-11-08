@@ -1,12 +1,7 @@
-import os
-import tempfile
 import unittest
-from pathlib import Path
-from unittest.mock import patch
 
 from tests.helpers import ManualClock, RecordingSubscriber
 from velis.app import build_engine
-from velis.config import Config
 from velis.core.broker import Broker
 from velis.core.commands import (
     Delivered,
@@ -25,28 +20,13 @@ from velis.core.store import Store
 
 
 class CacheTests(unittest.TestCase):
-    def test_restart_ignores_old_wal_and_starts_empty(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            wal = Path(directory) / "cache.wal"
-            original = b"existing cache WAL must be left untouched"
-            wal.write_bytes(original)
-            with patch.dict(
-                os.environ,
-                {
-                    "VELIS_WAL_PATH": str(wal),
-                    "VELIS_FSYNC": "obsolete",
-                    "VELIS_COMPACT_BYTES": "obsolete",
-                },
-            ):
-                Config.from_env()
-                sub = RecordingSubscriber()
-                engine = build_engine()
-                self.assertEqual(engine.execute(Set("k", b"v"), sub), Ok())
-                self.assertEqual(engine.execute(Expire("k", 5000), sub), Ok())
-                self.assertEqual(engine.execute(Get("k"), sub), Value(b"v"))
-                self.assertEqual(build_engine().execute(Get("k"), sub), Nil())
-            self.assertEqual(wal.read_bytes(), original)
-            self.assertEqual(list(Path(directory).iterdir()), [wal])
+    def test_new_engine_starts_with_an_empty_store(self) -> None:
+        sub = RecordingSubscriber()
+        engine = build_engine()
+        self.assertEqual(engine.execute(Set("k", b"v"), sub), Ok())
+        self.assertEqual(engine.execute(Expire("k", 5000), sub), Ok())
+        self.assertEqual(engine.execute(Get("k"), sub), Value(b"v"))
+        self.assertEqual(build_engine().execute(Get("k"), sub), Nil())
 
     def test_ttl_reset_lazy_expiry_and_sweep(self) -> None:
         clock = ManualClock()

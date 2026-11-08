@@ -2,16 +2,15 @@ import logging
 import os
 from dataclasses import dataclass, field
 
-from velis.core.broker import DEFAULT_MAX_SUBSCRIPTIONS, validate_subscription_limit
+from velis.core.broker import DEFAULT_MAX_SUBSCRIPTIONS
 from velis.core.store import (
     DEFAULT_EVICTION_POLICY,
     DEFAULT_MAX_BYTES,
     DEFAULT_MAX_KEYS,
+    EvictionPolicy,
     StoreLimits,
 )
-from velis.core.store import (
-    EVICTION_POLICIES as EVICTION_POLICIES,
-)
+from velis.validation import require_positive
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 9000
@@ -19,9 +18,6 @@ DEFAULT_MAX_BUFFER = 8 << 20
 DEFAULT_MAX_CONNECTIONS = 1024
 DEFAULT_SWEEP_INTERVAL_MS = 100
 DEFAULT_LOG_LEVEL = "INFO"
-
-# Preserve the existing configuration name; core owns limits and validation.
-Cache = StoreLimits
 
 
 def _env_int(name: str, default: int) -> int:
@@ -33,6 +29,16 @@ def _env_int(name: str, default: int) -> int:
         return int(raw)
     except ValueError:
         raise ValueError(f"{name} must be an integer, got {raw!r}") from None
+
+
+def _env_policy(name: str, default: EvictionPolicy) -> EvictionPolicy:
+    """Read an eviction policy, naming the environment variable on failure."""
+    raw = os.environ.get(name, default)
+    try:
+        return EvictionPolicy(raw)
+    except ValueError:
+        choices = ", ".join(EvictionPolicy)
+        raise ValueError(f"{name} must be one of {choices}, got {raw!r}") from None
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,15 +59,13 @@ class Server:
     def __post_init__(self) -> None:
         if not 0 <= self.port <= 65535:
             raise ValueError(f"invalid port: {self.port}")
-        if self.max_buffer <= 0:
-            raise ValueError(f"invalid max_buffer: {self.max_buffer}")
-        if self.max_connections <= 0:
-            raise ValueError(f"invalid max_connections: {self.max_connections}")
-        validate_subscription_limit(self.max_subscriptions)
+        require_positive("max_buffer", self.max_buffer)
+        require_positive("max_connections", self.max_connections)
+        require_positive("max_subscriptions", self.max_subscriptions)
 
     @classmethod
     def from_env(cls) -> Server:
-        """Load listener settings from VELIS_HOST, VELIS_PORT and VELIS_MAX_BUFFER."""
+        """Load listener settings from VELIS_* environment variables."""
         return cls(
             host=os.environ.get("VELIS_HOST", DEFAULT_HOST),
             port=_env_int("VELIS_PORT", DEFAULT_PORT),
@@ -75,16 +79,15 @@ class Server:
 
 @dataclass(frozen=True, slots=True)
 class Config:
-    """Validated logging, TCP server and expiry sweep settings."""
+    """Validated logging, TCP server, store and expiry sweep settings."""
 
     log_level: str = DEFAULT_LOG_LEVEL
     server: Server = field(default_factory=Server)
     sweep_interval_ms: int = DEFAULT_SWEEP_INTERVAL_MS
-    cache: StoreLimits = field(default_factory=StoreLimits)
+    store: StoreLimits = field(default_factory=StoreLimits)
 
     def __post_init__(self) -> None:
-        if self.sweep_interval_ms <= 0:
-            raise ValueError(f"invalid sweep interval: {self.sweep_interval_ms}")
+        require_positive("sweep_interval_ms", self.sweep_interval_ms)
         if self.log_level not in logging.getLevelNamesMapping():
             raise ValueError(f"invalid log level: {self.log_level!r}")
 
@@ -95,10 +98,10 @@ class Config:
             log_level=os.environ.get("VELIS_LOG_LEVEL", DEFAULT_LOG_LEVEL).upper(),
             server=Server.from_env(),
             sweep_interval_ms=_env_int("VELIS_SWEEP_MS", DEFAULT_SWEEP_INTERVAL_MS),
-            cache=StoreLimits(
+            store=StoreLimits(
                 max_keys=_env_int("VELIS_MAX_KEYS", DEFAULT_MAX_KEYS),
                 max_bytes=_env_int("VELIS_MAX_BYTES", DEFAULT_MAX_BYTES),
-                eviction_policy=os.environ.get(
+                eviction_policy=_env_policy(
                     "VELIS_EVICTION_POLICY", DEFAULT_EVICTION_POLICY
                 ),
             ),

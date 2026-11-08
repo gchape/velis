@@ -27,7 +27,7 @@ _WORD = [
 def show() -> None:
     """Print the startup banner if stderr is an interactive terminal.
 
-    NO_COLOR (https://no-color.org) strips the colors, not the banner.
+    A nonempty NO_COLOR environment variable disables the colors.
     """
     if not sys.stderr.isatty():
         return

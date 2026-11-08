@@ -1,7 +1,9 @@
 import asyncio
+import contextlib
 import random
 import struct
 import unittest
+from collections.abc import AsyncGenerator, Callable
 
 from velis.codec import Codec
 from velis.core.commands import (
@@ -27,7 +29,6 @@ from velis.core.commands import (
 )
 from velis.errors import ProtocolError
 from velis.net import protocol
-from velis.net.protocol import Request, Response
 
 
 def stream(data: bytes) -> asyncio.StreamReader:
@@ -50,7 +51,6 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
                     mutated = bytearray(body)
                     mutated[rng.randrange(len(mutated))] = rng.randrange(256)
                     cases.append(bytes(mutated))
-                # Preserve the outer tag/header while varying the remaining fields.
                 cases.extend(
                     body[:8] + rng.randbytes(rng.randrange(64)) for _ in range(50)
                 )
@@ -84,25 +84,13 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
             Delivered(42),
             Message("ch", b"hello"),
         )
-        check(protocol.CommandCodec(), commands)
-        check(protocol.FrameCodec(), frames)
-        check(
-            protocol.DEFAULT_PROTOCOL.commands,
-            tuple(Request(i, command) for i, command in enumerate(commands, 1)),
-        )
-        check(
-            protocol.DEFAULT_PROTOCOL.frames,
-            (
-                *(
-                    frame if isinstance(frame, Message) else Response(i, frame)
-                    for i, frame in enumerate(frames, 1)
-                ),
-                Response(0, Err("connection error")),
-            ),
-        )
+        check(protocol.COMMANDS, commands)
+        check(protocol.FRAMES, frames)
+        check(protocol.DEFAULT_PROTOCOL.commands, commands)
+        check(protocol.DEFAULT_PROTOCOL.frames, frames)
 
     def test_command_names_enforce_character_limits_in_both_directions(self) -> None:
-        codec = protocol.CommandCodec()
+        codec = protocol.COMMANDS
         for tag, make, limit, suffix in (
             ("GET", Get, 512, b""),
             ("DEL", Delete, 512, b""),
@@ -141,7 +129,7 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         for tag, what, limit in (("GET", "key", 512), ("SUBSCRIBE", "channel", 256)):
             byte_limit = limit * 4
             for name, error in (
-                (struct.pack(">I", byte_limit + 1), "truncated record"),
+                (struct.pack(">I", byte_limit + 1), "field too long"),
                 (protocol.BYTES.encode(b"\xff" * (byte_limit + 1)), "field too long"),
                 (protocol.BYTES.encode(b"\xff" * byte_limit), "invalid utf-8"),
                 (protocol.TEXT.encode("x" * (limit + 1)), f"{what} exceeds {limit}"),
@@ -151,23 +139,23 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
                     self.subTest(tag=tag, error=error),
                     self.assertRaisesRegex(ProtocolError, error),
                 ):
-                    protocol.CommandCodec().decode(protocol.TEXT.encode(tag) + name)
+                    protocol.COMMANDS.decode(protocol.TEXT.encode(tag) + name)
 
     def test_tags_reject_oversized_data_before_utf8_decoding(self) -> None:
-        for codec in (protocol.CommandCodec(), protocol.FrameCodec()):
+        for codec in (protocol.COMMANDS, protocol.FRAMES):
             for tag, error in (
                 (b"\xff" * 33, "field too long"),
                 (b"\xff" * 32, "invalid utf-8"),
                 (b"x" * 32, "unknown"),
             ):
                 with (
-                    self.subTest(codec=codec.name, tag=tag),
+                    self.subTest(codec=type(codec).__name__, tag=tag),
                     self.assertRaisesRegex(ProtocolError, error),
                 ):
                     codec.decode(protocol.BYTES.encode(tag))
 
     def test_reply_channels_keep_existing_text_rules(self) -> None:
-        codec = protocol.FrameCodec()
+        codec = protocol.FRAMES
         for channel in ("", "x" * 257):
             for frame in (
                 Message(channel, b"x"),
@@ -192,7 +180,7 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
                         codec.decode(malformed)
 
         check(
-            protocol.CommandCodec(),
+            protocol.COMMANDS,
             (
                 Get("k"),
                 Delete("k"),
@@ -206,7 +194,7 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
         check(
-            protocol.FrameCodec(),
+            protocol.FRAMES,
             (
                 Ok(),
                 TtlValue(1 << 62),
@@ -234,10 +222,12 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
             Publish("news", b"\x00\xff"),
         ):
             with self.subTest(command=command):
-                request = Request(42, command)
+                request = command
                 encoded = protocol.DEFAULT_PROTOCOL.commands.encode(request)
                 self.assertEqual(
-                    await protocol.DEFAULT_PROTOCOL.read_command(stream(encoded)),
+                    await anext(
+                        protocol.DEFAULT_PROTOCOL.read_commands(stream(encoded))
+                    ),
                     request,
                 )
 
@@ -247,16 +237,18 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         payload = b"x" * protocol.MAX_LEN
         for command in (Set(key, payload), Publish(channel, payload)):
             with self.subTest(command=type(command).__name__):
-                request = Request(protocol.MAX_REQUEST_ID, command)
+                request = command
                 encoded = protocol.DEFAULT_PROTOCOL.commands.encode(request)
                 self.assertEqual(
-                    await protocol.DEFAULT_PROTOCOL.read_command(stream(encoded)),
+                    await anext(
+                        protocol.DEFAULT_PROTOCOL.read_commands(stream(encoded))
+                    ),
                     request,
                 )
         message = Message(channel, payload)
         encoded = protocol.DEFAULT_PROTOCOL.frames.encode(message)
         self.assertEqual(
-            await protocol.DEFAULT_PROTOCOL.read_frame(stream(encoded)), message
+            await anext(protocol.DEFAULT_PROTOCOL.read_frames(stream(encoded))), message
         )
 
     async def test_reply_and_message_roundtrips(self) -> None:
@@ -272,17 +264,21 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
             Delivered((1 << 32) - 1),
         ):
             with self.subTest(reply=reply):
-                response = Response(42, reply)
+                response = reply
                 encoded = protocol.DEFAULT_PROTOCOL.frames.encode(response)
                 self.assertEqual(
-                    await protocol.DEFAULT_PROTOCOL.read_frame(stream(encoded)),
+                    await anext(protocol.DEFAULT_PROTOCOL.read_frames(stream(encoded))),
                     response,
                 )
         payload = b"x" * protocol.MAX_LEN
         self.assertEqual(
-            await protocol.DEFAULT_PROTOCOL.read_frame(
-                stream(
-                    protocol.DEFAULT_PROTOCOL.frames.encode(Message("news", payload))
+            await anext(
+                protocol.DEFAULT_PROTOCOL.read_frames(
+                    stream(
+                        protocol.DEFAULT_PROTOCOL.frames.encode(
+                            Message("news", payload)
+                        )
+                    )
                 )
             ),
             Message("news", payload),
@@ -291,10 +287,8 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
     async def test_encoders_reject_oversized_fields(self) -> None:
         big = b"x" * (protocol.MAX_LEN + 1)
         encoders = (
-            lambda: protocol.DEFAULT_PROTOCOL.commands.encode(
-                Request(1, Set("key", big))
-            ),
-            lambda: protocol.DEFAULT_PROTOCOL.frames.encode(Response(1, Value(big))),
+            lambda: protocol.DEFAULT_PROTOCOL.commands.encode(Set("key", big)),
+            lambda: protocol.DEFAULT_PROTOCOL.frames.encode(Value(big)),
             lambda: protocol.DEFAULT_PROTOCOL.frames.encode(Message("news", big)),
             lambda: protocol.DEFAULT_PROTOCOL.frames.encode(
                 Message("x" * (protocol.MAX_LEN + 1), b"")
@@ -307,16 +301,14 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
     async def test_encoders_reject_invalid_integer_ranges(self) -> None:
         for value in (-1, 1 << 64):
             with self.subTest(ttl=value), self.assertRaises(ProtocolError):
-                protocol.DEFAULT_PROTOCOL.commands.encode(
-                    Request(1, Expire("key", value))
-                )
+                protocol.DEFAULT_PROTOCOL.commands.encode(Expire("key", value))
         for value in (-1, 1 << 32):
             with self.subTest(delivered=value), self.assertRaises(ProtocolError):
-                protocol.DEFAULT_PROTOCOL.frames.encode(Response(1, Delivered(value)))
+                protocol.DEFAULT_PROTOCOL.frames.encode(Delivered(value))
 
     async def test_encoder_rejects_invalid_utf8(self) -> None:
         with self.assertRaisesRegex(ProtocolError, "invalid utf-8"):
-            protocol.DEFAULT_PROTOCOL.commands.encode(Request(1, Get("\ud800")))
+            protocol.DEFAULT_PROTOCOL.commands.encode(Get("\ud800"))
 
     async def test_decoder_rejects_invalid_fields(self) -> None:
         frames = (
@@ -326,137 +318,107 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         )
         for frame in frames:
             with self.subTest(frame=frame), self.assertRaises(ProtocolError):
-                await protocol.DEFAULT_PROTOCOL.read_command(
-                    stream(
-                        protocol.DEFAULT_PROTOCOL.framing.encode(
-                            struct.pack(">Q", 1) + frame
-                        )
+                await anext(
+                    protocol.DEFAULT_PROTOCOL.read_commands(
+                        stream(protocol.DEFAULT_PROTOCOL.framing.encode(frame))
                     )
                 )
 
     async def test_truncated_command_raises_incomplete_read(self) -> None:
-        encoded = protocol.DEFAULT_PROTOCOL.commands.encode(
-            Request(1, Set("key", b"value"))
-        )
+        encoded = protocol.DEFAULT_PROTOCOL.commands.encode(Set("key", b"value"))
         with self.assertRaises(asyncio.IncompleteReadError):
-            await protocol.DEFAULT_PROTOCOL.read_command(stream(encoded[:-1]))
+            await anext(protocol.DEFAULT_PROTOCOL.read_commands(stream(encoded[:-1])))
+
+    async def test_streaming_readers_handle_clean_and_partial_eof(self) -> None:
+        wire = protocol.DEFAULT_PROTOCOL
+
+        async def check[T](
+            read: Callable[[asyncio.StreamReader], AsyncGenerator[T]],
+            chain: Codec[T, bytes],
+            values: tuple[T, ...],
+        ) -> None:
+            with self.subTest(reader=read):
+                encoded = b"".join(chain.encode(value) for value in values)
+                self.assertEqual(
+                    [value async for value in read(stream(encoded))], list(values)
+                )
+                self.assertEqual([value async for value in read(stream(b""))], [])
+                for partial in (encoded[:1], encoded[:3], encoded[:-1]):
+                    with (
+                        self.subTest(partial=partial),
+                        self.assertRaises(asyncio.IncompleteReadError),
+                    ):
+                        [value async for value in read(stream(partial))]
+
+        await check(wire.read_commands, wire.commands, (Get("a"), Ttl("b")))
+        await check(wire.read_frames, wire.frames, (Ok(), Message("news", b"push")))
 
     async def test_fragmented_and_consecutive_messages(self) -> None:
-        first, second = Request(1, Set("key", b"value")), Request(2, Get("key"))
+        first, second = Set("key", b"value"), Get("key")
         encoded = protocol.DEFAULT_PROTOCOL.commands.encode(
             first
         ) + protocol.DEFAULT_PROTOCOL.commands.encode(second)
         reader = asyncio.StreamReader()
-        task = asyncio.create_task(protocol.DEFAULT_PROTOCOL.read_command(reader))
+        commands = protocol.DEFAULT_PROTOCOL.read_commands(reader)
+        await self.enterAsyncContext(contextlib.aclosing(commands))
+        task = asyncio.create_task(anext(commands))
         for byte in encoded:
             reader.feed_data(bytes([byte]))
             await asyncio.sleep(0)
         reader.feed_eof()
         self.assertEqual(await task, first)
-        self.assertEqual(await protocol.DEFAULT_PROTOCOL.read_command(reader), second)
+        self.assertEqual(await anext(commands), second)
+        with self.assertRaises(StopAsyncIteration):
+            await anext(commands)
 
     async def test_oversized_outer_length_rejected_before_reading_body(self) -> None:
         self.assertEqual(protocol.MAX_FRAME_LEN, 2 << 20)
         for read in (
-            protocol.DEFAULT_PROTOCOL.read_command,
-            protocol.DEFAULT_PROTOCOL.read_frame,
+            protocol.DEFAULT_PROTOCOL.read_commands,
+            protocol.DEFAULT_PROTOCOL.read_frames,
         ):
             reader = asyncio.StreamReader()
             reader.feed_data(struct.pack(">I", protocol.MAX_FRAME_LEN + 1))
-            # No EOF or body: rejecting the header must not wait for either.
             with (
                 self.subTest(read=read.__name__),
                 self.assertRaisesRegex(ProtocolError, "field too long"),
             ):
                 async with asyncio.timeout(1):
-                    await read(reader)
+                    await anext(read(reader))
 
     async def test_complete_frame_rejects_truncated_or_trailing_record(self) -> None:
-        body = struct.pack(">Q", 1) + protocol.CommandCodec().encode(
-            Set("key", b"value")
-        )
+        body = protocol.COMMANDS.encode(Set("key", b"value"))
         for malformed in (body[:-1], body + b"extra"):
             with self.subTest(body=malformed), self.assertRaises(ProtocolError):
-                await protocol.DEFAULT_PROTOCOL.read_command(
-                    stream(protocol.DEFAULT_PROTOCOL.framing.encode(malformed))
+                await anext(
+                    protocol.DEFAULT_PROTOCOL.read_commands(
+                        stream(protocol.DEFAULT_PROTOCOL.framing.encode(malformed))
+                    )
                 )
 
     def test_wire_bytes_are_explicitly_length_prefixed(self) -> None:
         self.assertEqual(
-            protocol.DEFAULT_PROTOCOL.commands.encode(Request(7, Get("k"))),
-            b"\x00\x00\x00\x14"
-            + struct.pack(">Q", 7)
-            + b"\x00\x00\x00\x03GET\x00\x00\x00\x01k",
+            protocol.DEFAULT_PROTOCOL.commands.encode(Get("k")),
+            b"\x00\x00\x00\x0c\x00\x00\x00\x03GET\x00\x00\x00\x01k",
         )
         self.assertEqual(
-            protocol.DEFAULT_PROTOCOL.frames.encode(Response(7, Ok())),
-            b"\x00\x00\x00\x0e" + struct.pack(">Q", 7) + b"\x00\x00\x00\x02OK",
+            protocol.DEFAULT_PROTOCOL.frames.encode(Ok()),
+            b"\x00\x00\x00\x06\x00\x00\x00\x02OK",
         )
-
-    def test_request_id_bounds_and_reserved_zero(self) -> None:
-        wire = protocol.DEFAULT_PROTOCOL
-        for request_id in (1, protocol.MAX_REQUEST_ID):
-            request = Request(request_id, Get("key"))
-            response = Response(request_id, Value(b"value"))
-            self.assertEqual(
-                wire.commands.decode(wire.commands.encode(request)), request
-            )
-            self.assertEqual(wire.frames.decode(wire.frames.encode(response)), response)
-        for request_id in (-1, 0, protocol.MAX_REQUEST_ID + 1):
-            with self.subTest(request_id=request_id), self.assertRaises(ProtocolError):
-                wire.commands.encode(Request(request_id, Get("key")))
-        for request_id in (-1, protocol.MAX_REQUEST_ID + 1):
-            with self.subTest(request_id=request_id), self.assertRaises(ProtocolError):
-                wire.frames.encode(Response(request_id, Ok()))
-        error = Response(0, Err("connection limit exceeded"))
-        self.assertEqual(wire.frames.decode(wire.frames.encode(error)), error)
-        with self.assertRaisesRegex(ProtocolError, "nonzero"):
-            wire.commands.decode(
-                wire.framing.encode(
-                    struct.pack(">Q", 0) + protocol.CommandCodec().encode(Get("key"))
-                )
-            )
-        with self.assertRaisesRegex(ProtocolError, "only connection errors"):
-            wire.frames.encode(Response(0, Ok()))
-        with self.assertRaisesRegex(ProtocolError, "only connection errors"):
-            wire.frames.decode(
-                wire.framing.encode(
-                    struct.pack(">Q", 0) + protocol.FrameCodec().encode(Ok())
-                )
-            )
-        with self.assertRaisesRegex(ProtocolError, "pushes must use request ID zero"):
-            wire.frames.decode(
-                wire.framing.encode(
-                    struct.pack(">Q", 1)
-                    + protocol.FrameCodec().encode(Message("ch", b"x"))
-                )
-            )
-
-    async def test_truncated_id_is_a_protocol_error_in_a_complete_frame(self) -> None:
-        wire = protocol.DEFAULT_PROTOCOL
-        for length in range(8):
-            for read in (wire.read_command, wire.read_frame):
-                with (
-                    self.subTest(length=length, read=read.__name__),
-                    self.assertRaises(ProtocolError),
-                ):
-                    await read(stream(wire.framing.encode(b"\x00" * length)))
 
     def test_sync_body_codecs_roundtrip_and_reject_wrong_message_direction(
         self,
     ) -> None:
         command = Set("key", b"value")
         self.assertEqual(
-            protocol.CommandCodec().decode(protocol.CommandCodec().encode(command)),
+            protocol.COMMANDS.decode(protocol.COMMANDS.encode(command)),
             command,
         )
         self.assertEqual(
-            protocol.FrameCodec().decode(
-                protocol.FrameCodec().encode(Message("ch", b"v"))
-            ),
+            protocol.FRAMES.decode(protocol.FRAMES.encode(Message("ch", b"v"))),
             Message("ch", b"v"),
         )
         with self.assertRaisesRegex(ProtocolError, "unknown command"):
-            protocol.CommandCodec().decode(protocol.FrameCodec().encode(Ok()))
+            protocol.COMMANDS.decode(protocol.FRAMES.encode(Ok()))
         with self.assertRaisesRegex(ProtocolError, "unknown frame"):
-            protocol.FrameCodec().decode(protocol.CommandCodec().encode(Get("key")))
+            protocol.FRAMES.decode(protocol.COMMANDS.encode(Get("key")))

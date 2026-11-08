@@ -6,9 +6,10 @@ when there is no remaining-milliseconds value.
 """
 
 from dataclasses import dataclass
+from typing import Final
 
-MISSING = -2
-NO_EXPIRY = -1
+MISSING: Final = -2
+NO_EXPIRY: Final = -1
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,6 +151,11 @@ type Reply = (
     | TtlValue
     | Persistent
 )
+
+# Shared instances of the payload-free replies (safe: the classes are frozen).
+OK: Final = Ok()
+NIL: Final = Nil()
+PERSISTENT: Final = Persistent()
 
 
 @dataclass(frozen=True, slots=True)

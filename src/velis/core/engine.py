@@ -3,7 +3,10 @@ from typing import assert_never
 from velis.core.broker import Broker, Subscriber
 from velis.core.commands import (
     MISSING,
+    NIL,
     NO_EXPIRY,
+    OK,
+    PERSISTENT,
     Command,
     Delete,
     Delivered,
@@ -28,7 +31,14 @@ from velis.core.store import Store
 
 
 def _ok_or_nil(found: bool) -> Ok | Nil:
-    return Ok() if found else Nil()
+    return OK if found else NIL
+
+
+def _ttl_reply(ms: int) -> Nil | Persistent | TtlValue:
+    """Map Store.ttl() results to replies: MISSING, NO_EXPIRY or remaining ms."""
+    if ms == MISSING:
+        return NIL
+    return PERSISTENT if ms == NO_EXPIRY else TtlValue(ms)
 
 
 class Engine:
@@ -48,10 +58,10 @@ class Engine:
         match command:
             case Get(key):
                 value = self._store.get(key)
-                return Nil() if value is None else Value(value)
+                return NIL if value is None else Value(value)
             case Set(key, value):
                 self._store.set(key, value)
-                return Ok()
+                return OK
             case Expire(key, ms):
                 return _ok_or_nil(self._store.expire(key, ms))
             case Delete(key):
@@ -59,10 +69,7 @@ class Engine:
             case Persist(key):
                 return _ok_or_nil(self._store.persist(key))
             case Ttl(key):
-                ms = self._store.ttl(key)
-                if ms == MISSING:
-                    return Nil()
-                return Persistent() if ms == NO_EXPIRY else TtlValue(ms)
+                return _ttl_reply(self._store.ttl(key))
             case Subscribe(channel):
                 self._broker.subscribe(channel, subscriber)
                 return Subscribed(channel)

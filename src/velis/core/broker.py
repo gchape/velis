@@ -1,4 +1,3 @@
-from collections import defaultdict
 from typing import Protocol
 
 from velis.errors import CapacityError
@@ -8,7 +7,10 @@ DEFAULT_MAX_SUBSCRIPTIONS = 1024
 
 
 class Subscriber(Protocol):
-    """Delivery interface implemented by subscriber connections."""
+    """Delivery interface implemented by subscriber connections.
+
+    Instances are used as set members and dict keys, so they must be hashable.
+    """
 
     def send(self, channel: str, payload: bytes) -> bool:
         """Accept a message promptly without waiting for delivery or processing.
@@ -21,13 +23,17 @@ class Subscriber(Protocol):
 
 
 class Broker:
-    """Track channel membership and deliver messages to live subscribers."""
+    """Track channel membership and deliver messages to live subscribers.
+
+    Two indexes mirror each other and never keep empty entries: channel to
+    subscribers for publishing, and subscriber to channels for limits and cleanup.
+    """
 
     def __init__(self, *, max_subscriptions: int = DEFAULT_MAX_SUBSCRIPTIONS) -> None:
         require_positive("max_subscriptions", max_subscriptions)
         self._max_subscriptions = max_subscriptions
-        self._subscribers: dict[str, set[Subscriber]] = defaultdict(set)
-        self._subscriptions: dict[Subscriber, set[str]] = defaultdict(set)
+        self._subscribers: dict[str, set[Subscriber]] = {}
+        self._subscriptions: dict[Subscriber, set[str]] = {}
 
     def subscribers(self, channel: str) -> int:
         """Return the number of subscribers currently listening to a channel."""
@@ -41,16 +47,20 @@ class Broker:
                 return
             if len(channels) >= self._max_subscriptions:
                 raise CapacityError("subscription limit exceeded")
-        self._subscriptions[subscriber].add(channel)
-        self._subscribers[channel].add(subscriber)
+        self._subscriptions.setdefault(subscriber, set()).add(channel)
+        self._subscribers.setdefault(channel, set()).add(subscriber)
+
+    def _drop_member(self, channel: str, subscriber: Subscriber) -> None:
+        """Remove a subscriber from a channel's index, pruning it when empty."""
+        members = self._subscribers.get(channel)
+        if members is not None:
+            members.discard(subscriber)
+            if not members:
+                del self._subscribers[channel]
 
     def unsubscribe(self, channel: str, subscriber: Subscriber) -> None:
         """Leave a channel, removing empty membership entries."""
-        subscribers = self._subscribers.get(channel)
-        if subscribers is not None:
-            subscribers.discard(subscriber)
-            if not subscribers:
-                del self._subscribers[channel]
+        self._drop_member(channel, subscriber)
         channels = self._subscriptions.get(subscriber)
         if channels is not None:
             channels.discard(channel)
@@ -59,8 +69,8 @@ class Broker:
 
     def unsubscribe_all(self, subscriber: Subscriber) -> None:
         """Leave every channel; safe to call after earlier cleanup."""
-        for channel in list(self._subscriptions.get(subscriber, ())):
-            self.unsubscribe(channel, subscriber)
+        for channel in self._subscriptions.pop(subscriber, ()):
+            self._drop_member(channel, subscriber)
 
     def publish(self, channel: str, payload: bytes) -> int:
         """Return the number of subscribers that accepted the message.

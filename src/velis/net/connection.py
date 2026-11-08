@@ -1,3 +1,5 @@
+"""Server-side connection: wire I/O plus push buffering for one subscriber."""
+
 import asyncio
 import contextlib
 import logging
@@ -55,16 +57,17 @@ class Connection:
         """Validate and encode the complete reply before writing any bytes."""
         self._writer.write(self._wire.frames.encode(reply))
 
+    def _encode(self, channel: str, payload: bytes) -> bytes:
+        return self._wire.frames.encode(Message(channel, payload))
+
     def _encode_push(self, channel: str, payload: bytes) -> bytes:
         """Encode once per wire protocol within the current dispatch scope."""
         encodings = _push_encodings.get()
         if encodings is None:
-            return self._wire.frames.encode(Message(channel, payload))
+            return self._encode(channel, payload)
         key = (id(self._wire), channel, payload)
-        data = encodings.get(key)
-        if data is None:
-            data = self._wire.frames.encode(Message(channel, payload))
-            encodings[key] = data
+        if (data := encodings.get(key)) is None:
+            data = encodings[key] = self._encode(channel, payload)
         return data
 
     def send(self, channel: str, payload: bytes) -> bool:
@@ -72,23 +75,26 @@ class Connection:
 
         Abort slow connections immediately instead of waiting to flush them.
         """
-        if self._writer.is_closing():
+        transport = self._writer.transport
+        if transport.is_closing():
             return False
         try:
             data = self._encode_push(channel, payload)
-        except ProtocolError:
-            log.warning("dropping subscriber: cannot encode push")
-            self._writer.transport.abort()
-            return False
-        try:
+        except ProtocolError as exc:
+            log.warning(
+                "dropping subscriber: cannot encode push on %r: %s", channel, exc
+            )
+        else:
             self._writer.write(data)
-        except ConnectionError:
-            self._writer.transport.abort()
-            return False
-        if self._writer.transport.get_write_buffer_size() > self._max_buffer:
-            self._writer.transport.abort()
-            return False
-        return True
+            # write() never raises for a lost connection: a failed send
+            # force-closes the transport, so check afterwards.
+            if (
+                not transport.is_closing()
+                and transport.get_write_buffer_size() <= self._max_buffer
+            ):
+                return True
+        transport.abort()
+        return False
 
     async def drain(self) -> None:
         """Wait for the transport to allow further writes."""

@@ -1,5 +1,5 @@
 from types import TracebackType
-from typing import final
+from typing import Self, final
 
 from velis.codec import Codec, Identity
 from velis.core.commands import (
@@ -31,6 +31,8 @@ from velis.errors import CommandError, ProtocolError
 from velis.net.protocol import DEFAULT_PROTOCOL, WireProtocol
 from velis.net.session import DEFAULT_LIMITS, Session, SessionLimits, TcpSession
 
+DEFAULT_CODEC: Codec[bytes, bytes] = Identity()
+
 
 def _unexpected(command: Command, reply: Reply) -> ProtocolError:
     return ProtocolError(
@@ -43,26 +45,26 @@ class Client:
     """Typed cache and pub-sub API over an owned session and a byte codec."""
 
     def __init__(
-        self, session: Session, codec: Codec[bytes, bytes] | None = None
+        self, session: Session, codec: Codec[bytes, bytes] = DEFAULT_CODEC
     ) -> None:
         self._session = session
-        self._codec: Codec[bytes, bytes] = Identity() if codec is None else codec
+        self._codec = codec
 
     @classmethod
     async def connect(
         cls,
         host: str,
         port: int,
-        codec: Codec[bytes, bytes] | None = None,
+        codec: Codec[bytes, bytes] = DEFAULT_CODEC,
         *,
         wire: WireProtocol = DEFAULT_PROTOCOL,
         limits: SessionLimits = DEFAULT_LIMITS,
-    ) -> Client:
+    ) -> Self:
         """Create a TCP client with bounded requests and unread messages."""
         session = await TcpSession.connect(host, port, wire=wire, limits=limits)
         return cls(session, codec)
 
-    async def __aenter__(self) -> Client:
+    async def __aenter__(self) -> Self:
         """Use this client within an owned asynchronous resource scope."""
         return self
 

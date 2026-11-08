@@ -4,12 +4,14 @@ import asyncio
 import contextlib
 from collections import deque
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, Self
 
 from velis.core.commands import Command, Err, Message, Reply
 from velis.errors import ProtocolError
 from velis.net.protocol import DEFAULT_PROTOCOL, WireProtocol
 from velis.validation import require_positive
+
+_CLOSED = "connection closed"
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,11 +76,12 @@ class TcpSession:
         self._pending: deque[asyncio.Future[Reply]] = deque()
         self._max_pending_bytes = limits.max_pending_bytes
         self._queued_bytes = 0
-        self._messages: asyncio.Queue[Message] = asyncio.Queue(
+        # Each entry carries its byte size, measured once on arrival.
+        self._messages: asyncio.Queue[tuple[int, Message]] = asyncio.Queue(
             maxsize=limits.max_pending_messages
         )
         self._closed = False
-        self._close_reason = "connection closed"
+        self._close_reason = _CLOSED
         self._reader_task = asyncio.create_task(self._receive_frames())
 
     @classmethod
@@ -89,16 +92,10 @@ class TcpSession:
         *,
         wire: WireProtocol = DEFAULT_PROTOCOL,
         limits: SessionLimits = DEFAULT_LIMITS,
-    ) -> TcpSession:
+    ) -> Self:
         """Open a TCP connection and start reading replies and server pushes."""
         reader, writer = await asyncio.open_connection(host, port)
-        try:
-            return cls(reader, writer, wire=wire, limits=limits)
-        except Exception:
-            writer.close()
-            with contextlib.suppress(ConnectionError):
-                await writer.wait_closed()
-            raise
+        return cls(reader, writer, wire=wire, limits=limits)
 
     async def _receive_frames(self) -> None:
         """Split the incoming stream into replies and server pushes."""
@@ -115,18 +112,18 @@ class TcpSession:
                         break
         except ProtocolError as exc:
             self._begin_close(str(exc))
-        except asyncio.IncompleteReadError, ConnectionError:
-            pass
+        except asyncio.IncompleteReadError, OSError:
+            pass  # EOF or any transport failure; ConnectionError is an OSError
         finally:
             self._begin_close()
 
     def _enqueue_message(self, message: Message) -> None:
         """Buffer a publication within the message count and byte limits."""
-        size = self._message_size(message)
+        size = len(message.channel.encode()) + len(message.payload)
         if self._messages.full() or self._queued_bytes + size > self._max_pending_bytes:
             self._begin_close("pending message buffer limit exceeded")
             return
-        self._messages.put_nowait(message)
+        self._messages.put_nowait((size, message))
         self._queued_bytes += size
 
     def _resolve_reply(self, reply: Reply) -> None:
@@ -144,12 +141,7 @@ class TcpSession:
         if not waiter.done():
             waiter.set_result(reply)
 
-    @staticmethod
-    def _message_size(message: Message) -> int:
-        """Count queued channel and payload bytes before codec decoding."""
-        return len(message.channel.encode()) + len(message.payload)
-
-    def _begin_close(self, reason: str = "connection closed") -> None:
+    def _begin_close(self, reason: str = _CLOSED) -> None:
         """Close and wake callers, preserving queued messages for draining.
 
         Mark failed futures as retrieved so abandoned callers leave no warnings.
@@ -159,13 +151,27 @@ class TcpSession:
         self._closed = True
         self._close_reason = reason
         self._writer.close()
-        for waiter in self._pending:
+        while self._pending:
+            waiter = self._pending.popleft()
             self._slots.release()
             if not waiter.done():
                 waiter.set_exception(ConnectionError(reason))
                 waiter.exception()
-        self._pending.clear()
         self._messages.shutdown()
+
+    def _submit(self, command: Command) -> asyncio.Future[Reply]:
+        """Encode, write and queue one command without yielding to the loop.
+
+        Staying synchronous keeps FIFO order equal to wire order. Once queued,
+        the caller's slot belongs to the future: a reply or closure releases it.
+        """
+        if self._closed:
+            raise ConnectionError(self._close_reason)
+        encoded = self._wire.commands.encode(command)
+        waiter = asyncio.get_running_loop().create_future()
+        self._writer.write(encoded)
+        self._pending.append(waiter)
+        return waiter
 
     async def request(self, command: Command) -> Reply:
         """Send a command and await the reply that answers it.
@@ -173,31 +179,26 @@ class TcpSession:
         Cancellation abandons the reply without closing the stream. A sent
         request keeps its slot until its reply arrives, which bounds the
         bookkeeping for cancelled requests even if the peer stops responding.
-        Capacity is acquired before wire encoding. Queueing the future and writing
-        are synchronous so FIFO order matches wire order. Cancellation during drain
-        also retains the future's position while discarding its eventual result.
+        Capacity is acquired before wire encoding, and a failed submit returns
+        it. Cancellation during drain also retains the future's position while
+        discarding its eventual result.
         """
         if self._closed:
             raise ConnectionError(self._close_reason)
         await self._slots.acquire()
-        waiter: asyncio.Future[Reply] | None = None
         try:
-            if self._closed:
-                raise ConnectionError(self._close_reason)
-            encoded = self._wire.commands.encode(command)
-            waiter = asyncio.get_running_loop().create_future()
-            self._pending.append(waiter)
-            self._writer.write(encoded)
-            del encoded
+            waiter = self._submit(command)
+        except BaseException:
+            self._slots.release()
+            raise
+        try:
             await self._writer.drain()
             return await waiter
         except ConnectionError:
             await self.close()
             raise
         finally:
-            if waiter is None:
-                self._slots.release()
-            elif not waiter.done():
+            if not waiter.done():
                 waiter.cancel()
 
     async def next_message(self) -> Message:
@@ -208,17 +209,22 @@ class TcpSession:
         have been drained and the connection is closed.
         """
         try:
-            message = await self._messages.get()
-        except asyncio.QueueShutDown:
-            raise ConnectionError(self._close_reason) from None
-        self._queued_bytes -= self._message_size(message)
+            size, message = await self._messages.get()
+        except asyncio.QueueShutDown as exc:
+            raise ConnectionError(self._close_reason) from exc
+        self._queued_bytes -= size
         return message
 
     async def close(self) -> None:
-        """Close the stream, wake waiting callers and stop the reader task."""
+        """Close the stream, wake waiting callers and stop the reader task.
+
+        Safe to repeat. Cancelling the caller still propagates, and an
+        unexpected reader failure is raised after cleanup completes.
+        """
         self._begin_close()
         self._reader_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await self._reader_task
+        await asyncio.wait((self._reader_task,))
         with contextlib.suppress(ConnectionError):
             await self._writer.wait_closed()
+        if not self._reader_task.cancelled():
+            self._reader_task.result()

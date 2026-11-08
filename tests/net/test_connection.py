@@ -4,10 +4,9 @@ from unittest.mock import Mock
 
 from tests.codec.helpers import Reverse
 from tests.helpers import RecordingSubscriber
-from velis.codec import CodecChain
+from velis.codec import CodecChain, Deflate
 from velis.core.broker import Broker
 from velis.core.commands import Message
-from velis.errors import ProtocolError
 from velis.net import protocol
 from velis.net.connection import Connection, share_message_encodings
 
@@ -81,8 +80,26 @@ class ConnectionDeliveryTests(unittest.TestCase):
         self.assertFalse(self.connection.send("news", b"hello"))
         self.writer.transport.abort.assert_called_once()
 
-    def test_encoding_errors_are_not_treated_as_disconnections(self) -> None:
-        with self.assertRaises(ProtocolError):
-            self.connection.send("news", b"x" * (protocol.MAX_LEN + 1))
+    def test_encoding_failure_drops_only_subscriber_and_preserves_fanout(self) -> None:
+        wire = protocol.WireProtocol(
+            frame_codec=CodecChain.of(protocol.FrameCodec()) | Deflate(max_length=64)
+        )
+        failing = Connection(Mock(), self.writer, 16, wire=wire)
+        broker, healthy = Broker(), RecordingSubscriber()
+        for channel in ("news", "other"):
+            broker.subscribe(channel, failing)
+            broker.subscribe(channel, healthy)
+        for cached in (False, True):
+            with self.subTest(cached=cached):
+                broker.subscribe("news", failing)
+                if cached:
+                    with share_message_encodings():
+                        accepted = broker.publish("news", b"x" * 128)
+                else:
+                    accepted = broker.publish("news", b"x" * 128)
+                self.assertEqual(accepted, 1)
+                self.assertEqual(broker.subscribers("news"), 1)
+                self.assertEqual(broker.subscribers("other"), 1)
+        self.assertEqual(healthy.messages, [("news", b"x" * 128)] * 2)
         self.writer.write.assert_not_called()
-        self.writer.transport.abort.assert_not_called()
+        self.assertEqual(self.writer.transport.abort.call_count, 2)

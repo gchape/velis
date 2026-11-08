@@ -62,12 +62,7 @@ class TcpServer:
             reader, writer, self._config.max_buffer, wire=self._wire
         )
         if self._connection_count >= self._config.max_connections:
-            try:
-                with contextlib.suppress(ProtocolError, ConnectionError):
-                    connection.write_reply(Err("connection limit exceeded"))
-            finally:
-                connection.close()
-                await connection.wait_closed()
+            await self._reject(connection)
             return
         self._connection_count += 1
         log.info("connected: %s", peer)
@@ -89,6 +84,15 @@ class TcpServer:
             connection.close()
             await connection.wait_closed()
             log.info("disconnected: %s", peer)
+
+    async def _reject(self, connection: Connection) -> None:
+        """Best-effort admission error followed by connection cleanup."""
+        try:
+            with contextlib.suppress(ProtocolError, ConnectionError):
+                connection.write_reply(Err("connection limit exceeded"))
+        finally:
+            connection.close()
+            await connection.wait_closed()
 
     async def _serve_commands(self, connection: Connection) -> None:
         """Read commands and reply until the connection ends or misbehaves."""

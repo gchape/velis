@@ -1,10 +1,14 @@
 import asyncio
 import contextlib
+import logging
 from collections.abc import Generator
 from contextvars import ContextVar
 
 from velis.core.commands import Command, Message, Reply
+from velis.errors import ProtocolError
 from velis.net.protocol import DEFAULT_PROTOCOL, WireProtocol
+
+log = logging.getLogger(__name__)
 
 _push_encodings: ContextVar[dict[tuple[int, str, bytes], bytes] | None] = ContextVar(
     "push_encodings", default=None
@@ -50,6 +54,18 @@ class Connection:
         """Validate and encode the complete reply before writing any bytes."""
         self._writer.write(self._wire.frames.encode(reply))
 
+    def _encode_push(self, channel: str, payload: bytes) -> bytes:
+        """Encode once per wire protocol within the current dispatch scope."""
+        encodings = _push_encodings.get()
+        if encodings is None:
+            return self._wire.frames.encode(Message(channel, payload))
+        key = (id(self._wire), channel, payload)
+        data = encodings.get(key)
+        if data is None:
+            data = self._wire.frames.encode(Message(channel, payload))
+            encodings[key] = data
+        return data
+
     def send(self, channel: str, payload: bytes) -> bool:
         """Queue a push; reject disconnected, failed or overloaded transports.
 
@@ -57,15 +73,12 @@ class Connection:
         """
         if self._writer.is_closing():
             return False
-        encodings = _push_encodings.get()
-        if encodings is None:
-            data = self._wire.frames.encode(Message(channel, payload))
-        else:
-            key = (id(self._wire), channel, payload)
-            data = encodings.get(key)
-            if data is None:
-                data = self._wire.frames.encode(Message(channel, payload))
-                encodings[key] = data
+        try:
+            data = self._encode_push(channel, payload)
+        except ProtocolError:
+            log.warning("dropping subscriber: cannot encode push")
+            self._writer.transport.abort()
+            return False
         try:
             self._writer.write(data)
         except ConnectionError:

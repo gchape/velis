@@ -2,8 +2,8 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock, Mock
 
-from velis.core.commands import Message, Ok, Subscribed, Unsubscribed, Value
-from velis.errors import ProtocolError
+from velis.core.commands import Err, Message, Ok, Subscribed, Unsubscribed, Value
+from velis.errors import CommandError, ProtocolError
 from velis.net import protocol
 from velis.net.client import Client
 from velis.net.session import TcpSession
@@ -219,6 +219,53 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(ConnectionError, "without a pending request"):
                 await self.client.next_message()
         self.writer.close.assert_called_once()
+
+    async def test_unsolicited_error_preserves_server_rejection_reason(self) -> None:
+        self.reader.feed_data(
+            protocol.DEFAULT_PROTOCOL.frames.encode(Err("connection limit exceeded"))
+        )
+        self.reader.feed_eof()
+        async with asyncio.timeout(1):
+            with self.assertRaisesRegex(ConnectionError, "connection limit exceeded"):
+                await self.client.next_message()
+            with self.assertRaisesRegex(ConnectionError, "connection limit exceeded"):
+                await self.client.get("key")
+        self.writer.close.assert_called_once()
+
+    async def test_command_error_reply_keeps_connection_usable(self) -> None:
+        request = asyncio.create_task(self.client.get("key"))
+        await asyncio.sleep(0)
+        self.reader.feed_data(
+            protocol.DEFAULT_PROTOCOL.frames.encode(Err("bad command"))
+        )
+        async with asyncio.timeout(1):
+            with self.assertRaisesRegex(CommandError, "bad command"):
+                await request
+            request = asyncio.create_task(self.client.get("key"))
+            await asyncio.sleep(0)
+            self.reader.feed_data(protocol.DEFAULT_PROTOCOL.frames.encode(Value(b"ok")))
+            self.assertEqual(await request, b"ok")
+
+    async def test_duplicate_reply_closes_connection(self) -> None:
+        request = asyncio.create_task(self.client.get("key"))
+        await asyncio.sleep(0)
+        self.reader.feed_data(protocol.DEFAULT_PROTOCOL.frames.encode(Value(b"ok")) * 2)
+        async with asyncio.timeout(1):
+            self.assertEqual(await request, b"ok")
+            with self.assertRaisesRegex(ConnectionError, "without a pending request"):
+                await self.client.next_message()
+
+    async def test_reply_received_during_drain_survives_eof(self) -> None:
+        async def drain() -> None:
+            self.reader.feed_data(protocol.DEFAULT_PROTOCOL.frames.encode(Value(b"ok")))
+            self.reader.feed_eof()
+            await asyncio.sleep(0)
+
+        self.writer.drain.side_effect = drain
+        async with asyncio.timeout(1):
+            self.assertEqual(await self.client.get("key"), b"ok")
+            with self.assertRaises(ConnectionError):
+                await self.client.get("another")
 
     async def test_drain_failure_closes_connection(self) -> None:
         self.writer.drain.side_effect = ConnectionError("write failed")

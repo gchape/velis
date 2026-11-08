@@ -60,6 +60,47 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         writer.transport.abort.assert_called_once()
         writer.drain.assert_not_awaited()
 
+    async def test_subscriber_wire_failure_keeps_publisher_and_healthy_peer_usable(
+        self,
+    ) -> None:
+        wire = protocol.WireProtocol(
+            frame_codec=CodecChain.of(protocol.FrameCodec()) | Deflate(max_length=64)
+        )
+        server = TcpServer(self.engine, ServerConfig("127.0.0.1", 0), wire=wire)
+        await server.start()
+        self.addAsyncCleanup(server.close)
+        limited = await Client.connect("127.0.0.1", server.port, wire=wire)
+        self.addAsyncCleanup(limited.close)
+        healthy, publisher = await self.client(), await self.client()
+        await limited.subscribe("news")
+        await healthy.subscribe("news")
+        payload = b"x" * 128
+        async with asyncio.timeout(1):
+            self.assertEqual(await publisher.publish("news", payload), 1)
+            self.assertEqual(await healthy.next_message(), Message("news", payload))
+            with self.assertRaises(ConnectionError):
+                await limited.next_message()
+            await publisher.set("key", b"usable")
+            self.assertEqual(await publisher.get("key"), b"usable")
+            self.assertEqual(await publisher.publish("news", b"again"), 1)
+            self.assertEqual(await healthy.next_message(), Message("news", b"again"))
+
+    async def test_connection_limit_reason_reaches_idle_client(self) -> None:
+        server = TcpServer(self.engine, ServerConfig("127.0.0.1", 0, max_connections=1))
+        await server.start()
+        self.addAsyncCleanup(server.close)
+        first = await Client.connect("127.0.0.1", server.port)
+        self.addAsyncCleanup(first.close)
+        await first.set("key", b"value")
+        rejected = await Client.connect("127.0.0.1", server.port)
+        self.addAsyncCleanup(rejected.close)
+        async with asyncio.timeout(1):
+            with self.assertRaisesRegex(ConnectionError, "connection limit exceeded"):
+                await rejected.next_message()
+            with self.assertRaisesRegex(ConnectionError, "connection limit exceeded"):
+                await rejected.get("key")
+            self.assertEqual(await first.get("key"), b"value")
+
     async def test_connection_limit_rejects_excess_and_reuses_closed_slot(self) -> None:
         server = TcpServer(self.engine, ServerConfig("127.0.0.1", 0, max_connections=1))
         await server.start()

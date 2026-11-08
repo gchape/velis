@@ -4,7 +4,7 @@ import asyncio
 import contextlib
 from typing import Protocol
 
-from velis.core.commands import Command, Message, Reply
+from velis.core.commands import Command, Err, Message, Reply
 from velis.errors import ProtocolError
 from velis.net.protocol import DEFAULT_PROTOCOL, WireProtocol
 
@@ -34,6 +34,7 @@ class TcpSession:
 
     Limit both message count and channel/payload bytes. Closing wakes waiting
     readers and lets already queued messages drain before reporting closure.
+    Construction starts the reader task and requires a running event loop.
     """
 
     def __init__(
@@ -51,7 +52,8 @@ class TcpSession:
         self._reader = reader
         self._writer = writer
         self._request_lock = asyncio.Lock()
-        self._pending_reply: asyncio.Future[Reply] | None = None
+        self._replies: asyncio.Queue[Reply] = asyncio.Queue(maxsize=1)
+        self._awaiting_reply = False
         self._max_pending_bytes = max_pending_bytes
         self._queued_bytes = 0
         self._messages: asyncio.Queue[Message] = asyncio.Queue(
@@ -114,9 +116,12 @@ class TcpSession:
 
     def _resolve_reply(self, reply: Reply) -> None:
         """Complete the active request, rejecting unsolicited or duplicate replies."""
-        if self._pending_reply is None or self._pending_reply.done():
+        if not self._awaiting_reply or not self._replies.empty():
+            if not self._awaiting_reply and isinstance(reply, Err):
+                self._begin_close(reply.message)
+                return
             raise ProtocolError("reply received without a pending request")
-        self._pending_reply.set_result(reply)
+        self._replies.put_nowait(reply)
 
     @staticmethod
     def _message_size(message: Message) -> int:
@@ -130,8 +135,7 @@ class TcpSession:
         self._closed = True
         self._close_reason = reason
         self._writer.close()
-        if self._pending_reply is not None and not self._pending_reply.done():
-            self._pending_reply.set_exception(ConnectionError(reason))
+        self._replies.shutdown()
         self._messages.shutdown()
 
     async def request(self, command: Command) -> Reply:
@@ -144,24 +148,19 @@ class TcpSession:
             if self._closed:
                 raise ConnectionError(self._close_reason)
             encoded_command = self._wire.commands.encode(command)
-            reply_future: asyncio.Future[Reply] = (
-                asyncio.get_running_loop().create_future()
-            )
-            self._pending_reply = reply_future
+            self._awaiting_reply = True
             try:
                 self._writer.write(encoded_command)
                 await self._writer.drain()
-                reply = await reply_future
+                try:
+                    return await self._replies.get()
+                except asyncio.QueueShutDown:
+                    raise ConnectionError(self._close_reason) from None
             except asyncio.CancelledError, ConnectionError:
                 await self.close()
                 raise
             finally:
-                self._pending_reply = None
-                if not reply_future.done():
-                    reply_future.cancel()
-                elif not reply_future.cancelled():
-                    reply_future.exception()
-        return reply
+                self._awaiting_reply = False
 
     async def next_message(self) -> Message:
         """Wait for the next encoded message.

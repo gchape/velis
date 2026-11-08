@@ -29,7 +29,11 @@ async def _maintain(engine: Engine, interval: float) -> None:
     """Sweep expired keys periodically, with interval measured in seconds."""
     while True:
         await asyncio.sleep(interval)
-        engine.sweep()
+        while True:
+            engine.sweep()
+            if not engine.has_due_expirations:
+                break
+            await asyncio.sleep(0)
 
 
 @asynccontextmanager

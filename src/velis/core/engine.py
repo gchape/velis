@@ -65,3 +65,8 @@ class Engine:
     def sweep(self) -> int:
         """Run the store expiry sweep and return the number of keys removed."""
         return self._store.sweep()
+
+    @property
+    def has_due_expirations(self) -> bool:
+        """Whether maintenance should continue with another bounded sweep."""
+        return self._store.has_due_expirations

@@ -269,7 +269,7 @@ async def embedded() -> None:
 
 Maintenance runs in a task group owned by `serve()`. An unexpected sweep failure interrupts the active runtime scope and closes the server. Worker and caller failures are reported in an `ExceptionGroup` after cleanup; external cancellation remains `CancelledError`. Normal shutdown cancels and awaits maintenance before closing the server. Client disconnections remain local to their connections.
 
-One task sweeps expired keys every `VELIS_SWEEP_MS`. Each sweep processes at most 1,000 heap entries to limit work on the event loop; stale entries left by overwritten values or TTLs count toward that limit. Reads and `EXPIRE` also remove expired keys as needed. Mutations and sweeps rebuild the heap when it exceeds both 1,024 entries and twice the number of active TTLs. Rebuilding uses current deadlines and takes time proportional to the number of active TTLs on the event loop.
+One task starts sweeping expired keys every `VELIS_SWEEP_MS`. Each round processes at most 1,000 heap entries; stale entries left by overwritten values or TTLs count toward that limit. While due entries remain, maintenance yields to the event loop and runs another round without waiting for the next interval. It checks the heap rather than the number of keys removed, so a round containing only stale entries does not stop cleanup early. Reads and `EXPIRE` also remove expired keys as needed. Mutations and sweeps rebuild the heap when it exceeds both 1,024 entries and twice the number of active TTLs. Rebuilding uses current deadlines and takes time proportional to the number of active TTLs on the event loop.
 
 ---
 

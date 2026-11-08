@@ -42,6 +42,13 @@ class Store:
         """Retained UTF-8 key and value bytes, excluding Python object overhead."""
         return self._stored_bytes
 
+    @property
+    def has_due_expirations(self) -> bool:
+        """Whether another bounded sweep can process due or stale heap entries."""
+        return bool(
+            self._expiry_heap and self._expiry_heap[0][0] <= self._clock.now_ms()
+        )
+
     def _remove_if_expired(self, key: str) -> None:
         deadline = self._deadlines.get(key)
         if deadline is not None and deadline <= self._clock.now_ms():

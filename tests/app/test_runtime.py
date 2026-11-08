@@ -2,14 +2,82 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
+from tests.helpers import ManualClock
 from velis import __main__ as cli
-from velis.app import serve
+from velis.app import _maintain, serve
 from velis.config import Config, Server
+from velis.core.broker import Broker
 from velis.core.engine import Engine
+from velis.core.store import Store
 from velis.net.server import TcpServer
 
 
 class RuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_maintenance_drains_due_backlog_with_yields_between_rounds(
+        self,
+    ) -> None:
+        clock = ManualClock()
+        store = Store(clock)
+        for index in range(3001):
+            key = str(index)
+            store.set(key, b"v")
+            store.expire(key, 0)
+        snapshots: list[int] = []
+        intervals = 0
+        sleep = asyncio.sleep
+
+        async def wait(delay: float) -> None:
+            nonlocal intervals
+            if delay:
+                intervals += 1
+                if intervals == 2:
+                    raise asyncio.CancelledError
+            else:
+                snapshots.append(len(store))
+                await sleep(0)
+
+        with (
+            patch("velis.app.asyncio.sleep", side_effect=wait),
+            self.assertRaises(asyncio.CancelledError),
+        ):
+            await _maintain(Engine(store, Broker()), 60)
+        self.assertEqual(snapshots, [2001, 1001, 1])
+        self.assertEqual(len(store), 0)
+        self.assertEqual(store.stored_bytes, 0)
+
+    async def test_maintenance_continues_after_round_removing_only_stale_entries(
+        self,
+    ) -> None:
+        clock = ManualClock()
+        store = Store(clock)
+        for index in range(1000):
+            key = f"a{index}"
+            store.set(key, b"v")
+            store.expire(key, 0)
+            store.set(key, b"live")
+        store.set("z", b"due")
+        store.expire("z", 0)
+        intervals = 0
+        yields = 0
+
+        async def wait(delay: float) -> None:
+            nonlocal intervals, yields
+            if delay:
+                intervals += 1
+                if intervals == 2:
+                    raise asyncio.CancelledError
+            else:
+                yields += 1
+
+        with (
+            patch("velis.app.asyncio.sleep", side_effect=wait),
+            self.assertRaises(asyncio.CancelledError),
+        ):
+            await _maintain(Engine(store, Broker()), 60)
+        self.assertEqual(yields, 1)
+        self.assertEqual(len(store), 1000)
+        self.assertFalse(store.has_due_expirations)
+
     def setUp(self) -> None:
         self.config = Config("INFO", Server("127.0.0.1", 0))
         self.server = Mock(spec=TcpServer)

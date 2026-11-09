@@ -491,7 +491,6 @@ tests/
   net/ — protocol, client lifecycle and TCP integration tests
 benchmarks/
   tcp.py — repeatable localhost TCP throughput benchmark
-  tcp-results.json — machine details and individual throughput samples
 ```
 
 ---
@@ -525,21 +524,21 @@ Run the current server's TCP benchmark from the repository root:
 make bench
 ```
 
-Pass benchmark options with `BENCH_ARGS`, for example `make bench BENCH_ARGS="--pipeline 64 1024 --repeats 3"`. To save the JSON output, invoke `uv run python benchmarks/tcp.py > results.json` directly; benchmark progress goes to stderr.
+Pass benchmark options with `BENCH_ARGS`, for example `make bench BENCH_ARGS="--pipeline 64 1024 --repeats 3"`. Benchmark progress goes to stderr; JSON results are written to stdout.
 
 The benchmark starts the real Store, Broker and TCP runtime in a separate process, with the default S3-FIFO policy, capacity limits and 100 ms maintenance interval. One load-generator process uses one localhost connection per sample. Requests are encoded before timing; every reply is validated inside the timed interval. Connection setup and warmup are excluded.
 
 Each case measures 100,000 operations after 10,000 warmup operations, repeated five times with alternating case order. Keys are 16 bytes, values are 64 bytes, and the working set is 10,000 preloaded keys. SET overwrites existing keys; GET hits cycle through the resident keys, and GET misses use a disjoint key prefix. A pipeline window is sent and fully answered before the next window; depth 1 waits for each individual reply.
 
-Measured on **2026-11-09** with **CPython 3.15.2**, the standard asyncio event loop, **Linux 7.2.15 x86_64**, and an **AMD Ryzen 5 7535HS**. No CPU affinity or frequency tuning was applied. Median operations per second, rounded to the nearest 100:
+Measured on **2026-11-09** at commit `4603f35` with **CPython 3.15.2**, the standard asyncio event loop, **Linux 7.2.15 x86_64**, and an **AMD Ryzen 5 7535HS**. No CPU affinity or frequency tuning was applied. Median operations per second, rounded to the nearest 100:
 
 | Operation | Pipeline 1 | Pipeline 64 | Pipeline 1,024 |
 | --- | ---: | ---: | ---: |
-| SET overwrite | 21,000 | 233,900 | 269,600 |
-| GET hit | 23,200 | 286,400 | 341,400 |
-| GET miss | 24,400 | 367,400 | 447,000 |
+| SET overwrite | 21,400 | 192,300 | 220,900 |
+| GET hit | 23,100 | 257,900 | 309,600 |
+| GET miss | 24,200 | 319,200 | 391,300 |
 
-Results are machine-specific and cover cache operations without expiry or eviction pressure. The load generator uses raw wire frames, so application serialization and the `Client` API add costs beyond these measurements. Multi-connection scaling, larger values, TTL churn and pub-sub fan-out need separate workloads. Raw samples and environment details are in [benchmarks/tcp-results.json](benchmarks/tcp-results.json).
+Results are machine-specific and cover cache operations without expiry or eviction pressure. The load generator uses raw wire frames, so application serialization and the `Client` API add costs beyond these measurements. Multi-connection scaling, larger values, TTL churn and pub-sub fan-out need separate workloads.
 
 ---
 

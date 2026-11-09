@@ -21,6 +21,7 @@ Velis is a lightweight in-memory key-value store with TTL expiration, pub-sub an
 - [Encoding and framing](#encoding-and-framing)
 - [Project layout](#project-layout)
 - [Development](#development)
+- [Benchmarks](#benchmarks)
 - [Design notes and limitations](#design-notes-and-limitations)
 - [Roadmap](#roadmap)
 
@@ -450,6 +451,9 @@ tests/
   app/ — runtime cleanup and CLI signal ownership
   core/ — store, engine, broker and cache lifetime
   net/ — protocol, client lifecycle and TCP integration tests
+benchmarks/
+  tcp.py — repeatable localhost TCP throughput benchmark
+  tcp-results.json — machine details and individual throughput samples
 ```
 
 ---
@@ -472,6 +476,30 @@ make fmt
 The core is deliberately easy to test without sockets or real time: the `Store` accepts any object implementing the `Clock` protocol's `now_ms()` method, without requiring inheritance. The `ManualClock` in `tests/helpers.py` makes TTLs deterministic. Wire tests exercise golden byte fixtures, every truncation of valid bodies, and seeded mutations in both directions. Network tests bind to localhost on an automatically selected port, so the test environment must allow local sockets.
 
 Prefer direct stdlib APIs and clear ownership over custom infrastructure or small performance gains.
+
+---
+
+## Benchmarks
+
+Run the current server's TCP benchmark from the repository root:
+
+```bash
+uv run python benchmarks/tcp.py
+```
+
+The benchmark starts the real Store, Broker and TCP runtime in a separate process, with the default S3-FIFO policy, capacity limits and 100 ms maintenance interval. One load-generator process uses one localhost connection per sample. Requests are encoded before timing; every reply is validated inside the timed interval. Connection setup and warmup are excluded.
+
+Each case measures 100,000 operations after 10,000 warmup operations, repeated five times with alternating case order. Keys are 16 bytes, values are 64 bytes, and the working set is 10,000 preloaded keys. SET overwrites existing keys; GET hits cycle through the resident keys, and GET misses use a disjoint key prefix. A pipeline window is sent and fully answered before the next window; depth 1 waits for each individual reply.
+
+Measured on **2026-11-09** with **CPython 3.15.2**, the standard asyncio event loop, **Linux 7.2.15 x86_64**, and an **AMD Ryzen 5 7535HS**. No CPU affinity or frequency tuning was applied. Median operations per second, rounded to the nearest 100:
+
+| Operation | Pipeline 1 | Pipeline 64 | Pipeline 1,024 |
+| --- | ---: | ---: | ---: |
+| SET overwrite | 21,000 | 233,900 | 269,600 |
+| GET hit | 23,200 | 286,400 | 341,400 |
+| GET miss | 24,400 | 367,400 | 447,000 |
+
+Results are machine-specific and cover cache operations without expiry or eviction pressure. The load generator uses raw wire frames, so application serialization and the `Client` API add costs beyond these measurements. Multi-connection scaling, larger values, TTL churn and pub-sub fan-out need separate workloads. Raw samples and environment details are in [benchmarks/tcp-results.json](benchmarks/tcp-results.json).
 
 ---
 

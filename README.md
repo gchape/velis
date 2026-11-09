@@ -32,7 +32,7 @@ Velis is a lightweight in-memory key-value store with TTL expiration, pub-sub an
 | Area | Description |
 | --- | --- |
 | **Store** | `GET` / `SET` / `DEL` / `EXPIRE` / `TTL` / `PERSIST` on opaque `bytes` values, with key-count and byte limits. Single-owner, so no locks. |
-| **TTL** | Exact monotonic deadlines, a tick-bucket expiry index, lazy read expiry and bounded background sweeps. |
+| **TTL** | Exact monotonic deadlines, a heap-based expiry index, lazy read expiry and bounded background sweeps. |
 | **Pub-sub** | `SUBSCRIBE` / `UNSUBSCRIBE` / `PUBLISH`. At-most-once delivery to connected subscribers on one server. Slow network connections are disconnected when their server write buffer exceeds the configured limit. |
 | **Network** | Fixed binary protocol over TCP, ordered pipelining, an `asyncio.Protocol` server with batched replies, and an async `Client`. |
 | **Configuration** | CLI environment loading and frozen limits owned by each component. |
@@ -99,7 +99,7 @@ Use `asyncio.timeout(seconds)` around commands or `next_message()` to bound the 
 
 Wire encoding starts after a request acquires capacity. Invalid outgoing commands may therefore wait for a slot before raising; encoding failure releases the reservation without sending. Use bounded application submission for bulk work as well.
 
-Clients allow at most 128 in-flight requests by default. Pass `limits=SessionLimits(max_pending_requests=...)` to `Client.connect()`, `TCPSession.connect()` or `TCPSession` to change this limit; import `SessionLimits` from `velis.net.session`. Additional calls wait for a slot. A cancelled sent request retains its slot until its reply arrives, keeping cancellation bookkeeping bounded. If a peer stops replying, slots remain occupied until the connection closes; waiting calls can still be cancelled or timed out.
+Clients allow at most 128 in-flight requests by default. Pass `limits=SessionLimits(max_pending_requests=...)` to `Client.connect()`, `TCPSession.connect()` or `TCPSession` to change this limit; import `SessionLimits` from `velis.config`. Additional calls wait for a slot. A cancelled sent request retains its slot until its reply arrives, keeping cancellation bookkeeping bounded. If a peer stops replying, slots remain occupied until the connection closes; waiting calls can still be cancelled or timed out.
 
 Clients buffer at most 1,024 unread messages and 8 MiB of channel/payload bytes by default, measured as UTF-8 channel bytes plus payload bytes after wire decoding. Set `max_pending_messages` and `max_pending_bytes` on the same `SessionLimits` object to change these positive limits. Crossing either limit closes the connection and fails pending requests. Already queued messages can be drained before `next_message()` raises `ConnectionError`. A full message buffer never blocks the reply reader.
 
@@ -274,7 +274,7 @@ The `serve(server_limits, ...)` async context manager in `velis.app` owns the se
 
 ```python
 from velis.app import serve
-from velis.net.server import ServerLimits
+from velis.config import ServerLimits
 
 
 async def embedded() -> None:
@@ -286,13 +286,11 @@ async def embedded() -> None:
 
 Maintenance runs in a task group owned by `serve()`. An unexpected sweep failure interrupts the active runtime scope and closes the server. Worker and caller failures are reported in an `ExceptionGroup` after cleanup; external cancellation remains `CancelledError`. Normal shutdown uses Python 3.15's `TaskGroup.cancel()` and awaits the group before closing the server. Incoming command and message generators use `contextlib.aclosing()` for deterministic cleanup. Client disconnections remain local to their connections.
 
-One task starts sweeping expired keys every `VELIS_SWEEP_MS`. Each round spends at most 1,000 units on expired keys or stale time ticks. A round can remove no keys while still making cleanup progress. While due ticks remain, maintenance yields to the event loop and runs another round without waiting for the next interval.
+One task starts sweeping expired keys every `VELIS_SWEEP_MS`. Each round removes at most 1,000 expired keys. While due keys remain, maintenance yields to the event loop and runs another round without waiting for the next interval.
 
-`ExpiryIndex` is the sole expiration scheduler. It maps each key to its exact deadline and groups keys by `deadline // tick_ms`; Python's `heapq` orders tick IDs. The store uses the default `tick_ms=1`, so keys become sweepable at their exact deadline. With larger ticks, a bucket becomes due after every deadline in it has passed: physical cleanup can be delayed by less than one tick, while reads and TTL queries still use exact deadlines.
+`ExpiryIndex` maps each key to its exact deadline and uses a min-heap of `(deadline, key)` entries to return due keys in deadline order. Replacing or cancelling a timer updates the deadline map immediately; old heap entries remain until cleanup or compaction. Readiness checks skip stale entries, so `has_due(now)` is true only when a live timer is due. Stale entries do not consume the returned-key budget, and repeated deadlines return each key once.
 
-Replacing or cancelling a timer removes its key from the old bucket immediately. `SET`, `PERSIST`, deletion and eviction therefore leave no stale per-key records. Empty buckets are deleted, although their tick IDs can remain in the heap until cleanup or compaction. Recreated tick IDs are harmless: keys are returned once, and leftover IDs consume sweep budget without expiring anything.
-
-Deadline lookup takes expected constant time. Creating or removing the earliest tick costs O(log h), where h includes stale tick IDs. Cancelling a key normally updates dictionary and set membership. When the heap exceeds twice the occupied bucket count plus 64 IDs, compaction rebuilds it from occupied buckets. Compaction takes O(b) time for b occupied buckets, so the sweep limit bounds due-key and stale-tick work, **not compaction work or wall-clock duration**. Up to 64 stale IDs may remain after the last timer is cancelled. Clock jumps require no traversal of elapsed milliseconds.
+Deadline lookup and cancellation take expected constant time. Scheduling costs amortized O(log h), where h includes stale heap entries. Scheduling rebuilds the heap from live timers when it exceeds twice the live timer count plus 64 entries. Cancellation alone does not compact the heap; readiness checks and sweeps discard stale heads, including heads with future deadlines. The sweep limit bounds removed keys, **not stale-entry cleanup, compaction work or wall-clock duration**. Clock jumps require no traversal of elapsed milliseconds.
 
 ---
 
@@ -349,7 +347,7 @@ The cache is entirely in memory. Keys and TTLs are discarded on restart. There i
 
 The default store retains at most 100,000 keys and 64 MiB of UTF-8 key plus encoded value bytes. The byte budget excludes Python object overhead; the key-count limit bounds resident entry metadata. Expired entries count until cleanup removes them. The default `s3-fifo` policy evicts entries to make room when either limit is reached. A value whose key plus payload exceeds the entire byte budget is rejected before changing existing values or deadlines. Successful replacements clear the TTL. A capacity error produces `ERR` and keeps the connection usable. Direct `Store` and `Broker` callers receive `CapacityError`, a `CommandError` subclass.
 
-Select one of three eviction policies with `VELIS_EVICTION_POLICY` or `Store(limits=StoreLimits(eviction_policy=EvictionPolicy.LRU))` for direct embedding. `StoreLimits` lives in `velis.core.store`; import `EvictionPolicy` from `velis.core.eviction`. Policy strings are normalized to enum values:
+Select one of three eviction policies with `VELIS_EVICTION_POLICY` or `Store(limits=StoreLimits(eviction_policy=EvictionPolicy.LRU))` for direct embedding. `StoreLimits` lives in `velis.config` and is also exported by `velis.core.store`; import `EvictionPolicy` from `velis.core.eviction`. Policy strings are normalized to enum values:
 
 | Policy | Behavior when full |
 | --- | --- |
@@ -359,9 +357,11 @@ Select one of three eviction policies with `VELIS_EVICTION_POLICY` or `Store(lim
 
 S3-FIFO follows the [SOSP 2023 paper's queue and counter rules](https://www.cs.cmu.edu/~rvinayak/papers/s3-fifo-sosp-2023-fifo-queues-are-all-you-need-for-cache-eviction.pdf). New keys enter the small queue unless ghost history places them directly in the main queue. Resident accesses increment a counter capped at three without moving the key. Small-queue keys with more than one reuse are promoted, with their counters reset; others enter ghost history. Main-queue eviction reinserts keys with remaining credit, decrementing the counter each time.
 
-In Velis, queue targets use **key counts**: the small target is `max(1, max_keys // 10)`, and the main target is `max(1, max_keys - small_target)`. Ghost history retains at most `main_target` keys and no values. It adds Python metadata and retained key strings outside `stored_bytes`. These are eviction targets, not reserved partitions: queues borrow unused space, and the store independently enforces both total limits. With variable-sized values or very small caches, behavior can differ from the paper's equal-sized-object model. A single S3-FIFO eviction step can remove multiple residents while promoting entries and trimming the main queue.
+In Velis, queue targets follow the **current resident key count**, independently of `max_keys`: the small target is `max(1, int(residents * small_ratio))`, and the main target is `max(1, residents - small_target)`. `S3FIFO(small_ratio=0.1, ghost_ratio=0.9)` supplies the defaults. Small ratios must be between zero and one; ghost ratios must be positive. When recording a small-queue victim, ghost history is trimmed to `max(1, int(residents * ghost_ratio))` keys and retains no values. It adds Python metadata and retained key strings outside `stored_bytes`. Queues borrow unused space, and the store independently enforces both total limits. With variable-sized values or very small caches, behavior can differ from the paper's equal-sized-object model. Each policy eviction removes exactly one resident, though it may first promote several small entries.
 
-Eviction may remove several entries to fit the byte budget. Every victim's timer, cached size and resident policy metadata are removed together; S3-FIFO retains only its bounded ghost history. Explicit deletion and TTL expiry remove resident policy metadata without adding ghost entries. Under capacity pressure, every policy performs one bounded expiry sweep before evicting live entries. Remaining expired entries are reclaimed by later reads or maintenance. `GET` hits and successful `SET` operations count as accesses; a new S3-FIFO entry starts with zero reuse credit, while a replacement increments it. TTL inspection and expiry changes do not count as accesses. LFU uses linked frequency buckets for constant-time access, deletion and victim selection, including after deletions leave gaps between frequencies. Store owns values, capacity, byte accounting and TTL removal.
+Eviction may remove several entries to fit the byte budget. Every victim's value, byte accounting, timer and resident policy metadata are removed together; S3-FIFO may retain ghost history. Explicit deletion and TTL expiry forget policy history. Under capacity pressure, every policy performs one bounded expiry sweep before evicting live entries. Remaining expired entries are reclaimed by later reads or maintenance. `GET` hits update access history. Each successful `SET` starts fresh access history and clears any TTL; a new S3-FIFO entry starts with zero reuse credit. Re-inserting a key remembered in S3-FIFO ghost history enters main directly. TTL inspection and expiry changes do not count as accesses. LFU uses a min-heap ordered by frequency and last access, with lazy stale-entry removal and compaction; access and eviction cost amortized O(log n).
+
+`Store` composes `Expiring` over `Evicting` over `Memory`: the outer layer owns TTLs, the middle layer enforces capacity and tracks policy history, and the base layer stores values and accounts for bytes. Expiry removes keys through the eviction layer. Capacity eviction clears timers through a hook, and a reclamation hook sweeps expired keys before selecting live victims.
 
 `store.stats()` returns a frozen `StoreStats(hits, misses, evictions, expirations)` snapshot. Hits and misses count `GET` results only. Evictions count capacity victims; expirations count keys physically removed by lazy access, sweeps or write-time cleanup. Deleting or overwriting live keys does not increment either removal counter. Counters accumulate from construction, and taking a snapshot does not purge keys or reset them.
 
@@ -379,9 +379,9 @@ Pub-sub provides at-most-once delivery to connected subscribers on the same serv
 
 > **`max_bytes` is a data budget, not a RAM limit.** It counts UTF-8 keys and stored values only. Python objects, dictionaries, eviction queues and expiry metadata use additional memory; with many small keys, process memory can be several times the budget. Use `max_keys` as well.
 
-The CLI reads `VELIS_*` environment variables and constructs `ServerLimits` from `velis.net.server`, `StoreLimits` from `velis.core.store`, and `BrokerLimits` from `velis.core.broker`. Each component validates its own limits. Environment parsing and logging setup belong to `__main__.py`; `velis.app` owns the sweep interval and validates it before opening runtime resources. Embedded callers pass limits directly to `serve()` or `build_engine()` and control their own logging.
+`velis/config.py` defines the defaults, validated `ServerLimits`, `StoreLimits`, `SessionLimits`, and the immutable `Config` snapshot. `Config.from_env()` reads `VELIS_*` variables when called. The CLI loads it once before configuring logging or opening runtime resources. `Config()` uses explicit values and defaults; embedded callers can load environment settings themselves. Existing limit imports from the store, server and session modules remain available.
 
-Unknown log levels, ports outside `0–65535`, nonpositive limits or sweep intervals, and non-integer numeric settings raise `ValueError` at startup. Integer parsing errors include the environment variable name.
+Unknown log levels, ports outside `0–65535`, nonpositive limits or sweep intervals, and non-integer numeric settings raise `ValueError` before startup. Empty values are parsed and validated; only missing variables use defaults. Parsing errors include the environment variable name. Logging setup and signals belong to `__main__.py`; `velis.app` owns the runtime lifecycle.
 
 | Variable | Default | Description |
 | --- | --- | --- |
@@ -395,8 +395,41 @@ Unknown log levels, ports outside `0–65535`, nonpositive limits or sweep inter
 | `VELIS_MAX_CONNECTIONS` | `1024` | Maximum admitted TCP connections; excess connections are closed after a best-effort error. |
 | `VELIS_MAX_SUBSCRIPTIONS` | `1024` | Maximum distinct channels per subscriber connection. |
 | `VELIS_SWEEP_MS` | `100` | Milliseconds between expiry sweeps; must be positive. |
+| `VELIS_MAX_PENDING_REQUESTS` | `128` | Maximum in-flight requests per client session. |
+| `VELIS_MAX_PENDING_MESSAGES` | `1024` | Maximum unread publications per client session. |
+| `VELIS_MAX_PENDING_BYTES` | `8388608` (8 MiB) | Maximum unread channel/payload bytes per client session. |
 
-`serve(server_limits, store_limits=..., broker_limits=..., sweep_interval_ms=...)` applies the supplied store and broker limits when building its default engine. All arguments have defaults. When supplying `engine=...`, configure its store and broker directly; the runtime uses that engine without applying the store or broker limits. Listener and write-buffer limits still apply. `build_engine(store_limits=..., broker_limits=...)` constructs a standalone engine without networking or environment loading.
+For example, start the CLI with environment overrides:
+
+```sh
+VELIS_PORT=9001 VELIS_MAX_BYTES=33554432 VELIS_LOG_LEVEL=debug uv run velis
+```
+
+Embedded callers use the same configuration:
+
+```python
+from velis.app import serve
+from velis.config import Config
+from velis.net.client import Client
+
+
+async def embedded() -> None:
+    config = Config.from_env()
+    async with serve(
+        config.server_limits,
+        store_limits=config.store_limits,
+        max_subscriptions=config.max_subscriptions,
+        sweep_interval_ms=config.sweep_interval_ms,
+    ) as server:
+        async with await Client.connect(
+            config.server_limits.host, server.port, limits=config.session_limits
+        ) as client:
+            await client.set("greeting", b"hello")
+```
+
+Client environment settings take effect when passing `config.session_limits` to `Client.connect()` or `TCPSession`. `Config.from_env(mapping)` supports loading an explicit mapping, including an empty mapping for defaults.
+
+`serve(server_limits, store_limits=..., max_subscriptions=..., sweep_interval_ms=...)` applies the supplied store and broker limits when building its default engine. All arguments have defaults. When supplying `engine=...`, configure its store and broker directly; the runtime uses that engine without applying the store or broker limits. Listener and write-buffer limits still apply. `build_engine(store_limits=..., max_subscriptions=...)` constructs a standalone engine. Embedded callers control their own logging.
 
 ---
 
@@ -425,18 +458,23 @@ Golden byte fixtures cover every command, reply and push. Truncation, malformed-
 
 ```
 src/velis/
-  __main__.py — CLI: VELIS_* environment loading, logging, signals and startup
+  __main__.py — CLI: logging, signals and startup
+  config.py — all runtime settings, defaults, validation and VELIS_* loading
   app.py — composition root: serve() owns networking and maintenance
   errors.py — VelisError, ProtocolError, CommandError, CapacityError
   validation.py — shared positive-limit validation
   core/ — no sockets, no wire format
     messages.py — Command / Reply / Message dataclasses and TTL sentinels
     engine.py — command dispatch and replies
-    store.py — StoreLimits, StoreStats, TtlStatus, capacity and removal bookkeeping
+    store.py — public Store composition and StoreStats snapshots
+    kv.py — KV protocol, Memory and byte accounting
+    limits.py — re-export of StoreLimits and defaults from config.py
+    evicting.py — capacity enforcement, eviction policy and layer hooks
+    expiring.py — TTL operations, TtlStatus and expiration counts
     eviction.py — EvictionPolicy and S3-FIFO (default), LRU and LFU policies
-    expiry_index.py — exact deadlines, tick buckets and stale-tick compaction
-    broker.py — BrokerLimits, shared Message delivery and the Subscriber protocol
-    membership.py — ManyToMany relation with mirrored membership indexes
+    expiry_index.py — exact deadlines and a min-heap with lazy stale-entry removal
+    broker.py — subscription limits, shared Message delivery and Subscriber protocol
+    membership.py — Memberships with join/leave operations and mirrored indexes
     clock.py — structural Clock protocol and MonotonicClock implementation
   net/
     protocol.py — fixed u32 framing, shared PushEncoder and client message reader

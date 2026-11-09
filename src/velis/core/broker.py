@@ -1,27 +1,12 @@
 """Subscription limits and synchronous message delivery."""
 
-from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, final
 
-from velis.core.membership import ManyToMany
+from velis.config import DEFAULT_MAX_SUBSCRIPTIONS
+from velis.core.membership import Memberships
 from velis.core.messages import Message
 from velis.errors import CapacityError
 from velis.validation import require_positive
-
-DEFAULT_MAX_SUBSCRIPTIONS = 1024
-
-
-@dataclass(frozen=True, slots=True)
-class BrokerLimits:
-    """Bound the number of channels each subscriber can join."""
-
-    max_subscriptions: int = DEFAULT_MAX_SUBSCRIPTIONS
-
-    def __post_init__(self) -> None:
-        require_positive(max_subscriptions=self.max_subscriptions)
-
-
-DEFAULT_BROKER_LIMITS = BrokerLimits()
 
 
 class Subscriber(Protocol):
@@ -32,38 +17,37 @@ class Subscriber(Protocol):
         ...
 
 
+@final
 class Broker:
-    """Apply subscription limits and deliver one shared message to each peer."""
+    """Deliver each published message to every subscriber of a channel."""
 
-    def __init__(self, *, limits: BrokerLimits = DEFAULT_BROKER_LIMITS) -> None:
-        self._limits = limits
-        self._members: ManyToMany[str, Subscriber] = ManyToMany()
+    def __init__(self, *, max_subscriptions: int = DEFAULT_MAX_SUBSCRIPTIONS) -> None:
+        require_positive(max_subscriptions=max_subscriptions)
+        self._max_subscriptions = max_subscriptions
+        self._memberships: Memberships[str, Subscriber] = Memberships()
 
     def subscribers(self, channel: str) -> int:
-        """Return the number of recipients subscribed to a channel."""
-        return self._members.value_count(channel)
+        return self._memberships.member_count(channel)
 
     def subscribe(self, channel: str, subscriber: Subscriber) -> None:
-        """Join once; enforce the limit without changing existing memberships."""
-        if self._members.has(channel, subscriber):
+        """Join once; the limit applies only to new subscriptions."""
+        if self._memberships.is_member(channel, subscriber):
             return
-        if self._members.key_count(subscriber) >= self._limits.max_subscriptions:
+        if self._memberships.group_count(subscriber) >= self._max_subscriptions:
             raise CapacityError("subscription limit exceeded")
-        self._members.add(channel, subscriber)
+        self._memberships.join(channel, subscriber)
 
     def unsubscribe(self, channel: str, subscriber: Subscriber) -> None:
-        """Leave a channel."""
-        self._members.discard(channel, subscriber)
+        self._memberships.leave(channel, subscriber)
 
     def unsubscribe_all(self, subscriber: Subscriber) -> None:
-        """Remove all of a subscriber's memberships; safe to repeat."""
-        self._members.discard_value(subscriber)
+        self._memberships.leave_all(subscriber)
 
     def publish(self, channel: str, payload: bytes) -> int:
-        """Count accepted deliveries, removing failed recipients from every channel."""
+        """Return accepted deliveries; drop subscribers whose send fails."""
         message = Message(channel, payload)
         accepted = 0
-        for subscriber in self._members.values_of(channel):
+        for subscriber in self._memberships.members(channel):
             if subscriber.send(message):
                 accepted += 1
             else:

@@ -90,7 +90,7 @@ class ModelTests(unittest.TestCase):
                         new_size = len(key.encode()) + len(value)
                         rejected = new_size > 20
                         if not rejected:
-                            lazy_expire(key)
+                            remove(key)
 
                             if not fits(key, new_size):
                                 sweep()
@@ -140,7 +140,9 @@ class ModelTests(unittest.TestCase):
                             else TtlStatus.PERSISTENT
                         )
                         self.assertEqual(store.ttl(key), expected)
-                self.assertEqual(
-                    {key: entry.value for key, entry in store._entries.items()}, values
-                )
+                self.assertEqual(len(store), len(values))
+                for candidate in ("a", "b", "c", "d", "é"):
+                    self.assertEqual(
+                        store._inner._inner._inner.get(candidate), values.get(candidate)
+                    )
                 self.assertEqual(store.stored_bytes, size())

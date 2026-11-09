@@ -1,7 +1,7 @@
 import random
 import unittest
 
-from velis.core.membership import ManyToMany
+from velis.core.membership import Memberships
 
 
 class MembershipTests(unittest.TestCase):
@@ -9,33 +9,54 @@ class MembershipTests(unittest.TestCase):
         self,
     ) -> None:
         rng = random.Random(47)
-        membership: ManyToMany[int, int] = ManyToMany()
+        membership: Memberships[int, int] = Memberships()
         pairs: set[tuple[int, int]] = set()
         for step in range(1000):
             key, value = rng.randrange(8), rng.randrange(8)
             match rng.randrange(3):
                 case 0:
-                    membership.add(key, value)
+                    membership.join(key, value)
                     pairs.add((key, value))
                 case 1:
-                    membership.discard(key, value)
+                    membership.leave(key, value)
                     pairs.discard((key, value))
                 case 2:
-                    membership.discard_value(value)
+                    membership.leave_all(value)
                     pairs = {(k, v) for k, v in pairs if v != value}
             with self.subTest(step=step):
-                self.assertEqual(set(membership._values_by_key), {k for k, _ in pairs})
-                self.assertEqual(set(membership._keys_by_value), {v for _, v in pairs})
+                self.assertEqual(
+                    set(membership._members_by_group), {k for k, _ in pairs}
+                )
+                self.assertEqual(
+                    set(membership._groups_by_member), {v for _, v in pairs}
+                )
                 for candidate in range(8):
+                    for member in range(8):
+                        self.assertEqual(
+                            membership.is_member(candidate, member),
+                            (candidate, member) in pairs,
+                        )
                     self.assertEqual(
-                        set(membership.values_of(candidate)),
+                        set(membership.members(candidate)),
                         {v for k, v in pairs if k == candidate},
                     )
                     self.assertEqual(
-                        membership.value_count(candidate),
+                        membership.member_count(candidate),
                         sum(k == candidate for k, _ in pairs),
                     )
                     self.assertEqual(
-                        membership.key_count(candidate),
+                        membership.group_count(candidate),
                         sum(v == candidate for _, v in pairs),
                     )
+
+    def test_members_snapshot_allows_leaving_groups_during_iteration(self) -> None:
+        membership: Memberships[str, int] = Memberships()
+        for member in range(3):
+            membership.join("a", member)
+            membership.join("b", member)
+        snapshot = membership.members("a")
+        for member in snapshot:
+            membership.leave_all(member)
+        self.assertEqual(set(snapshot), {0, 1, 2})
+        self.assertEqual(membership.members("a"), ())
+        self.assertEqual(membership.member_count("b"), 0)

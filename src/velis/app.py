@@ -5,25 +5,32 @@ import logging
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
-from velis.core.broker import DEFAULT_BROKER_LIMITS, Broker, BrokerLimits
+from velis.config import (
+    DEFAULT_MAX_SUBSCRIPTIONS,
+    DEFAULT_SERVER_LIMITS,
+    DEFAULT_STORE_LIMITS,
+    DEFAULT_SWEEP_INTERVAL_MS,
+    ServerLimits,
+    StoreLimits,
+)
+from velis.core.broker import Broker
 from velis.core.engine import Engine
-from velis.core.store import DEFAULT_STORE_LIMITS, Store, StoreLimits
-from velis.net.server import DEFAULT_SERVER_LIMITS, ServerLimits, TCPServer
+from velis.core.store import Store
+from velis.net.server import TCPServer
 from velis.validation import require_positive
 
 log = logging.getLogger(__name__)
-DEFAULT_SWEEP_INTERVAL_MS = 100
 
 
 def build_engine(
     *,
     store_limits: StoreLimits = DEFAULT_STORE_LIMITS,
-    broker_limits: BrokerLimits = DEFAULT_BROKER_LIMITS,
+    max_subscriptions: int = DEFAULT_MAX_SUBSCRIPTIONS,
 ) -> Engine:
     """Create an engine with an empty in-memory store and pub-sub broker."""
     return Engine(
         Store(limits=store_limits),
-        Broker(limits=broker_limits),
+        Broker(max_subscriptions=max_subscriptions),
     )
 
 
@@ -42,14 +49,14 @@ async def serve(
     server_limits: ServerLimits = DEFAULT_SERVER_LIMITS,
     *,
     store_limits: StoreLimits = DEFAULT_STORE_LIMITS,
-    broker_limits: BrokerLimits = DEFAULT_BROKER_LIMITS,
+    max_subscriptions: int = DEFAULT_MAX_SUBSCRIPTIONS,
     sweep_interval_ms: int = DEFAULT_SWEEP_INTERVAL_MS,
     engine: Engine | None = None,
 ) -> AsyncGenerator[TCPServer]:
     """Own server and maintenance resources across startup, serving and cleanup.
 
     Supply an engine to reuse application state or an injected clock.
-    Store and broker limits apply only when creating the default engine;
+    Store limits and max_subscriptions apply only when creating the default engine;
     supplied engines keep their existing limits. Nonpositive sweep intervals
     raise ValueError before any runtime resources are opened.
     Signal handling belongs to the CLI; embedding callers control this scope.
@@ -58,7 +65,9 @@ async def serve(
     """
     require_positive(sweep_interval_ms=sweep_interval_ms)
     if engine is None:
-        engine = build_engine(store_limits=store_limits, broker_limits=broker_limits)
+        engine = build_engine(
+            store_limits=store_limits, max_subscriptions=max_subscriptions
+        )
     async with (
         TCPServer(engine, server_limits) as server,
         asyncio.TaskGroup() as workers,

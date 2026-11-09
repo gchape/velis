@@ -173,6 +173,20 @@ class StoreTests(unittest.TestCase):
         self.assertIsNone(store.get("k"))
         self.assertEqual(store.stored_bytes, 0)
 
+    def test_rejected_replacement_does_not_purge_an_expired_predecessor(self) -> None:
+        store = Store(self.clock, limits=StoreLimits(max_bytes=4))
+        store.set("k", b"old")
+        store.expire("k", 0)
+        before = store.stats()
+        with self.assertRaises(CapacityError):
+            store.set("k", b"oversized")
+        self.assertEqual(store.stats(), before)
+        self.assertEqual(len(store), 1)
+        self.assertEqual(store.stored_bytes, 4)
+        self.assertTrue(store.has_due_expirations)
+        self.assertEqual(store.sweep(), 1)
+        self.assertEqual(store.stats().expirations, 1)
+
     def test_store_limits_must_be_positive(self) -> None:
         for keys, size in ((0, 1), (1, 0), (1, -1)):
             with self.subTest(keys=keys, size=size), self.assertRaises(ValueError):

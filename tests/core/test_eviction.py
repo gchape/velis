@@ -13,7 +13,7 @@ class EvictionTests(unittest.TestCase):
     ) -> None:
         for kind in EvictionPolicy:
             with self.subTest(policy=kind):
-                policy = kind.create(max_keys=10)
+                policy = kind.create()
                 resident = {f"key-{i}" for i in range(10)}
                 for key in sorted(resident):
                     for _ in range(3):
@@ -51,7 +51,7 @@ class EvictionTests(unittest.TestCase):
                 self.assertIsNone(store.get("old-key"))
                 self.assertEqual(store.get("new-key"), b"new")
                 self.assertEqual(len(store), 1)
-                self.assertEqual(len(store._eviction), 1)
+                self.assertEqual(len(store._inner._inner._policy), 1)
 
     def test_lfu_handles_frequency_gaps_after_deletion_and_reinsertion(self) -> None:
         policy = LFU()
@@ -101,18 +101,24 @@ class EvictionTests(unittest.TestCase):
         store.get("a")
         store.get("b")
         store.set("c", b"c")
-        self.assertEqual(set(store._entries), {"b", "c"})
+        self.assertIsNone(store.get("a"))
+        self.assertEqual(store.get("b"), b"b")
+        self.assertEqual(store.get("c"), b"c")
 
-    def test_lfu_updates_count_as_accesses(self) -> None:
+    def test_lfu_replacement_restarts_access_history(self) -> None:
         store = Store(
             limits=StoreLimits(max_keys=2, eviction_policy=EvictionPolicy.LFU)
         )
         store.set("a", b"a")
         store.set("b", b"b")
+        store.get("b")
+        store.get("a")
+        store.get("a")
         store.set("a", b"updated")
         store.set("c", b"c")
-        self.assertEqual(store.get("a"), b"updated")
-        self.assertIsNone(store.get("b"))
+        self.assertIsNone(store.get("a"))
+        self.assertEqual(store.get("b"), b"b")
+        self.assertEqual(store.get("c"), b"c")
 
     def test_ttl_operations_do_not_promote_eviction_candidates(self) -> None:
         for policy in EvictionPolicy:
@@ -143,8 +149,10 @@ class EvictionTests(unittest.TestCase):
                     store.sweep()
                 store.set("e", b"x")
                 store.set("f", b"x")
-                self.assertEqual(set(store._entries), {"d", "e", "f"})
-                for key in tuple(store._entries):
+                for key in ("d", "e", "f"):
+                    self.assertEqual(store.get(key), b"x")
+                self.assertEqual(len(store), 3)
+                for key in ("d", "e", "f"):
                     store.delete(key)
                 store.set("again", b"ok")
                 self.assertEqual(store.get("again"), b"ok")

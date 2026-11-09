@@ -18,7 +18,7 @@ class ExpiryIndexTests(unittest.TestCase):
         self.assertIsNone(index.deadline("updated"))
         self.assertFalse(index.has_due(30))
 
-    def test_cancelled_keys_in_live_buckets_do_not_consume_budget(self) -> None:
+    def test_cancelled_keys_with_equal_deadlines_do_not_consume_budget(self) -> None:
         index = ExpiryIndex()
         index.set("a", 0)
         index.set("b", 0)
@@ -26,14 +26,13 @@ class ExpiryIndexTests(unittest.TestCase):
         self.assertEqual(index.pop_due(0, 1), ["b"])
         self.assertFalse(index.has_due(0))
 
-    def test_stale_ticks_consume_the_expiry_budget(self) -> None:
+    def test_stale_entries_do_not_consume_the_expiry_budget(self) -> None:
         index = ExpiryIndex()
         index.set("a", 0)
         index.set("b", 1)
         index.clear("a")
-        self.assertEqual(index.pop_due(1, 1), [])
-        self.assertTrue(index.has_due(1))
         self.assertEqual(index.pop_due(1, 1), ["b"])
+        self.assertFalse(index.has_due(1))
 
     def test_rescheduling_and_cancellation_keep_stale_storage_bounded(self) -> None:
         index = ExpiryIndex()
@@ -42,19 +41,20 @@ class ExpiryIndexTests(unittest.TestCase):
             index.set("deleted", deadline)
             index.clear("deleted")
         self.assertEqual(len(index._deadlines), 1)
-        self.assertLessEqual(len(index._ticks), 2 * len(index._buckets) + 64)
+        self.assertLessEqual(len(index._heap), 2 * (len(index._deadlines) + 1) + 64)
         self.assertEqual(index.pop_due(9_998, 1), [])
         self.assertEqual(index.pop_due(9_999, 100), ["changing"])
 
-    def test_mass_cancellation_compacts_stale_ticks(self) -> None:
+    def test_readiness_skips_mass_cancellation_before_a_future_timer(self) -> None:
         index = ExpiryIndex()
         for number in range(5000):
             index.set(str(number), number)
         for number in range(4999):
             self.assertTrue(index.clear(str(number)))
         self.assertEqual(len(index._deadlines), 1)
-        self.assertLessEqual(len(index._ticks), 2 * len(index._buckets) + 64)
-        self.assertEqual(index.pop_due(4999, 100), ["4999"])
+        self.assertFalse(index.has_due(4998))
+        self.assertEqual(len(index._heap), 1)
+        self.assertEqual(index.pop_due(4999, 1), ["4999"])
 
     def test_exact_deadlines_at_negative_and_large_clock_origins(self) -> None:
         for origin in (-5000, 0, 1003, 1 << 80):
@@ -106,7 +106,7 @@ class ExpiryIndexTests(unittest.TestCase):
         rescheduled, cancelled = sorted({"a", "b", "c"} - set(expired))
         index.set(rescheduled, 1000)
         index.clear(cancelled)
-        self.assertTrue(index.has_due(65))
+        self.assertFalse(index.has_due(65))
         self.assertEqual(index.pop_due(65, 2), [])
         self.assertFalse(index.has_due(65))
         self.assertEqual(index.pop_due(1000, 1), [rescheduled])
@@ -139,43 +139,25 @@ class ExpiryIndexTests(unittest.TestCase):
                                 expected = sorted(d for d in model.values() if d <= now)
                                 due = index.pop_due(now, budget)
                                 actual = [model.pop(expired) for expired in due]
-                                self.assertEqual(actual, expected[: len(actual)])
-                                self.assertLessEqual(len(actual), budget)
+                                self.assertEqual(actual, expected[:budget])
                         self.assertEqual(index._deadlines, model)
-                        self.assertLessEqual(
-                            len(index._ticks), 2 * len(index._buckets) + 64
+                        self.assertEqual(
+                            index.has_due(now), any(d <= now for d in model.values())
                         )
-                        if any(d <= now for d in model.values()):
-                            self.assertTrue(index.has_due(now))
                         for live_key, deadline in model.items():
                             self.assertEqual(index.deadline(live_key), deadline)
-                        ticks = set(index._ticks)
-                        self.assertTrue(
-                            all(deadline in ticks for deadline in model.values())
-                        )
-                        bucketed = {
-                            key: deadline
-                            for deadline, bucket in index._buckets.items()
-                            for key in bucket
-                        }
-                        self.assertEqual(bucketed, model)
-                        for position, entry in enumerate(index._ticks):
-                            if position:
-                                self.assertLessEqual(
-                                    index._ticks[(position - 1) // 2], entry
-                                )
                 while index.has_due(now):
                     for expired in index.pop_due(now, 3):
                         self.assertLessEqual(model.pop(expired), now)
                 self.assertTrue(all(deadline > now for deadline in model.values()))
 
-    def test_stale_due_ticks_can_require_a_sweep_without_live_expiration(
+    def test_readiness_ignores_rescheduled_deadlines(
         self,
     ) -> None:
         index = ExpiryIndex()
         index.set("key", 1)
         index.set("key", 100)
-        self.assertTrue(index.has_due(1))
+        self.assertFalse(index.has_due(1))
         self.assertEqual(index.pop_due(1, 1), [])
         self.assertFalse(index.has_due(1))
         self.assertEqual(index.deadline("key"), 100)
@@ -195,54 +177,32 @@ class ExpiryIndexTests(unittest.TestCase):
         index = ExpiryIndex()
         for _ in range(10000):
             index.set("key", 1)
-        self.assertLessEqual(len(index._ticks), 66)
+        self.assertLessEqual(len(index._heap), 66)
         self.assertEqual(index.pop_due(1, 1), ["key"])
         self.assertEqual(index.pop_due(1, 100), [])
         self.assertFalse(index.has_due(1))
 
-    def test_last_cancellation_leaves_only_bounded_stale_ticks(self) -> None:
+    def test_readiness_cleans_stale_entries_after_last_cancellation(self) -> None:
         index = ExpiryIndex()
         for deadline in range(50):
             index.set("key", deadline)
         index.clear("key")
         self.assertFalse(index._deadlines)
-        self.assertLessEqual(len(index._ticks), 64)
-        self.assertTrue(index.has_due(100))
-        while index.has_due(100):
-            self.assertEqual(index.pop_due(100, 7), [])
-        self.assertFalse(index._ticks)
+        self.assertLessEqual(len(index._heap), 64)
+        self.assertFalse(index.has_due(100))
+        self.assertEqual(index.pop_due(100, 7), [])
+        self.assertFalse(index._heap)
         index.set("key", -1)
         self.assertEqual(index.pop_due(0, 1), ["key"])
 
-    def test_invalid_tick_sizes_are_rejected(self) -> None:
-        for tick_ms in (0, -1):
-            with self.subTest(tick_ms=tick_ms), self.assertRaises(ValueError):
-                ExpiryIndex(tick_ms=tick_ms)
-
-    def test_coarse_ticks_never_expire_early_at_any_clock_origin(self) -> None:
-        for tick_ms in (2, 10, 64):
-            for deadline in (-5001, -65, -1, 0, 1, 63, 64, 1003, 1 << 80):
-                with self.subTest(tick_ms=tick_ms, deadline=deadline):
-                    index = ExpiryIndex(tick_ms=tick_ms)
-                    index.set("key", deadline)
-                    due_at = (deadline // tick_ms + 1) * tick_ms - 1
-                    self.assertFalse(index.has_due(due_at - 1))
-                    self.assertEqual(index.pop_due(due_at - 1, 100), [])
-                    self.assertEqual(index.deadline("key"), deadline)
-                    self.assertLess(due_at - deadline, tick_ms)
-                    self.assertEqual(index.pop_due(due_at, 1), ["key"])
-
-    def test_coarse_bucket_drains_in_bounded_batches_after_all_keys_are_due(
-        self,
-    ) -> None:
-        index = ExpiryIndex(tick_ms=10)
-        for key, deadline in (("a", 10), ("b", 15), ("c", 19)):
+    def test_due_keys_are_returned_in_deadline_order_with_bounded_batches(self) -> None:
+        index = ExpiryIndex()
+        for key, deadline in (("c", 19), ("a", 10), ("b", 15)):
             index.set(key, deadline)
-        self.assertEqual(index.pop_due(18, 100), [])
-        first = index.pop_due(19, 2)
-        self.assertEqual(len(first), 2)
-        self.assertTrue(index.has_due(19))
-        second = index.pop_due(19, 2)
-        self.assertEqual(len(second), 1)
-        self.assertEqual(set(first + second), {"a", "b", "c"})
+        self.assertEqual(index.pop_due(9, 100), [])
+        self.assertEqual(index.pop_due(18, 1), ["a"])
+        self.assertTrue(index.has_due(18))
+        self.assertEqual(index.pop_due(18, 2), ["b"])
+        self.assertFalse(index.has_due(18))
+        self.assertEqual(index.pop_due(19, 2), ["c"])
         self.assertFalse(index.has_due(19))

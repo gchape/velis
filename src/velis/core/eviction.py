@@ -1,11 +1,10 @@
 """Eviction policies: they order resident keys; Store owns values and capacity."""
 
 from collections import OrderedDict
-from dataclasses import dataclass, field
 from enum import StrEnum
+from heapq import heapify, heappop, heappush
+from itertools import count
 from typing import Protocol, assert_never
-
-from velis.validation import require_positive
 
 _EMPTY = "cannot evict from an empty store"
 
@@ -53,80 +52,51 @@ class LRU:
         return key
 
 
-@dataclass(slots=True, eq=False)
-class _Bucket:
-    """Keys sharing one access frequency, linked in a circular list."""
-
-    frequency: int
-    keys: OrderedDict[str, None] = field(
-        default_factory=OrderedDict[str, None], init=False
-    )
-    prev: _Bucket = field(init=False, repr=False)
-    next: _Bucket = field(init=False, repr=False)
-
-    def __post_init__(self) -> None:
-        self.prev = self.next = self
-
-
 class LFU:
-    """Evict the least frequently used key, oldest first within a frequency.
+    """Evict the least frequently used key, oldest access first within a frequency.
 
-    Buckets form a circular list around a sentinel of frequency 0, ordered by
-    ascending frequency, so the first bucket is always the lowest one and no
-    link is ever None. New keys start at frequency one; each later access adds
-    one, even when deletion has left gaps between buckets. Access, discard and
-    eviction are all O(1).
+    A min-heap of (frequency, tick, key) orders the candidates. Each access
+    pushes a new entry and leaves the old one behind; an entry is live only if
+    it matches the key's current record, and stale ones are skipped during
+    eviction. The heap is rebuilt once stale entries outnumber live ones, so
+    memory stays O(n). Access is O(log n), eviction amortized O(log n).
     """
 
     def __init__(self) -> None:
-        self._root = _Bucket(0)
-        self._buckets: dict[str, _Bucket] = {}
+        self._records: dict[str, tuple[int, int]] = {}
+        self._heap: list[tuple[int, int, str]] = []
+        self._ticks = count()
 
     def __len__(self) -> int:
-        return len(self._buckets)
+        return len(self._records)
 
     def __contains__(self, key: object) -> bool:
-        return key in self._buckets
+        return key in self._records
 
     def access(self, key: str) -> None:
-        current = self._buckets.get(key)
-        after, frequency = (
-            (self._root, 1) if current is None else (current, current.frequency + 1)
-        )
-        target = after.next
-        if target.frequency != frequency:
-            target = self._insert_after(after, frequency)
-        target.keys[key] = None
-        self._buckets[key] = target
-        if current is not None:
-            self._release(current, key)
+        frequency, _ = self._records.get(key, (0, 0))
+        record = (frequency + 1, next(self._ticks))
+        self._records[key] = record
+        heappush(self._heap, (*record, key))
+        self._compact()
 
     def discard(self, key: str) -> None:
-        if (bucket := self._buckets.pop(key, None)) is not None:
-            self._release(bucket, key)
+        self._records.pop(key, None)
+        self._compact()
 
     def evict(self) -> str:
-        lowest = self._root.next
-        assert lowest is not self._root, _EMPTY
-        key = next(iter(lowest.keys))
-        self.discard(key)
-        return key
+        assert self._records, _EMPTY
+        while True:
+            frequency, tick, key = heappop(self._heap)
+            if self._records.get(key) == (frequency, tick):
+                del self._records[key]
+                return key
 
-    @staticmethod
-    def _insert_after(node: _Bucket, frequency: int) -> _Bucket:
-        bucket = _Bucket(frequency)
-        bucket.prev, bucket.next = node, node.next
-        node.next.prev = bucket
-        node.next = bucket
-        return bucket
-
-    @staticmethod
-    def _release(bucket: _Bucket, key: str) -> None:
-        """Remove a key from its bucket, unlinking the bucket once empty."""
-        del bucket.keys[key]
-        if not bucket.keys:
-            bucket.prev.next = bucket.next
-            bucket.next.prev = bucket.prev
+    def _compact(self) -> None:
+        """Drop stale heap entries once they outnumber live ones."""
+        if len(self._heap) > 2 * len(self._records):
+            self._heap = [(f, t, k) for k, (f, t) in self._records.items()]
+            heapify(self._heap)
 
 
 _MAX_HITS = 3
@@ -136,19 +106,24 @@ _PROMOTE_HITS = 2
 class S3FIFO:
     """Filter new keys through a small FIFO before the main FIFO.
 
-    Queue targets use key counts: 10% small, 90% main, rounded to at least
-    one key each. Ghost history stores at most the main target's key count.
-    Store independently enforces its byte budget. Hits increment counters
-    capped at three without changing queue order. Two hits after insertion
-    qualify a small-queue key for promotion. A ghost hit enters main directly;
-    explicit deletion forgets both residency and ghost history. One eviction
-    removes exactly one key, though it may first promote several small entries.
+    Queue targets are ratios of the resident key count, not fixed sizes, so
+    they stay calibrated whether Store evicts on key count or on bytes: small
+    gets ``small_ratio`` of resident keys (at least one), main gets the rest.
+    Ghost history holds at most ``ghost_ratio`` of the resident count.
+    Hits increment counters capped at three without changing queue order. Two
+    hits after insertion qualify a small-queue key for promotion. A ghost hit
+    enters main directly; explicit deletion forgets both residency and ghost
+    history. One eviction removes exactly one key, though it may first promote
+    several small entries.
     """
 
-    def __init__(self, capacity: int) -> None:
-        require_positive(capacity=capacity)
-        self._small_limit = max(1, capacity // 10)
-        self._main_limit = max(1, capacity - self._small_limit)
+    def __init__(self, *, small_ratio: float = 0.1, ghost_ratio: float = 0.9) -> None:
+        if not 0 < small_ratio < 1:
+            raise ValueError(f"small_ratio must be in (0, 1), got {small_ratio}")
+        if ghost_ratio <= 0:
+            raise ValueError(f"ghost_ratio must be positive, got {ghost_ratio}")
+        self._small_ratio = small_ratio
+        self._ghost_ratio = ghost_ratio
         self._small: OrderedDict[str, int] = OrderedDict()
         self._main: OrderedDict[str, int] = OrderedDict()
         self._ghost: OrderedDict[str, None] = OrderedDict()
@@ -158,6 +133,18 @@ class S3FIFO:
 
     def __contains__(self, key: object) -> bool:
         return key in self._small or key in self._main
+
+    @property
+    def _small_limit(self) -> int:
+        return max(1, int(len(self) * self._small_ratio))
+
+    @property
+    def _main_limit(self) -> int:
+        return max(1, len(self) - self._small_limit)
+
+    @property
+    def _ghost_limit(self) -> int:
+        return max(1, int(len(self) * self._ghost_ratio))
 
     def access(self, key: str) -> None:
         if key in self._small:
@@ -211,7 +198,7 @@ class S3FIFO:
     def _remember(self, key: str) -> None:
         """Record an evicted key in the bounded ghost history."""
         self._ghost[key] = None
-        if len(self._ghost) > self._main_limit:
+        while len(self._ghost) > self._ghost_limit:
             self._ghost.popitem(last=False)
 
 
@@ -220,16 +207,13 @@ class EvictionPolicy(StrEnum):
     LFU = "lfu"
     S3_FIFO = "s3-fifo"
 
-    def create(self, *, max_keys: int) -> Eviction:
+    def create(self) -> Eviction:
         match self:
             case EvictionPolicy.LRU:
                 return LRU()
             case EvictionPolicy.LFU:
                 return LFU()
             case EvictionPolicy.S3_FIFO:
-                return S3FIFO(max_keys)
+                return S3FIFO()
             case _:
                 assert_never(self)
-
-
-DEFAULT_EVICTION_POLICY = EvictionPolicy.S3_FIFO

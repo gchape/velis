@@ -4,14 +4,19 @@ from unittest.mock import Mock, patch
 
 from tests.helpers import RecordingSubscriber
 from velis import __main__ as cli
-from velis.app import DEFAULT_SWEEP_INTERVAL_MS, build_engine
-from velis.core.broker import DEFAULT_BROKER_LIMITS, BrokerLimits
+from velis.app import build_engine
+from velis.config import (
+    DEFAULT_MAX_SUBSCRIPTIONS,
+    DEFAULT_SERVER_LIMITS,
+    DEFAULT_STORE_LIMITS,
+    DEFAULT_SWEEP_INTERVAL_MS,
+    ServerLimits,
+    StoreLimits,
+)
 from velis.core.engine import Engine
 from velis.core.eviction import EvictionPolicy
 from velis.core.messages import Get, Nil, Set, Subscribe, Value
-from velis.core.store import DEFAULT_STORE_LIMITS, StoreLimits
 from velis.errors import CapacityError
-from velis.net.server import DEFAULT_SERVER_LIMITS, ServerLimits
 
 
 class CLITests(unittest.TestCase):
@@ -37,7 +42,7 @@ class CLITests(unittest.TestCase):
         options = self.serve.call_args.kwargs
         return build_engine(
             store_limits=options["store_limits"],
-            broker_limits=options["broker_limits"],
+            max_subscriptions=options["max_subscriptions"],
         )
 
     def test_unset_environment_preserves_component_defaults(self) -> None:
@@ -45,7 +50,7 @@ class CLITests(unittest.TestCase):
         self.serve.assert_called_once_with(
             DEFAULT_SERVER_LIMITS,
             store_limits=DEFAULT_STORE_LIMITS,
-            broker_limits=DEFAULT_BROKER_LIMITS,
+            max_subscriptions=DEFAULT_MAX_SUBSCRIPTIONS,
             sweep_interval_ms=DEFAULT_SWEEP_INTERVAL_MS,
         )
         self.main.assert_called_once_with(self.run_looptime)
@@ -139,7 +144,7 @@ class CLITests(unittest.TestCase):
         self.serve.assert_called_once_with(
             ServerLimits(host="localhost", port=0, max_buffer=16, max_connections=2),
             store_limits=StoreLimits(max_keys=1, max_bytes=4),
-            broker_limits=BrokerLimits(max_subscriptions=1),
+            max_subscriptions=1,
             sweep_interval_ms=7,
         )
         subscriber = RecordingSubscriber()
@@ -160,6 +165,10 @@ class CLITests(unittest.TestCase):
             "VELIS_MAX_BUFFER",
             "VELIS_MAX_CONNECTIONS",
             "VELIS_MAX_SUBSCRIPTIONS",
+            "VELIS_SWEEP_MS",
+            "VELIS_MAX_PENDING_REQUESTS",
+            "VELIS_MAX_PENDING_MESSAGES",
+            "VELIS_MAX_PENDING_BYTES",
         ):
             for value in ("0", "-1", "invalid"):
                 with (
@@ -169,6 +178,8 @@ class CLITests(unittest.TestCase):
                 ):
                     cli.main()
         self.run_loop.assert_not_called()
+        self.logging.assert_not_called()
+        self.serve.assert_not_called()
 
     def test_environment_rejects_invalid_ports(self) -> None:
         for value in ("-1", "65536", "invalid"):

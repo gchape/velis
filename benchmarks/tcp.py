@@ -23,12 +23,12 @@ from pathlib import Path
 from time import perf_counter
 
 from velis.app import serve
+from velis.config import DEFAULT_STORE_LIMITS, ServerLimits
 from velis.core.broker import Broker
 from velis.core.engine import Engine
 from velis.core.messages import NIL, OK, Get, Set, Value
-from velis.core.store import DEFAULT_STORE_LIMITS, Store
+from velis.core.store import Store
 from velis.net.protocol import encode_command, encode_message
-from velis.net.server import ServerLimits
 
 KEY_COUNT = 10_000
 

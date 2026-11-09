@@ -3,34 +3,14 @@
 import asyncio
 import contextlib
 from collections import deque
-from dataclasses import dataclass
 from typing import Protocol, Self
 
+from velis.config import DEFAULT_SESSION_LIMITS, SessionLimits
 from velis.core.messages import Command, Err, Message, Reply
 from velis.errors import ProtocolError
 from velis.net import protocol
-from velis.validation import require_positive
 
 _CLOSED = "connection closed"
-
-
-@dataclass(frozen=True, slots=True)
-class SessionLimits:
-    """Bounds on in-flight requests and on messages the caller has not read."""
-
-    max_pending_requests: int = 128
-    max_pending_messages: int = 1024
-    max_pending_bytes: int = 8 << 20
-
-    def __post_init__(self) -> None:
-        require_positive(
-            max_pending_requests=self.max_pending_requests,
-            max_pending_messages=self.max_pending_messages,
-            max_pending_bytes=self.max_pending_bytes,
-        )
-
-
-DEFAULT_SESSION_LIMITS = SessionLimits()
 
 
 class _MessageBuffer:

@@ -3,6 +3,7 @@
 from types import TracebackType
 from typing import Self, final
 
+from velis.config import DEFAULT_SESSION_LIMITS, SessionLimits
 from velis.core.messages import (
     MISSING,
     NO_EXPIRY,
@@ -29,7 +30,7 @@ from velis.core.messages import (
     Value,
 )
 from velis.errors import CommandError, ProtocolError
-from velis.net.session import DEFAULT_SESSION_LIMITS, Session, SessionLimits, TCPSession
+from velis.net.session import Session, TCPSession
 
 
 def _unexpected(command: Command, reply: Reply) -> ProtocolError:

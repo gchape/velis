@@ -5,14 +5,15 @@ from unittest.mock import AsyncMock, MagicMock, Mock, patch
 from tests.helpers import ManualClock
 from velis import __main__ as cli
 from velis.app import _maintain, serve
+from velis.config import ServerLimits
 from velis.core.broker import Broker
 from velis.core.engine import Engine
 from velis.core.store import Store
-from velis.net.server import ServerLimits, TCPServer
+from velis.net.server import TCPServer
 
 
 class RuntimeTests(unittest.IsolatedAsyncioTestCase):
-    async def test_maintenance_continues_after_a_round_only_discarding_stale_ticks(
+    async def test_maintenance_skips_stale_deadlines_without_extra_yields(
         self,
     ) -> None:
         clock = ManualClock()
@@ -26,7 +27,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         store.expire("due", 1002)
         clock.advance(1002)
         intervals = 0
-        snapshots: list[bool] = []
+        snapshots: list[int] = []
 
         async def wait(delay: float) -> None:
             nonlocal intervals
@@ -35,15 +36,15 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
                 if intervals == 2:
                     raise asyncio.CancelledError
             else:
-                snapshots.append("due" in store._entries)
+                snapshots.append(len(store))
 
         with (
             patch("velis.app.asyncio.sleep", side_effect=wait),
             self.assertRaises(asyncio.CancelledError),
         ):
             await _maintain(Engine(store, Broker()), 60)
-        self.assertEqual(snapshots, [True])
-        self.assertNotIn("due", store._entries)
+        self.assertEqual(snapshots, [])
+        self.assertEqual(store.stats().expirations, 1)
         self.assertEqual(len(store), 1001)
         self.assertFalse(store.has_due_expirations)
 

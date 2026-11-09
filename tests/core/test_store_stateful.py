@@ -31,7 +31,7 @@ class StoreMachine(RuleBasedStateMachine):
             max_keys=capacity, max_bytes=max_bytes, eviction_policy=policy
         )
         self.store = Store(self.clock, limits=self.limits)
-        self.policy = self.store._eviction
+        self.policy = self.store._inner._inner._policy
         self.model: dict[str, tuple[bytes, int | None]] = {}
 
     def purge(self, key: str) -> None:

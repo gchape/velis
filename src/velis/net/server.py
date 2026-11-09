@@ -2,38 +2,13 @@
 
 import asyncio
 import logging
-from dataclasses import dataclass
 from typing import Self
 
+from velis.config import ServerLimits
 from velis.core.engine import Engine
 from velis.net.connection import Connection
-from velis.validation import require_positive
 
 log = logging.getLogger(__name__)
-DEFAULT_HOST = "127.0.0.1"
-DEFAULT_PORT = 9000
-DEFAULT_MAX_BUFFER = 8 << 20
-DEFAULT_MAX_CONNECTIONS = 1024
-
-
-@dataclass(frozen=True, slots=True)
-class ServerLimits:
-    """Validated TCP listener, connection and subscriber buffer settings."""
-
-    host: str = DEFAULT_HOST
-    port: int = DEFAULT_PORT
-    max_buffer: int = DEFAULT_MAX_BUFFER
-    max_connections: int = DEFAULT_MAX_CONNECTIONS
-
-    def __post_init__(self) -> None:
-        if not 0 <= self.port <= 65535:
-            raise ValueError(f"invalid port: {self.port}")
-        require_positive(
-            max_buffer=self.max_buffer, max_connections=self.max_connections
-        )
-
-
-DEFAULT_SERVER_LIMITS = ServerLimits()
 
 
 class TCPServer:

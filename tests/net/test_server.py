@@ -6,7 +6,7 @@ from unittest.mock import Mock, patch
 from tests.helpers import ManualClock
 from tests.net.helpers import make_connection
 from velis.app import serve
-from velis.core.broker import Broker, BrokerLimits
+from velis.core.broker import Broker
 from velis.core.engine import Engine
 from velis.core.eviction import EvictionPolicy
 from velis.core.messages import Err, Message, Subscribe
@@ -250,7 +250,7 @@ class RuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
             serve(
                 ServerLimits("127.0.0.1", 0),
                 store_limits=StoreLimits(max_keys=1, max_bytes=4),
-                broker_limits=BrokerLimits(max_subscriptions=1),
+                max_subscriptions=1,
             ) as server,
             await Client.connect("127.0.0.1", server.port) as client,
         ):

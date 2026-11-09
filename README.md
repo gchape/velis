@@ -24,6 +24,7 @@ Velis is a lightweight in-memory key-value store with TTL expiration, pub-sub, a
 - [Project layout](#project-layout)
 - [Development](#development)
 - [Benchmarks](#benchmarks)
+  - [Expiration index selection](#expiration-index-selection)
   - [In-process operations](#in-process-operations)
   - [Local TCP GET](#local-tcp-get)
   - [Local TCP pub-sub](#local-tcp-pub-sub)
@@ -37,7 +38,7 @@ Velis is a lightweight in-memory key-value store with TTL expiration, pub-sub, a
 | Area | Description |
 | --- | --- |
 | **Store** | `GET` / `SET` / `DEL` / `EXPIRE` / `TTL` / `PERSIST` on opaque `bytes` values, with key-count and byte limits. Single-owner, so no locks. |
-| **TTL** | Exact monotonic deadlines, a hierarchical timing wheel, lazy read expiry and bounded background sweeps. |
+| **TTL** | Exact monotonic deadlines, an indexed binary heap, lazy read expiry and bounded background sweeps. |
 | **Pub-sub** | `SUBSCRIBE` / `UNSUBSCRIBE` / `PUBLISH`. At-most-once delivery to connected subscribers on one server. Slow network connections are disconnected when their server write buffer exceeds the configured limit. |
 | **Network** | Length-prefixed binary protocol over TCP, bounded pipelining with ordered replies, an asyncio server and an async `Client`. |
 | **Codecs** | Typed `CompositeCodec`s for payload transforms, wire serialization and validation. Stored values remain opaque bytes. |
@@ -134,7 +135,7 @@ flowchart TB
 
     subgraph core ["velis.core: no sockets or wire format"]
         engine["Engine<br/>execute command and return reply"]
-        store["Store<br/>opaque bytes and TTL wheel"]
+        store["Store<br/>opaque bytes and TTL heap"]
         broker["Broker<br/>channel membership"]
     end
 
@@ -170,7 +171,7 @@ Commands and replies are plain frozen dataclasses (`velis.core.messages`). `net/
 
 ### Request lifecycle
 
-Cache mutations only change memory. The store validates the TTL range and raises `CommandError` for invalid TTLs without changing existing values or deadlines. The engine lets command errors reach the transport, which replies with `ERR` and keeps the connection open. The store owns its monotonic clock and delegates timer scheduling, cancellation and bounded sweeps to `TimingWheel`. System wall-clock adjustments do not change TTL duration.
+Cache mutations only change memory. The store validates the TTL range and raises `CommandError` for invalid TTLs without changing existing values or deadlines. The engine lets command errors reach the transport, which replies with `ERR` and keeps the connection open. The store owns its monotonic clock and delegates timer scheduling, cancellation and bounded sweeps to `IndexedBinaryHeap`. System wall-clock adjustments do not change TTL duration.
 
 `SET` clears any previous TTL. `EXPIRE` returns `NIL` for a missing or already expired key, so it cannot revive expired data. A zero TTL expires a live key immediately. Accepted TTLs are between `0` and `2**62` milliseconds, inclusive.
 
@@ -308,11 +309,11 @@ async def embedded() -> None:
 
 Maintenance runs in a task group owned by `serve()`. An unexpected sweep failure interrupts the active runtime scope and closes the server. Worker and caller failures are reported in an `ExceptionGroup` after cleanup; external cancellation remains `CancelledError`. Normal shutdown cancels and awaits maintenance before closing the server. Client disconnections remain local to their connections.
 
-One task starts sweeping expired keys every `VELIS_SWEEP_MS`. Each round processes at most 1,000 timers, counting both expiration and moves from coarse buckets into finer buckets. While ready buckets remain, maintenance yields to the event loop and runs another round without waiting for the next interval. A round that only moves future timers still allows the next round to process a due backlog.
+One task starts sweeping expired keys every `VELIS_SWEEP_MS`. Each round removes at most 1,000 due keys. While due deadlines remain, maintenance yields to the event loop and runs another round without waiting for the next interval.
 
-`TimingWheel` uses sparse levels with 64 slots each: the base level has 1 ms slots, and each following level spans 64 times more time. Levels grow to cover the full supported TTL range. Advancing across a long pause examines at most 64 slots per level instead of every elapsed millisecond. Ready buckets are drained within the timer budget. The original millisecond deadline is checked before a key is removed, so coarse buckets never expire values early. Reads also check exact deadlines independently of maintenance.
+`IndexedBinaryHeap` is the sole expiration scheduler. A min-heap orders exact millisecond deadlines, and a dictionary maps each key to its heap entry and position. Deadline lookup and readiness checks take expected constant time; insertion, rescheduling and cancellation repair at most one logarithmic heap path. A sweep removing up to `limit` keys costs O(limit × log n). Equal deadlines have no guaranteed key order. Reads also check exact deadlines independently of maintenance.
 
-Each key owns one scheduled timer. Replacing a TTL, `SET`, `PERSIST`, deletion and eviction unlink the previous timer immediately, including from partly drained buckets. The wheel has no stale timer accumulation or full-index compaction. Bucket advancement is bounded by the number of wheel levels and slots; timer processing is bounded by the sweep limit. An individual command or publication can still take more CPU time than a scheduling quantum.
+Each key owns one timer. Replacing a TTL updates its entry in place; `SET`, `PERSIST`, deletion and eviction cancel the old timer immediately. There are no stale timers, bucket cascades or full-index compactions. Clock jumps require no traversal of elapsed time. The indexed heap replaces the timing wheel because it handles arbitrary deadlines without depending on clustering and stores one entry per live timer. Python containers can retain allocated capacity after mass cancellation. Allocation, dictionary resizing, garbage collection and OS scheduling still affect operation duration; sweep limits do not impose a hard wall-clock bound.
 
 ---
 
@@ -367,21 +368,23 @@ Request keys contain 1–512 characters and request channels contain 1–256 cha
 
 The cache is entirely in memory. Keys and TTLs are discarded on restart. There is no cache WAL, recovery or compaction.
 
-The default store retains at most 100,000 keys and 64 MiB of UTF-8 key plus encoded value bytes. The byte budget excludes Python object overhead; the key-count limit also bounds entry metadata. Expired entries count until cleanup removes them. The default `lru` policy evicts the least recently used entries to make room when either limit is reached. Select `reject` explicitly to reject writes that exceed the limits while retaining live entries. Rejected replacements preserve the previous value and TTL; successful replacements clear the TTL. A capacity error produces `ERR` and keeps the connection usable. Direct `Store` and `Broker` callers receive `CapacityError`, a `CommandError` subclass.
+The default store retains at most 100,000 keys and 64 MiB of UTF-8 key plus encoded value bytes. The byte budget excludes Python object overhead; the key-count limit bounds resident entry metadata. Expired entries count until cleanup removes them. The default `s3-fifo` policy evicts entries to make room when either limit is reached. A value whose key plus payload exceeds the entire byte budget is rejected before changing existing values or deadlines. Successful replacements clear the TTL. A capacity error produces `ERR` and keeps the connection usable. Direct `Store` and `Broker` callers receive `CapacityError`, a `CommandError` subclass.
 
-Select a built-in eviction policy with `VELIS_EVICTION_POLICY` or `Store(limits=StoreLimits(eviction_policy=EvictionPolicy.LRU))` for direct embedding. `StoreLimits` lives in `velis.core.store`; import `EvictionPolicy` from `velis.core.eviction`. Pass store settings through `limits=StoreLimits(...)`; the policy is normalized to an enum value:
+Select one of three eviction policies with `VELIS_EVICTION_POLICY` or `Store(limits=StoreLimits(eviction_policy=EvictionPolicy.LRU))` for direct embedding. `StoreLimits` lives in `velis.core.store`; import `EvictionPolicy` from `velis.core.eviction`. Policy strings are normalized to enum values:
 
 | Policy | Behavior when full |
 | --- | --- |
-| `lru` (default) | Evict the least recently used entry. |
-| `reject` | Reject the write without evicting values. |
-| `fifo` | Evict the oldest inserted entry; reads do not change its position. |
+| `s3-fifo` (default) | Filter new keys through a small FIFO; retain reused keys in a main FIFO and remember recent probationary evictions in a bounded ghost queue. |
+| `lru` | Evict the least recently used entry. |
 | `lfu` | Evict the least frequently accessed entry, breaking ties by least recent access. |
-| `random` | Evict a uniformly random entry. |
 
-Eviction may remove several entries to fit the byte budget. Each victim's deadline and cached entry size are removed together. An entry whose own UTF-8 key plus value exceeds the entire byte budget is rejected before any eviction, preserving existing values and TTLs. Under capacity pressure, every policy, including `reject`, performs one bounded expiry sweep when due entries exist before making room or refusing the write. Remaining expired entries are reclaimed by later reads or maintenance. `GET` reads and successful `SET` operations update the selected policy; TTL inspection and expiry changes do not count as accesses. LRU moves accessed keys to the newest end. LFU uses linked frequency buckets for constant-time access, deletion and victim selection, including when deletions leave gaps between frequencies. `reject` raises `CapacityError("store limit exceeded")` when a write cannot fit. Store owns values, capacity, byte accounting and TTL removal; eviction policies only track candidate keys.
+S3-FIFO follows the [SOSP 2023 paper's queue and counter rules](https://www.cs.cmu.edu/~rvinayak/papers/s3-fifo-sosp-2023-fifo-queues-are-all-you-need-for-cache-eviction.pdf). New keys enter the small queue unless ghost history places them directly in the main queue. Resident accesses increment a counter capped at three without moving the key. Small-queue keys with more than one reuse are promoted, with their counters reset; others enter ghost history. Main-queue eviction reinserts keys with remaining credit, decrementing the counter each time.
 
-Running `uv run velis` uses LRU by default. To retain entries and reject writes when full, use `VELIS_EVICTION_POLICY=reject uv run velis`. Choose `fifo`, `lfu` or `random` with the same environment variable. The former `sieve` and `rr` settings are unsupported.
+In Velis, queue targets use **key counts**: the small target is `max(1, max_keys // 10)`, and the main target is `max(1, max_keys - small_target)`. Ghost history retains at most `main_target` keys and no values. It adds Python metadata and retained key strings outside `stored_bytes`. These are eviction targets, not reserved partitions: queues borrow unused space, and the store independently enforces both total limits. With variable-sized values or very small caches, behavior can differ from the paper's equal-sized-object model. A single S3-FIFO eviction step can remove multiple residents while promoting entries and trimming the main queue.
+
+Eviction may remove several entries to fit the byte budget. Every victim's timer, cached size and resident policy metadata are removed together; S3-FIFO retains only its bounded ghost history. Explicit deletion and TTL expiry remove resident policy metadata without adding ghost entries. Under capacity pressure, every policy performs one bounded expiry sweep before evicting live entries. Remaining expired entries are reclaimed by later reads or maintenance. `GET` hits and successful `SET` operations count as accesses; a new S3-FIFO entry starts with zero reuse credit, while a replacement increments it. TTL inspection and expiry changes do not count as accesses. LFU uses linked frequency buckets for constant-time access, deletion and victim selection, including after deletions leave gaps between frequencies. Store owns values, capacity, byte accounting and TTL removal.
+
+Running `uv run velis` uses S3-FIFO by default. Choose LRU with `VELIS_EVICTION_POLICY=lru uv run velis`, or use `lfu`. The former `fifo`, `random`, `reject`, `sieve` and `rr` settings are unsupported. S3-FIFO can resist scan pollution, but our synthetic comparisons also showed workloads where LRU had a higher hit rate; the default is not a claim that one policy wins every workload.
 
 Each connection can subscribe to at most 1,024 channels by default. Repeating an existing subscription uses no extra capacity; unsubscribing frees a slot. The listener admits at most 1,024 active connections by default. Excess connections receive a best-effort `ERR` and are closed, leaving admitted clients usable.
 
@@ -405,7 +408,7 @@ Unknown log levels, ports outside `0–65535`, nonpositive limits or sweep inter
 | `VELIS_MAX_BUFFER` | `8388608` (8 MiB) | Server write buffer limit checked when pushing a message. Must be positive; allow room for both the channel and payload plus framing. |
 | `VELIS_MAX_KEYS` | `100000` | Maximum retained cache keys; the eviction policy controls behavior when full. |
 | `VELIS_MAX_BYTES` | `67108864` (64 MiB) | Maximum retained UTF-8 key plus encoded value bytes; excludes Python object overhead. |
-| `VELIS_EVICTION_POLICY` | `lru` | One of `lru`, `fifo`, `lfu`, `random`, `reject`; applies to both key-count and byte pressure. |
+| `VELIS_EVICTION_POLICY` | `s3-fifo` | One of `s3-fifo`, `lru`, `lfu`; applies to both key-count and byte pressure. |
 | `VELIS_MAX_CONNECTIONS` | `1024` | Maximum admitted TCP connections; excess connections are closed after a best-effort error. |
 | `VELIS_MAX_SUBSCRIPTIONS` | `1024` | Maximum distinct channels per subscriber connection. |
 | `VELIS_SWEEP_MS` | `100` | Milliseconds between expiry sweeps; must be positive. |
@@ -576,8 +579,8 @@ src/velis/
     messages.py — Command / Reply / Message dataclasses and TTL sentinels
     engine.py — command dispatch and replies
     store.py — StoreLimits, capacity and centralized removal bookkeeping
-    eviction.py — EvictionPolicy and LRU, FIFO, LFU, random and reject policies
-    timing_wheel.py — hierarchical timing wheel and bounded timer processing
+    eviction.py — EvictionPolicy and S3-FIFO (default), LRU and LFU policies
+    indexed_heap.py — indexed binary heap with exact deadlines and eager cancellation
     broker.py — membership, Publication caching and the Subscriber protocol
     clock.py — structural Clock protocol and MonotonicClock implementation
   net/
@@ -623,31 +626,40 @@ The core is deliberately easy to test without sockets or real time: the `Store` 
 
 ## Benchmarks
 
+### Expiration index selection
+
+A comparison on 2026-11-09 used CPython 3.15.2 on an AMD Ryzen 5 7535HS, pinned to logical CPU 0. Inputs used seed 47, one warm-up and three measured trials per configuration; garbage collection remained enabled. The following are median scheduling rates at 100,000 timers. Memory is separately traced index metadata, excluding preallocated input keys and deadlines, not process RSS.
+
+| Deadline distribution | Index | Million schedules/s | Metadata, MiB |
+| --- | --- | ---: | ---: |
+| Scattered | Indexed binary heap | 1.147 | 12.79 |
+| Scattered | Grouped-deadline heap | 0.785 | 35.32 |
+| 64 shared timestamps | Indexed binary heap | 1.257 | 12.79 |
+| 64 shared timestamps | Grouped-deadline heap | 3.022 | 6.85 |
+
+The indexed heap is the general-purpose choice: its performance and memory do not rely on shared deadlines. Grouping can win when exact deadlines cluster, but equal TTL durations alone do not guarantee shared timestamps. These synthetic measurements do not establish the distribution of application TTLs. The comparison implementations, runner and raw artifacts were removed after selection; correctness coverage for the retained heap lives in `tests/core/test_indexed_heap.py`.
+
+### Historical store and network measurements
+
 Measured on 2026-11-08 with CPython 3.15.2, Linux x86-64 and an AMD Ryzen 5 7535HS with Radeon Graphics. The process could use 12 logical CPUs and was not pinned. TCP clients, subscribers and server shared one `_UnixSelectorEventLoop` event loop in one process; asyncio debug mode was disabled.
 
-These are historical measurements from before the current refactors. The benchmark runner and raw results have since been removed; the SIEVE rows describe the former implementation.
+These are historical measurements from before the current refactors. The benchmark runner and raw results have since been removed; these rows describe the earlier LRU implementation.
 
 Each measured workload ran once for warm-up and five times for measurement. Setup, prefill and teardown were outside the timers. Full garbage collection ran before each trial and stayed enabled during measurement. Rates below are medians; ranges are the observed minimum and maximum trial rates. These ranges are not confidence intervals. Latency percentiles use nearest ranks within each trial, then the median percentile across the five trials.
 
 ### In-process operations
 
-Store and timing-wheel trials each performed 100,000 operations. Store workloads used 4,096 resident keys and 256-byte values: GET was a 100% hit workload, while SET inserted new keys into a full store, forcing eviction. Input keys and the shared value buffer were prepared before timing. These rates include the Python benchmark loops.
+Store trials each performed 100,000 operations. Store workloads used 4,096 resident keys and 256-byte values: GET was a 100% hit workload, while SET inserted new keys into a full store, forcing eviction. Input keys and the shared value buffer were prepared before timing. These rates include the Python benchmark loops.
 
-Wheel scheduling used deadlines from 1 to 4,096 ms; rescheduling moved existing timers to 4,097–8,192 ms. Expiration advanced to 4,096 ms and drained the already-due timers with a 1,000-timer sweep budget. The wire case encoded and decoded a complete 256-byte SET frame 100,000 times.
+The wire case encoded and decoded a complete 256-byte SET frame 100,000 times.
 
 | Workload | Median operations/s | Observed trial range |
 | --- | ---: | ---: |
 | LRU GET hit | 4,601,404 | 3,132,609–4,620,892 |
-| SIEVE GET hit | 4,866,344 | 4,466,379–4,990,157 |
 | LRU SET with eviction | 730,182 | 670,524–759,129 |
-| SIEVE SET with eviction | 598,101 | 564,134–627,778 |
-| Wheel schedule | 1,072,427 | 956,855–1,138,522 |
-| Wheel reschedule | 911,363 | 842,927–924,509 |
-| Wheel cancel | 4,790,499 | 4,290,031–5,159,566 |
-| Wheel expire | 2,681,926 | 2,425,687–2,830,538 |
 | Wire SET encode + decode | 212,825 | 208,167–220,904 |
 
-One codec round-trip counts as one operation, including both encoding and decoding. SIEVE had higher hot-key read throughput in this run, while LRU handled eviction writes faster. This workload does not measure cache hit quality or justify changing the default policy.
+One codec round-trip counts as one operation, including both encoding and decoding. This workload does not measure cache hit quality or compare the current eviction policies.
 
 ### Local TCP GET
 
@@ -661,7 +673,6 @@ Each trial read 5,000 values from 1,024 prefilled keys over one client connectio
 | LRU | 1 KiB | 1 | 14,606 | 14,485–14,768 | 63.1 | 89.9 | 110.3 |
 | LRU | 1 KiB | 32 | 29,297 | 28,821–30,523 | 839.7 | 1,028.1 | 1,275.4 |
 | LRU | 1 KiB | 128 | 31,816 | 27,752–31,929 | 3,155.1 | 3,659.3 | 3,851.8 |
-| SIEVE | 1 KiB | 32 | 31,286 | 31,063–31,415 | 787.5 | 916.8 | 959.3 |
 
 ### Local TCP pub-sub
 
@@ -693,6 +704,6 @@ These are local measurements of this implementation and harness, with CPU freque
 - [x] Bounded ordered pipelining with cancellation-safe reply handling.
 - [ ] Pub-sub message replication between servers, independent of cache state.
 - [x] Connection and memory limits.
-- [x] Built-in LRU (default), FIFO, LFU, random and strict-capacity reject mode.
+- [x] Built-in S3-FIFO (default), LRU and LFU eviction policies.
 - [ ] Built-in encryption codec to compose with `CompositeCodec`.
 - [ ] Authentication and TLS.

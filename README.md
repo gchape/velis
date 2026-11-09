@@ -484,8 +484,10 @@ Prefer direct stdlib APIs and clear ownership over custom infrastructure or smal
 Run the current server's TCP benchmark from the repository root:
 
 ```bash
-uv run python benchmarks/tcp.py
+make bench
 ```
+
+Pass benchmark options with `BENCH_ARGS`, for example `make bench BENCH_ARGS="--pipeline 64 1024 --repeats 3"`. To save the JSON output, invoke `uv run python benchmarks/tcp.py > results.json` directly; benchmark progress goes to stderr.
 
 The benchmark starts the real Store, Broker and TCP runtime in a separate process, with the default S3-FIFO policy, capacity limits and 100 ms maintenance interval. One load-generator process uses one localhost connection per sample. Requests are encoded before timing; every reply is validated inside the timed interval. Connection setup and warmup are excluded.
 

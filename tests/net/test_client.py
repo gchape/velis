@@ -351,6 +351,20 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
             await self.client.get("key")
         self.writer.close.assert_called_once()
 
+    async def test_unexpected_write_failure_cannot_leave_an_unsent_pending_request(
+        self,
+    ) -> None:
+        self.writer.write.side_effect = RuntimeError("write after EOF")
+        with self.assertRaisesRegex(RuntimeError, "write after EOF"):
+            await self.client.get("unsent")
+        self.assertTrue(self.session._pending.empty())
+        self.assertTrue(self.session._reader_task.done())
+        self.writer.close.assert_called_once()
+        self.writer.write.side_effect = None
+        with self.assertRaises(ConnectionError):
+            await self.client.get("later")
+        self.writer.write.assert_called_once()
+
     async def test_write_failure_closes_and_fails_other_pending_requests(self) -> None:
         pending = asyncio.create_task(self.client.get("first"))
         await asyncio.sleep(0)

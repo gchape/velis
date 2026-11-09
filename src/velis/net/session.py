@@ -172,6 +172,8 @@ class TCPSession:
         request keeps its slot until its reply arrives or the session closes,
         bounding bookkeeping for cancelled requests if the peer stops replying.
         Cancellation abandons the reply without closing the stream.
+        Other I/O failures close the session to preserve reply ordering when
+        a write leaves an unsent waiter or a partial frame.
         """
         frame = protocol.encode_command(command)
         waiter: asyncio.Future[Reply] = asyncio.get_running_loop().create_future()
@@ -182,7 +184,7 @@ class TCPSession:
             return await waiter
         except asyncio.QueueShutDown as exc:
             raise ConnectionError(self._close_reason) from exc
-        except OSError:
+        except Exception:
             await self.close()
             raise
         finally:

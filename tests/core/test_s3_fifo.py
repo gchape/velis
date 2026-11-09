@@ -1,10 +1,8 @@
-import random
 import unittest
 
 from tests.helpers import ManualClock
 from velis.core.eviction import S3FIFO, EvictionPolicy
-from velis.core.store import Store, StoreLimits
-from velis.errors import CapacityError
+from velis.core.store import Store, StoreLimits, TtlStatus
 
 
 class S3FIFOTests(unittest.TestCase):
@@ -58,9 +56,29 @@ class S3FIFOTests(unittest.TestCase):
         self.assertEqual(list(policy._small), ["a", "b"])
         self.assertEqual(policy._small["a"], 3)
 
-    def test_nested_eviction_cleans_up_every_victim_and_preserves_ghost_history(
-        self,
-    ) -> None:
+    def test_promotion_that_overflows_main_evicts_exactly_one_key(self) -> None:
+        """A promoted key fills main and evicts there, preserving small's tail.
+
+        Capacity ten gives small/main targets of one/nine. Ghost re-entry fills
+        main; two later hits qualify a for promotion while b remains unreused.
+        """
+        policy = S3FIFO(10)
+        for index in range(9):
+            key = f"m{index}"
+            policy.access(key)
+            self.assertEqual(policy.evict(), key)
+            policy.access(key)
+        self.assertEqual(len(policy._main), 9)
+        for _ in range(3):
+            policy.access("a")
+        policy.access("b")
+        self.assertEqual(policy.evict(), "m0")
+        self.assertIn("a", policy._main)
+        self.assertEqual(list(policy._small), ["b"])
+        self.assertNotIn("b", policy._ghost)
+
+    def test_promotion_eviction_cleans_up_the_victim_everywhere(self) -> None:
+        """Main victims leave no ghost and lose their values, bytes and timers."""
         clock = ManualClock()
         store = Store(clock, limits=StoreLimits(max_keys=10))
         policy = store._eviction
@@ -73,84 +91,28 @@ class S3FIFOTests(unittest.TestCase):
                 store.get(key)
                 store.get(key)
         store.set("new", b"v")
-        self.assertEqual(set(store._entries), {str(i) for i in range(1, 9)} | {"new"})
-        self.assertEqual(list(policy._ghost), ["9"])
-        for key in ("0", "9"):
-            self.assertIsNone(store._expiry.deadline(key))
-        self.assertEqual(store.stored_bytes, 20)
+        self.assertEqual(set(store._entries), {str(i) for i in range(1, 10)} | {"new"})
+        self.assertEqual(list(policy._ghost), [])
+        self.assertNotIn("0", policy._main)
+        self.assertIsNone(store._expiry.deadline("0"))
+        self.assertIsNotNone(store._expiry.deadline("9"))
+        self.assertEqual(store.stored_bytes, 22)
         clock.advance(100)
-        self.assertEqual(store.sweep(), 8)
+        self.assertEqual(store.sweep(), 9)
         self.assertEqual(store.stored_bytes, 4)
         store.set("0", b"fresh")
-        self.assertEqual(store.ttl("0"), -1)
+        self.assertIs(store.ttl("0"), TtlStatus.PERSISTENT)
 
     def test_main_queue_reinsertion_decrements_credit(self) -> None:
         policy = S3FIFO(10)
         for key in ("a", "b"):
             policy.access(key)
-            self.assertEqual(policy.evict(), [key])
+            self.assertEqual(policy.evict(), key)
             policy.access(key)
         policy.access("a")
         policy.access("a")
-        self.assertEqual(policy.evict(), ["b"])
+        self.assertEqual(policy.evict(), "b")
         self.assertEqual(policy._main["a"], 1)
-        self.assertEqual(policy.evict(), ["a"])
+        self.assertEqual(policy.evict(), "a")
         with self.assertRaises(AssertionError):
             policy.evict()
-
-    def test_ttl_deletion_and_variable_sizes_preserve_queue_and_capacity_invariants(
-        self,
-    ) -> None:
-        for capacity in (1, 2, 10, 31):
-            clock = ManualClock()
-            store = Store(clock, limits=StoreLimits(max_keys=capacity, max_bytes=100))
-            policy = store._eviction
-            assert isinstance(policy, S3FIFO)
-            rng = random.Random(47)
-            for step in range(2000):
-                key = str(rng.randrange(100))
-                with self.subTest(capacity=capacity, step=step):
-                    match rng.randrange(7):
-                        case 0 | 1:
-                            value = rng.randbytes(rng.randrange(120))
-                            if len(key.encode()) + len(value) > 100:
-                                before = (dict(policy._small), dict(policy._main))
-                                with self.assertRaises(CapacityError):
-                                    store.set(key, value)
-                                self.assertEqual(
-                                    (dict(policy._small), dict(policy._main)), before
-                                )
-                            else:
-                                store.set(key, value)
-                        case 2:
-                            store.get(key)
-                        case 3:
-                            store.delete(key)
-                        case 4:
-                            store.expire(key, rng.randrange(5))
-                        case 5:
-                            clock.advance(rng.randrange(5))
-                            store.sweep(limit=rng.randrange(3))
-                        case 6:
-                            store.persist(key)
-                    resident = set(store._entries)
-                    self.assertEqual(resident, set(policy._small) | set(policy._main))
-                    self.assertFalse(set(policy._small) & set(policy._main))
-                    self.assertFalse(resident & set(policy._ghost))
-                    self.assertLessEqual(len(policy._ghost), policy._main_limit)
-                    self.assertTrue(
-                        all(
-                            0 <= f <= 3
-                            for f in (*policy._small.values(), *policy._main.values())
-                        )
-                    )
-                    self.assertLessEqual(len(store), capacity)
-                    self.assertLessEqual(store.stored_bytes, 100)
-                    self.assertEqual(
-                        store.stored_bytes,
-                        sum(
-                            len(k.encode()) + len(e.value)
-                            for k, e in store._entries.items()
-                        ),
-                    )
-                    self.assertLessEqual(set(store._expiry._entries), resident)

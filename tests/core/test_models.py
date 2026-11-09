@@ -2,10 +2,11 @@
 
 import random
 import unittest
+from collections import Counter
 
 from tests.helpers import ManualClock
 from velis.core.eviction import LFU, EvictionPolicy
-from velis.core.store import Store, StoreLimits
+from velis.core.store import Store, StoreLimits, TtlStatus
 from velis.errors import CapacityError
 
 
@@ -16,14 +17,14 @@ class ModelTests(unittest.TestCase):
         for seed in range(5):
             rng = random.Random(seed)
             actual = LFU()
-            counts: dict[str, int] = {}
+            counts: Counter[str] = Counter()
             accessed: dict[str, int] = {}
             for step in range(2000):
                 key = str(rng.randrange(12))
                 match rng.randrange(3):
                     case 0:
                         actual.access(key)
-                        counts[key] = counts.get(key, 0) + 1
+                        counts[key] += 1
                         accessed[key] = step
                     case 1:
                         actual.discard(key)
@@ -34,8 +35,7 @@ class ModelTests(unittest.TestCase):
                             counts, key=lambda item: (counts[item], accessed[item])
                         )
                         with self.subTest(seed=seed, step=step):
-                            self.assertEqual(actual.victim(), expected)
-                        actual.discard(expected)
+                            self.assertEqual(actual.evict(), expected)
                         del counts[expected]
                         del accessed[expected]
 
@@ -133,11 +133,11 @@ class ModelTests(unittest.TestCase):
                     case 7:
                         lazy_expire(key)
                         expected = (
-                            -2
+                            TtlStatus.MISSING
                             if key not in values
                             else deadlines[key] - clock.now_ms()
                             if key in deadlines
-                            else -1
+                            else TtlStatus.PERSISTENT
                         )
                         self.assertEqual(store.ttl(key), expected)
                 self.assertEqual(

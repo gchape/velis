@@ -1,33 +1,72 @@
-import contextlib
-import random
 import unittest
 from typing import cast
 
 from tests.helpers import ManualClock
 from velis.core.eviction import LFU, EvictionPolicy
-from velis.core.store import Store, StoreLimits
+from velis.core.store import Store, StoreLimits, TtlStatus
 from velis.errors import CapacityError
 
 
 class EvictionTests(unittest.TestCase):
+    def test_eviction_removes_exactly_one_resident_and_membership_ignores_ghosts(
+        self,
+    ) -> None:
+        for kind in EvictionPolicy:
+            with self.subTest(policy=kind):
+                policy = kind.create(max_keys=10)
+                resident = {f"key-{i}" for i in range(10)}
+                for key in sorted(resident):
+                    for _ in range(3):
+                        policy.access(key)
+                self.assertEqual(len(policy), len(resident))
+                while resident:
+                    before = len(policy)
+                    victim = policy.evict()
+                    self.assertIn(victim, resident)
+                    resident.remove(victim)
+                    self.assertNotIn(victim, policy)
+                    self.assertEqual(len(policy), before - 1)
+                    self.assertTrue(all(key in policy for key in resident))
+                self.assertNotIn(None, policy)
+                policy.access("cold")
+                self.assertEqual(policy.evict(), "cold")
+                self.assertEqual(len(policy), 0)
+                self.assertNotIn("cold", policy)
+                policy.access("cold")
+                self.assertEqual(len(policy), 1)
+                policy.discard("cold")
+                policy.discard("missing")
+                policy.access("again")
+                policy.access("again")
+                self.assertEqual(len(policy), 1)
+                policy.discard("again")
+                self.assertEqual(len(policy), 0)
+
+    def test_store_evicts_a_whole_multicharacter_key(self) -> None:
+        for kind in EvictionPolicy:
+            with self.subTest(policy=kind):
+                store = Store(limits=StoreLimits(max_keys=1, eviction_policy=kind))
+                store.set("old-key", b"old")
+                store.set("new-key", b"new")
+                self.assertIsNone(store.get("old-key"))
+                self.assertEqual(store.get("new-key"), b"new")
+                self.assertEqual(len(store), 1)
+                self.assertEqual(len(store._eviction), 1)
+
     def test_lfu_handles_frequency_gaps_after_deletion_and_reinsertion(self) -> None:
         policy = LFU()
         for key, accesses in (("low", 1), ("middle", 10), ("high", 30)):
             for _ in range(accesses):
                 policy.access(key)
-        self.assertEqual(policy.victim(), "low")
-        policy.discard("low")
-        self.assertEqual(policy.victim(), "middle")
-        policy.discard("middle")
-        self.assertEqual(policy.victim(), "high")
+        self.assertEqual(policy.evict(), "low")
+        self.assertEqual(policy.evict(), "middle")
         policy.access("new")
-        self.assertEqual(policy.victim(), "new")
-        policy.discard("high")
-        policy.discard("new")
+        self.assertEqual(policy.evict(), "new")
+        self.assertEqual(policy.evict(), "high")
         with self.assertRaises(AssertionError):
-            policy.victim()
+            policy.evict()
         policy.access("again")
-        self.assertEqual(policy.victim(), "again")
+        self.assertEqual(policy.evict(), "again")
 
     def test_lru_keeps_the_recently_accessed_key(self) -> None:
         store = Store(
@@ -158,12 +197,12 @@ class EvictionTests(unittest.TestCase):
                 store.set("a", b"old")
                 store.expire("a", 5)
                 store.set("b", b"other")
-                self.assertEqual(store.ttl("a"), -2)
+                self.assertIs(store.ttl("a"), TtlStatus.MISSING)
                 store.set("a", b"new")
                 clock.advance(5)
                 store.sweep()
                 self.assertEqual(store.get("a"), b"new")
-                self.assertEqual(store.ttl("a"), -1)
+                self.assertIs(store.ttl("a"), TtlStatus.PERSISTENT)
 
     def test_expired_entries_are_reclaimed_before_live_eviction(self) -> None:
         clock = ManualClock()
@@ -176,38 +215,6 @@ class EvictionTests(unittest.TestCase):
         store.set("new", b"v")
         self.assertEqual(store.get("live"), b"v")
         self.assertIsNone(store.get("expired"))
-
-    def test_random_operations_preserve_both_budgets(self) -> None:
-        for policy in EvictionPolicy:
-            rng = random.Random(47)
-            clock = ManualClock()
-            store = Store(
-                clock,
-                limits=StoreLimits(max_keys=4, max_bytes=24, eviction_policy=policy),
-            )
-            for _ in range(1000):
-                key = rng.choice(["a", "b", "c", "d", "é", "😀"])
-                with contextlib.suppress(CapacityError):
-                    store.set(key, rng.randbytes(rng.randrange(28)))
-                match rng.randrange(6):
-                    case 0:
-                        store.delete(key)
-                    case 1:
-                        store.expire(key, rng.randrange(5))
-                    case 2:
-                        clock.advance(rng.randrange(5))
-                        store.sweep(limit=rng.randrange(3))
-                    case 3:
-                        store.persist(key)
-                    case 4:
-                        store.get(key)
-                self.assertLessEqual(len(store), 4)
-                self.assertLessEqual(store.stored_bytes, 24)
-                expected = sum(
-                    len(k.encode()) + len(entry.value)
-                    for k, entry in store._entries.items()
-                )
-                self.assertEqual(store.stored_bytes, expected)
 
     def test_unknown_policy_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "unknown"):

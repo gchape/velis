@@ -4,9 +4,7 @@ from typing import assert_never
 
 from velis.core.broker import Broker, Subscriber
 from velis.core.messages import (
-    MISSING,
     NIL,
-    NO_EXPIRY,
     OK,
     PERSISTENT,
     TTL,
@@ -29,18 +27,23 @@ from velis.core.messages import (
     Unsubscribed,
     Value,
 )
-from velis.core.store import Store
+from velis.core.store import SWEEP_LIMIT, Store, TtlStatus
 
 
 def _ok_or_nil(found: bool) -> Ok | Nil:
     return OK if found else NIL
 
 
-def _ttl_reply(ms: int) -> Nil | Persistent | TTLValue:
-    """Map Store.ttl() results to replies: MISSING, NO_EXPIRY or remaining ms."""
-    if ms == MISSING:
-        return NIL
-    return PERSISTENT if ms == NO_EXPIRY else TTLValue(ms)
+def _ttl_reply(result: int | TtlStatus) -> Nil | Persistent | TTLValue:
+    match result:
+        case TtlStatus.MISSING:
+            return NIL
+        case TtlStatus.PERSISTENT:
+            return PERSISTENT
+        case int(ms):
+            return TTLValue(ms)
+        case _:
+            assert_never(result)
 
 
 class Engine:
@@ -87,9 +90,9 @@ class Engine:
         """Remove the disconnected subscriber from every channel."""
         self._broker.unsubscribe_all(subscriber)
 
-    def sweep(self) -> int:
-        """Run the store expiry sweep and return the number of keys removed."""
-        return self._store.sweep()
+    def sweep(self, limit: int = SWEEP_LIMIT) -> int:
+        """Run one bounded expiry sweep and return the number of keys removed."""
+        return self._store.sweep(limit)
 
     @property
     def has_due_expirations(self) -> bool:

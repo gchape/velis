@@ -3,7 +3,7 @@ from typing import assert_type
 from unittest.mock import patch
 
 from tests.codec.helpers import Prefix, Reverse
-from velis.codec import CompositeCodec, Identity, LengthPrefixedField, UInt, Utf8
+from velis.codec import UTF8, CompositeCodec, Identity, LengthPrefixedField, UInt
 
 
 class CompositeCodecTests(unittest.TestCase):
@@ -17,7 +17,7 @@ class CompositeCodecTests(unittest.TestCase):
         self.assertEqual(codec.decode(codec.encode(b"ab")), b"ab")
 
     def test_typed_composition_accepts_individual_codecs(self) -> None:
-        codec = CompositeCodec.of(Utf8()) | LengthPrefixedField(
+        codec = CompositeCodec.of(UTF8()) | LengthPrefixedField(
             Identity(), 64, prefix=UInt(4)
         )
         assert_type(codec, CompositeCodec[str, bytes])

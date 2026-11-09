@@ -14,17 +14,16 @@ from velis.codec import (
     UInt,
     Validate,
 )
-from velis.config import Config
-from velis.config import Server as ServerConfig
+from velis.config import Config, ServerConfig
 from velis.core.broker import Broker
-from velis.core.commands import Command, Err, Get, Message, Subscribe
 from velis.core.engine import Engine
+from velis.core.messages import Command, Err, Get, Message, Subscribe
 from velis.core.store import EvictionPolicy, Store, StoreLimits
 from velis.errors import CommandError, ProtocolError
 from velis.net import protocol
 from velis.net.client import Client
 from velis.net.connection import Connection
-from velis.net.server import TcpServer
+from velis.net.server import TCPServer
 
 
 class ServerTests(unittest.IsolatedAsyncioTestCase):
@@ -71,10 +70,10 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         wire = protocol.WireProtocol(
-            frame_codec=CompositeCodec.of(protocol.FRAMES)
+            message_codec=CompositeCodec.of(protocol.SERVER_MESSAGES)
             | LengthPrefixedField(Identity(), 64, prefix=UInt(4))
         )
-        server = TcpServer(self.engine, ServerConfig("127.0.0.1", 0), wire=wire)
+        server = TCPServer(self.engine, ServerConfig("127.0.0.1", 0), wire=wire)
         await server.start()
         self.addAsyncCleanup(server.close)
         limited = await Client.connect("127.0.0.1", server.port, wire=wire)
@@ -94,7 +93,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await healthy.next_message(), Message("news", b"again"))
 
     async def test_connection_limit_reason_reaches_idle_client(self) -> None:
-        server = TcpServer(self.engine, ServerConfig("127.0.0.1", 0, max_connections=1))
+        server = TCPServer(self.engine, ServerConfig("127.0.0.1", 0, max_connections=1))
         await server.start()
         self.addAsyncCleanup(server.close)
         first = await Client.connect("127.0.0.1", server.port)
@@ -110,7 +109,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await first.get("key"), b"value")
 
     async def test_connection_limit_rejects_excess_and_reuses_closed_slot(self) -> None:
-        server = TcpServer(self.engine, ServerConfig("127.0.0.1", 0, max_connections=1))
+        server = TCPServer(self.engine, ServerConfig("127.0.0.1", 0, max_connections=1))
         await server.start()
         self.addAsyncCleanup(server.close)
         first = await Client.connect("127.0.0.1", server.port)
@@ -120,7 +119,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         try:
             async with asyncio.timeout(1):
                 self.assertEqual(
-                    await anext(protocol.DEFAULT_PROTOCOL.read_frames(reader)),
+                    await anext(protocol.DEFAULT_PROTOCOL.read_messages(reader)),
                     Err("connection limit exceeded"),
                 )
                 self.assertEqual(await reader.read(), b"")
@@ -145,7 +144,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncSetUp(self) -> None:
         self.engine = Engine(Store(), Broker())
-        self.server = TcpServer(self.engine, ServerConfig("127.0.0.1", 0))
+        self.server = TCPServer(self.engine, ServerConfig("127.0.0.1", 0))
         await self.server.start()
         self.addAsyncCleanup(self.server.close)
 
@@ -176,7 +175,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             writer.write(protocol.DEFAULT_PROTOCOL.framing.encode(body))
             async with asyncio.timeout(1):
                 self.assertEqual(
-                    await anext(protocol.DEFAULT_PROTOCOL.read_frames(reader)),
+                    await anext(protocol.DEFAULT_PROTOCOL.read_messages(reader)),
                     Err("key must not be empty"),
                 )
                 self.assertEqual(await reader.read(), b"")
@@ -204,7 +203,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
     async def test_max_size_message_does_not_drop_subscriber(self) -> None:
         sub, pub = await self.client(), await self.client()
         await sub.subscribe("ch")
-        big = b"x" * protocol.MAX_LEN
+        big = b"x" * protocol.MAX_FIELD_BYTES
         self.assertEqual(await pub.publish("ch", big), 1)
         async with asyncio.timeout(5):
             self.assertEqual((await sub.next_message()).payload, big)
@@ -223,7 +222,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             protocol.DEFAULT_PROTOCOL.framing.encode(struct.pack(">I", 4) + b"NOPE")
         )
         frame = await asyncio.wait_for(
-            anext(protocol.DEFAULT_PROTOCOL.read_frames(reader)), 1
+            anext(protocol.DEFAULT_PROTOCOL.read_messages(reader)), 1
         )
         self.assertEqual(frame, Err("unknown command: 'NOPE'"))
         self.assertEqual(await asyncio.wait_for(reader.read(), 1), b"")
@@ -252,11 +251,11 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
     ) -> None:
         wire = protocol.WireProtocol(
             command_codec=CompositeCodec.of(protocol.COMMANDS) | Reverse(),
-            frame_codec=CompositeCodec.of(protocol.FRAMES) | Reverse(),
+            message_codec=CompositeCodec.of(protocol.SERVER_MESSAGES) | Reverse(),
             framing=LengthPrefixedField(Identity(), 65535, prefix=UInt(2)),
         )
         store = Store()
-        server = TcpServer(
+        server = TCPServer(
             Engine(store, Broker()), ServerConfig("127.0.0.1", 0), wire=wire
         )
         await server.start()
@@ -299,17 +298,19 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
 
         wire = protocol.WireProtocol(
             command_codec=CompositeCodec.of(Validate(allow)) | protocol.COMMANDS,
-            frame_codec=CompositeCodec.of(protocol.FRAMES) | Reverse(),
+            message_codec=CompositeCodec.of(protocol.SERVER_MESSAGES) | Reverse(),
         )
-        server = TcpServer(self.engine, ServerConfig("127.0.0.1", 0), wire=wire)
+        server = TCPServer(self.engine, ServerConfig("127.0.0.1", 0), wire=wire)
         await server.start()
         self.addAsyncCleanup(server.close)
         reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
         try:
-            writer.write(protocol.DEFAULT_PROTOCOL.commands.encode(Get("blocked")))
+            writer.write(
+                protocol.DEFAULT_PROTOCOL.framed_commands.encode(Get("blocked"))
+            )
             async with asyncio.timeout(1):
                 self.assertEqual(
-                    await anext(wire.read_frames(reader)), Err("blocked key")
+                    await anext(wire.read_messages(reader)), Err("blocked key")
                 )
                 self.assertEqual(await reader.read(), b"")
         finally:
@@ -429,8 +430,8 @@ class RuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_server_encodes_one_push_per_publish_for_all_subscribers(
         self,
     ) -> None:
-        codec = Mock(wraps=protocol.FRAMES)
-        wire = protocol.WireProtocol(frame_codec=codec)
+        codec = Mock(wraps=protocol.SERVER_MESSAGES)
+        wire = protocol.WireProtocol(message_codec=codec)
         config = Config("INFO", ServerConfig("127.0.0.1", 0))
         async with (
             serve(config, wire=wire) as server,
@@ -477,7 +478,7 @@ class RuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
         config = Config("INFO", ServerConfig("127.0.0.1", 0))
         wire = protocol.WireProtocol(
             command_codec=CompositeCodec.of(protocol.COMMANDS) | Reverse(),
-            frame_codec=CompositeCodec.of(protocol.FRAMES) | Reverse(),
+            message_codec=CompositeCodec.of(protocol.SERVER_MESSAGES) | Reverse(),
         )
         async with serve(config, wire=wire) as server:
             client = await Client.connect("127.0.0.1", server.port, wire=wire)

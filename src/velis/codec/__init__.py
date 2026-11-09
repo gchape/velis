@@ -5,12 +5,13 @@ from velis.codec.fields import (
     LengthPrefixedField,
 )
 from velis.codec.records import TAG, Choice, Record
-from velis.codec.values import U32, U64, Identity, UInt, Utf8, Validate
+from velis.codec.values import U32, U64, UTF8, Identity, UInt, Validate
 
 __all__ = [
     "TAG",
     "U32",
     "U64",
+    "UTF8",
     "Choice",
     "Codec",
     "CompositeCodec",
@@ -20,6 +21,5 @@ __all__ = [
     "LengthPrefixedField",
     "Record",
     "UInt",
-    "Utf8",
     "Validate",
 ]

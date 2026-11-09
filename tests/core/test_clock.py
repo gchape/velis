@@ -4,7 +4,7 @@ from unittest.mock import patch
 from velis.core.store import Store
 
 
-class SystemClockTests(unittest.TestCase):
+class MonotonicClockTests(unittest.TestCase):
     def test_wall_clock_changes_do_not_change_ttl(self) -> None:
         with (
             patch("time.monotonic_ns", return_value=1_000_000_000) as monotonic,

@@ -6,7 +6,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Protocol, Self
 
-from velis.core.commands import Command, Err, Message, Reply
+from velis.core.messages import Command, Err, Message, Reply
 from velis.errors import ProtocolError
 from velis.net.protocol import DEFAULT_PROTOCOL, WireProtocol
 from velis.validation import require_positive
@@ -28,7 +28,7 @@ class SessionLimits:
         require_positive("max_pending_bytes", self.max_pending_bytes)
 
 
-DEFAULT_LIMITS = SessionLimits()
+DEFAULT_SESSION_LIMITS = SessionLimits()
 
 
 class Session(Protocol):
@@ -51,7 +51,7 @@ class Session(Protocol):
         ...
 
 
-class TcpSession:
+class TCPSession:
     """Pipeline TCP requests and buffer server messages.
 
     The server replies in the order it receives commands, so each reply
@@ -67,7 +67,7 @@ class TcpSession:
         writer: asyncio.StreamWriter,
         *,
         wire: WireProtocol = DEFAULT_PROTOCOL,
-        limits: SessionLimits = DEFAULT_LIMITS,
+        limits: SessionLimits = DEFAULT_SESSION_LIMITS,
     ) -> None:
         self._wire = wire
         self._reader = reader
@@ -82,7 +82,7 @@ class TcpSession:
         )
         self._closed = False
         self._close_reason = _CLOSED
-        self._reader_task = asyncio.create_task(self._receive_frames())
+        self._reader_task = asyncio.create_task(self._receive_messages())
 
     @classmethod
     async def connect(
@@ -91,17 +91,17 @@ class TcpSession:
         port: int,
         *,
         wire: WireProtocol = DEFAULT_PROTOCOL,
-        limits: SessionLimits = DEFAULT_LIMITS,
+        limits: SessionLimits = DEFAULT_SESSION_LIMITS,
     ) -> Self:
         """Open a TCP connection and start reading replies and server pushes."""
         reader, writer = await asyncio.open_connection(host, port)
         return cls(reader, writer, wire=wire, limits=limits)
 
-    async def _receive_frames(self) -> None:
+    async def _receive_messages(self) -> None:
         """Split the incoming stream into replies and server pushes."""
         try:
             async with contextlib.aclosing(
-                self._wire.read_frames(self._reader)
+                self._wire.read_messages(self._reader)
             ) as frames:
                 async for frame in frames:
                     if isinstance(frame, Message):
@@ -167,7 +167,7 @@ class TcpSession:
         """
         if self._closed:
             raise ConnectionError(self._close_reason)
-        encoded = self._wire.commands.encode(command)
+        encoded = self._wire.framed_commands.encode(command)
         waiter = asyncio.get_running_loop().create_future()
         self._writer.write(encoded)
         self._pending.append(waiter)

@@ -5,11 +5,11 @@ from unittest.mock import AsyncMock, Mock, patch
 from tests.helpers import ManualClock
 from velis import __main__ as cli
 from velis.app import _maintain, serve
-from velis.config import Config, Server
+from velis.config import Config, ServerConfig
 from velis.core.broker import Broker
 from velis.core.engine import Engine
 from velis.core.store import EvictionPolicy, Store, StoreLimits
-from velis.net.server import TcpServer
+from velis.net.server import TCPServer
 
 
 class RuntimeTests(unittest.IsolatedAsyncioTestCase):
@@ -79,11 +79,11 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(store.has_due_expirations)
 
     def setUp(self) -> None:
-        self.config = Config("INFO", Server("127.0.0.1", 0))
-        self.server = Mock(spec=TcpServer)
+        self.config = Config("INFO", ServerConfig("127.0.0.1", 0))
+        self.server = Mock(spec=TCPServer)
         self.server.start = AsyncMock()
         self.server.close = AsyncMock()
-        self.patch_server = patch("velis.app.TcpServer", return_value=self.server)
+        self.patch_server = patch("velis.app.TCPServer", return_value=self.server)
         self.patch_server.start()
         self.addCleanup(self.patch_server.stop)
 

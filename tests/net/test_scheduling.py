@@ -2,18 +2,18 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock, Mock
 
-from velis.config import Server
-from velis.core.commands import Get, Ok
+from velis.config import ServerConfig
 from velis.core.engine import Engine
+from velis.core.messages import Get, Ok
 from velis.net.connection import Connection
-from velis.net.server import COMMANDS_PER_TURN, TcpServer
+from velis.net.server import COMMANDS_PER_TURN, TCPServer
 
 
 class SchedulingTests(unittest.IsolatedAsyncioTestCase):
     async def test_ready_pipeline_yields_between_command_batches(self) -> None:
         total = COMMANDS_PER_TURN * 3 + 1
 
-        async def commands():
+        async def framed_commands():
             for _ in range(total):
                 yield Get("key")
 
@@ -22,7 +22,7 @@ class SchedulingTests(unittest.IsolatedAsyncioTestCase):
         connection = Mock(spec=Connection)
         connection.read_commands.return_value = commands()
         connection.drain = AsyncMock()
-        server = TcpServer(engine, Server())
+        server = TCPServer(engine, ServerConfig())
         progress = []
 
         async def observe() -> None:

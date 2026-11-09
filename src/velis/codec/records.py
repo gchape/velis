@@ -6,11 +6,11 @@ from typing import Any
 
 from velis.codec.cursor import Cursor
 from velis.codec.fields import Field, LengthPrefixedField
-from velis.codec.values import U32, Utf8
+from velis.codec.values import U32, UTF8
 from velis.errors import ProtocolError
 
 _POSITIONAL = (Parameter.POSITIONAL_ONLY, Parameter.POSITIONAL_OR_KEYWORD)
-TAG = LengthPrefixedField(Utf8(), 32, prefix=U32)
+TAG = LengthPrefixedField(UTF8(), 32, prefix=U32)
 
 
 class Record[T]:

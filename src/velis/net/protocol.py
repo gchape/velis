@@ -14,6 +14,7 @@ from functools import cached_property
 from velis.codec import (
     U32,
     U64,
+    UTF8,
     Choice,
     Codec,
     CompositeCodec,
@@ -21,10 +22,10 @@ from velis.codec import (
     Identity,
     LengthPrefixedField,
     Record,
-    Utf8,
     Validate,
 )
-from velis.core.commands import (
+from velis.core.messages import (
+    TTL,
     Command,
     Delete,
     Delivered,
@@ -41,21 +42,20 @@ from velis.core.commands import (
     Set,
     Subscribe,
     Subscribed,
-    Ttl,
-    TtlValue,
+    TTLValue,
     Unsubscribe,
     Unsubscribed,
     Value,
 )
 from velis.errors import ProtocolError
 
-MAX_LEN = 1 << 20
-MAX_FRAME_LEN = 2 * MAX_LEN
+MAX_FIELD_BYTES = 1 << 20
+MAX_FRAME_BODY_BYTES = 2 * MAX_FIELD_BYTES
 
-type Frame = Reply | Message
+type ServerMessage = Reply | Message
 
-BYTES = LengthPrefixedField(Identity(), MAX_LEN, prefix=U32)
-TEXT = LengthPrefixedField(Utf8(), MAX_LEN, prefix=U32)
+BYTES = LengthPrefixedField(Identity(), MAX_FIELD_BYTES, prefix=U32)
+TEXT = LengthPrefixedField(UTF8(), MAX_FIELD_BYTES, prefix=U32)
 
 
 def _text_rule(what: str, max_chars: int) -> Callable[[str], None]:
@@ -71,7 +71,7 @@ def _text_rule(what: str, max_chars: int) -> Callable[[str], None]:
 def _text_field(what: str, max_chars: int) -> LengthPrefixedField[str]:
     """Bound text by characters and allow up to four UTF-8 bytes per character."""
     return LengthPrefixedField(
-        CompositeCodec.of(Validate(_text_rule(what, max_chars))) | Utf8(),
+        CompositeCodec.of(Validate(_text_rule(what, max_chars))) | UTF8(),
         max_chars * 4,
         prefix=U32,
     )
@@ -87,7 +87,7 @@ COMMANDS: Choice[Command] = Choice(
         "SET": Record(Set, KEY, BYTES),
         "EXPIRE": Record(Expire, KEY, FixedLengthField(U64, 8)),
         "DEL": Record(Delete, KEY),
-        "TTL": Record(Ttl, KEY),
+        "TTL": Record(TTL, KEY),
         "PERSIST": Record(Persist, KEY),
         "SUBSCRIBE": Record(Subscribe, CHANNEL),
         "UNSUBSCRIBE": Record(Unsubscribe, CHANNEL),
@@ -95,7 +95,7 @@ COMMANDS: Choice[Command] = Choice(
     },
 )
 
-FRAMES: Choice[Frame] = Choice(
+SERVER_MESSAGES: Choice[ServerMessage] = Choice(
     "frame",
     {
         "OK": Record(Ok),
@@ -105,7 +105,7 @@ FRAMES: Choice[Frame] = Choice(
         "SUBSCRIBED": Record(Subscribed, TEXT),
         "UNSUBSCRIBED": Record(Unsubscribed, TEXT),
         "DELIVERED": Record(Delivered, FixedLengthField(U32, 4)),
-        "TTL_VALUE": Record(TtlValue, FixedLengthField(U64, 8)),
+        "TTL_VALUE": Record(TTLValue, FixedLengthField(U64, 8)),
         "PERSISTENT": Record(Persistent),
         "MESSAGE": Record(Message, TEXT, BYTES),
     },
@@ -122,22 +122,22 @@ class WireProtocol:
     """
 
     command_codec: Codec[Command, bytes] = COMMANDS
-    frame_codec: Codec[Frame, bytes] = FRAMES
+    message_codec: Codec[ServerMessage, bytes] = SERVER_MESSAGES
     framing: LengthPrefixedField[bytes] = field(
         default_factory=lambda: LengthPrefixedField(
-            Identity(), MAX_FRAME_LEN, prefix=U32
+            Identity(), MAX_FRAME_BODY_BYTES, prefix=U32
         )
     )
 
     @cached_property
-    def commands(self) -> CompositeCodec[Command, bytes]:
+    def framed_commands(self) -> CompositeCodec[Command, bytes]:
         """Encode and decode whole framed commands."""
         return CompositeCodec.of(self.command_codec) | self.framing
 
     @cached_property
-    def frames(self) -> CompositeCodec[Frame, bytes]:
+    def framed_messages(self) -> CompositeCodec[ServerMessage, bytes]:
         """Encode and decode whole framed replies and pushes."""
-        return CompositeCodec.of(self.frame_codec) | self.framing
+        return CompositeCodec.of(self.message_codec) | self.framing
 
     async def _read_body(self, reader: asyncio.StreamReader) -> bytes | None:
         """Return one frame body, or None on EOF at a frame boundary.
@@ -164,9 +164,11 @@ class WireProtocol:
         """Yield decoded commands until the peer disconnects cleanly."""
         return self._read(reader, self.command_codec)
 
-    def read_frames(self, reader: asyncio.StreamReader) -> AsyncGenerator[Frame]:
+    def read_messages(
+        self, reader: asyncio.StreamReader
+    ) -> AsyncGenerator[ServerMessage]:
         """Yield decoded replies and pushes until the server disconnects cleanly."""
-        return self._read(reader, self.frame_codec)
+        return self._read(reader, self.message_codec)
 
 
 DEFAULT_PROTOCOL = WireProtocol()

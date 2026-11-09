@@ -1,6 +1,6 @@
 import unittest
 
-from velis.codec import U32, FixedLengthField, Identity, LengthPrefixedField, UInt, Utf8
+from velis.codec import U32, UTF8, FixedLengthField, Identity, LengthPrefixedField, UInt
 from velis.codec.cursor import Cursor
 from velis.errors import ProtocolError
 
@@ -38,7 +38,7 @@ class CursorTests(unittest.TestCase):
             cursor.finish()
         self.assertEqual(FixedLengthField(UInt(1), length=1).read(cursor), 1)
         self.assertEqual(
-            LengthPrefixedField(Utf8(), 64, prefix=UInt(4)).read(cursor), "hi"
+            LengthPrefixedField(UTF8(), 64, prefix=UInt(4)).read(cursor), "hi"
         )
         self.assertEqual(
             LengthPrefixedField(Identity(), 64, prefix=UInt(4)).read(cursor), b""

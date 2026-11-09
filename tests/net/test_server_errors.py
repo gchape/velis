@@ -3,10 +3,10 @@ import unittest
 from unittest.mock import AsyncMock, Mock
 
 from velis.codec import Identity, LengthPrefixedField, UInt
-from velis.config import Server as ServerConfig
+from velis.config import ServerConfig
 from velis.core.engine import Engine
 from velis.net.protocol import WireProtocol
-from velis.net.server import TcpServer
+from velis.net.server import TCPServer
 
 
 class ServerErrorTests(unittest.IsolatedAsyncioTestCase):
@@ -17,7 +17,7 @@ class ServerErrorTests(unittest.IsolatedAsyncioTestCase):
                 wire = WireProtocol(
                     framing=LengthPrefixedField(Identity(), max_frame, prefix=UInt(4))
                 )
-                server = TcpServer(engine, ServerConfig("127.0.0.1", 0), wire=wire)
+                server = TCPServer(engine, ServerConfig("127.0.0.1", 0), wire=wire)
                 reader = asyncio.StreamReader()
                 reader.feed_data(b"\x00\x00\x00\x00")
                 reader.feed_eof()

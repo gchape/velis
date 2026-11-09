@@ -4,6 +4,7 @@ from typing import TypeAliasType, cast, get_args
 
 from velis.codec import (
     TAG,
+    UTF8,
     Choice,
     CompositeCodec,
     FixedLengthField,
@@ -11,13 +12,12 @@ from velis.codec import (
     LengthPrefixedField,
     Record,
     UInt,
-    Utf8,
     Validate,
 )
 from velis.codec.cursor import Cursor
-from velis.core.commands import Command, Message, Reply
+from velis.core.messages import Command, Message, Reply
 from velis.errors import ProtocolError
-from velis.net.protocol import COMMANDS, FRAMES
+from velis.net.protocol import COMMANDS, SERVER_MESSAGES
 
 
 def members(alias: TypeAliasType) -> set[type]:
@@ -40,7 +40,7 @@ class ChoiceTests(unittest.TestCase):
             {
                 "R": Record(
                     Row,
-                    LengthPrefixedField(Utf8(), 32, prefix=UInt(4)),
+                    LengthPrefixedField(UTF8(), 32, prefix=UInt(4)),
                     FixedLengthField(UInt(2), 2),
                 )
             },
@@ -50,10 +50,10 @@ class ChoiceTests(unittest.TestCase):
 
     def test_protocol_tables_cover_every_command_and_reply(self) -> None:
         self.assertEqual(COMMANDS.types, members(Command))
-        self.assertEqual(FRAMES.types, members(Reply) | {Message})
+        self.assertEqual(SERVER_MESSAGES.types, members(Reply) | {Message})
 
     def test_custom_variants_mix_prefixed_fields_and_fixed_width_integers(self) -> None:
-        text = LengthPrefixedField(Utf8(), 32, prefix=UInt(4))
+        text = LengthPrefixedField(UTF8(), 32, prefix=UInt(4))
         codec = Choice("record", {"R": Record(Row, text, FixedLengthField(UInt(2), 2))})
         record = Row("é", 258)
         encoded = b"\x00\x00\x00\x01R\x00\x00\x00\x02\xc3\xa9\x01\x02"
@@ -69,7 +69,7 @@ class ChoiceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "2 fields but 0 codecs"):
             Record(Row)
         codecs = (
-            LengthPrefixedField(Utf8(), 32, prefix=UInt(4)),
+            LengthPrefixedField(UTF8(), 32, prefix=UInt(4)),
             FixedLengthField(UInt(2), 2),
         )
         with self.assertRaisesRegex(ValueError, "listed twice"):
@@ -87,7 +87,7 @@ class ChoiceTests(unittest.TestCase):
             "record",
             {
                 "R": Record(
-                    Row, LengthPrefixedField(Utf8(), 32, prefix=UInt(4)), integer
+                    Row, LengthPrefixedField(UTF8(), 32, prefix=UInt(4)), integer
                 )
             },
         )
@@ -112,9 +112,9 @@ class ChoiceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             FixedLengthField(UInt(1), 0)
         with self.assertRaises(ValueError):
-            LengthPrefixedField(Utf8(), -1, prefix=UInt(4))
+            LengthPrefixedField(UTF8(), -1, prefix=UInt(4))
         codecs = (
-            LengthPrefixedField(Utf8(), 32, prefix=UInt(4)),
+            LengthPrefixedField(UTF8(), 32, prefix=UInt(4)),
             FixedLengthField(UInt(2), 2),
         )
         with self.assertRaisesRegex(ValueError, "invalid tag"):
@@ -125,4 +125,4 @@ class ChoiceTests(unittest.TestCase):
             name: str
 
         with self.assertRaisesRegex(ValueError, "positional init fields"):
-            Record(Named, LengthPrefixedField(Utf8(), 32, prefix=UInt(4)))
+            Record(Named, LengthPrefixedField(UTF8(), 32, prefix=UInt(4)))

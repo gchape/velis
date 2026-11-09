@@ -4,8 +4,8 @@ from unittest.mock import patch
 
 from tests.helpers import RecordingSubscriber
 from velis.app import build_engine
-from velis.config import Config, Server
-from velis.core.commands import Get, Nil, Set, Subscribe, Value
+from velis.config import Config, ServerConfig
+from velis.core.messages import Get, Nil, Set, Subscribe, Value
 from velis.core.store import EvictionPolicy, StoreLimits
 from velis.errors import CapacityError
 
@@ -107,4 +107,4 @@ class ConfigTests(unittest.TestCase):
     ) -> None:
         for kwargs in ({"max_connections": 0}, {"max_subscriptions": -1}):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
-                Server("127.0.0.1", 0, **kwargs)
+                ServerConfig("127.0.0.1", 0, **kwargs)

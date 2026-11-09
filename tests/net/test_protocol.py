@@ -13,7 +13,8 @@ from velis.codec import (
     LengthPrefixedField,
     UInt,
 )
-from velis.core.commands import (
+from velis.core.messages import (
+    TTL,
     Delete,
     Delivered,
     Err,
@@ -28,8 +29,7 @@ from velis.core.commands import (
     Set,
     Subscribe,
     Subscribed,
-    Ttl,
-    TtlValue,
+    TTLValue,
     Unsubscribe,
     Unsubscribed,
     Value,
@@ -58,9 +58,14 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
                     commands = [Set("key", b"value"), Get("key")]
                     for command in commands:
                         self.assertEqual(
-                            wire.commands.decode(wire.commands.encode(command)), command
+                            wire.framed_commands.decode(
+                                wire.framed_commands.encode(command)
+                            ),
+                            command,
                         )
-                    encoded = b"".join(wire.commands.encode(cmd) for cmd in commands)
+                    encoded = b"".join(
+                        wire.framed_commands.encode(cmd) for cmd in commands
+                    )
                     self.assertEqual(
                         [cmd async for cmd in wire.read_commands(stream(encoded))],
                         commands,
@@ -68,22 +73,27 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
                     frames = [Value(b"value"), Message("news", b"hello")]
                     for frame in frames:
                         self.assertEqual(
-                            wire.frames.decode(wire.frames.encode(frame)), frame
+                            wire.framed_messages.decode(
+                                wire.framed_messages.encode(frame)
+                            ),
+                            frame,
                         )
-                    encoded = b"".join(wire.frames.encode(frame) for frame in frames)
+                    encoded = b"".join(
+                        wire.framed_messages.encode(frame) for frame in frames
+                    )
                     self.assertEqual(
-                        [frame async for frame in wire.read_frames(stream(encoded))],
+                        [frame async for frame in wire.read_messages(stream(encoded))],
                         frames,
                     )
 
     async def test_composite_body_codec_works_with_framing_and_streams(self) -> None:
         codec = CompositeCodec.of(protocol.COMMANDS) | Reverse()
         wire = protocol.WireProtocol(command_codec=codec)
-        self.assertIsInstance(wire.commands, CompositeCodec)
-        self.assertIs(wire.commands, wire.commands)
+        self.assertIsInstance(wire.framed_commands, CompositeCodec)
+        self.assertIs(wire.framed_commands, wire.framed_commands)
         command = Set("key", b"hello")
-        encoded = wire.commands.encode(command)
-        self.assertEqual(wire.commands.decode(encoded), command)
+        encoded = wire.framed_commands.encode(command)
+        self.assertEqual(wire.framed_commands.decode(encoded), command)
         self.assertEqual(
             [value async for value in wire.read_commands(stream(encoded))], [command]
         )
@@ -112,7 +122,7 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         commands = (
             Get("key"),
             Delete("key"),
-            Ttl("key"),
+            TTL("key"),
             Persist("key"),
             Set("key", b"\x00\xff"),
             Expire("key", 1),
@@ -122,7 +132,7 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         )
         frames = (
             Ok(),
-            TtlValue(1 << 62),
+            TTLValue(1 << 62),
             Persistent(),
             Nil(),
             Value(b"\xff"),
@@ -133,16 +143,16 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
             Message("ch", b"hello"),
         )
         check(protocol.COMMANDS, commands)
-        check(protocol.FRAMES, frames)
-        check(protocol.DEFAULT_PROTOCOL.commands, commands)
-        check(protocol.DEFAULT_PROTOCOL.frames, frames)
+        check(protocol.SERVER_MESSAGES, frames)
+        check(protocol.DEFAULT_PROTOCOL.framed_commands, commands)
+        check(protocol.DEFAULT_PROTOCOL.framed_messages, frames)
 
     def test_command_names_enforce_character_limits_in_both_directions(self) -> None:
         codec = protocol.COMMANDS
         for tag, make, limit, suffix in (
             ("GET", Get, 512, b""),
             ("DEL", Delete, 512, b""),
-            ("TTL", Ttl, 512, b""),
+            ("TTL", TTL, 512, b""),
             ("PERSIST", Persist, 512, b""),
             ("SET", lambda name: Set(name, b"x"), 512, protocol.BYTES.encode(b"x")),
             ("EXPIRE", lambda name: Expire(name, 1), 512, struct.pack(">Q", 1)),
@@ -190,7 +200,7 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
                     protocol.COMMANDS.decode(protocol.TEXT.encode(tag) + name)
 
     def test_tags_reject_oversized_data_before_utf8_decoding(self) -> None:
-        for codec in (protocol.COMMANDS, protocol.FRAMES):
+        for codec in (protocol.COMMANDS, protocol.SERVER_MESSAGES):
             for tag, error in (
                 (b"\xff" * 33, "field too long"),
                 (b"\xff" * 32, "invalid utf-8"),
@@ -203,7 +213,7 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
                     codec.decode(protocol.BYTES.encode(tag))
 
     def test_reply_channels_keep_existing_text_rules(self) -> None:
-        codec = protocol.FRAMES
+        codec = protocol.SERVER_MESSAGES
         for channel in ("", "x" * 257):
             for frame in (
                 Message(channel, b"x"),
@@ -232,7 +242,7 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
             (
                 Get("k"),
                 Delete("k"),
-                Ttl("k"),
+                TTL("k"),
                 Persist("k"),
                 Set("k", b"v"),
                 Expire("k", 1),
@@ -242,10 +252,10 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
         check(
-            protocol.FRAMES,
+            protocol.SERVER_MESSAGES,
             (
                 Ok(),
-                TtlValue(1 << 62),
+                TTLValue(1 << 62),
                 Persistent(),
                 Nil(),
                 Value(b"v"),
@@ -261,7 +271,7 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         for command in (
             Get("ქართული"),
             Delete("k"),
-            Ttl("k"),
+            TTL("k"),
             Persist("k"),
             Set("key", bytes(range(256))),
             Expire("key", (1 << 64) - 1),
@@ -271,7 +281,7 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         ):
             with self.subTest(command=command):
                 request = command
-                encoded = protocol.DEFAULT_PROTOCOL.commands.encode(request)
+                encoded = protocol.DEFAULT_PROTOCOL.framed_commands.encode(request)
                 self.assertEqual(
                     await anext(
                         protocol.DEFAULT_PROTOCOL.read_commands(stream(encoded))
@@ -282,11 +292,11 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
     async def test_largest_request_fields_fit_outer_frame(self) -> None:
         key = "\U0010ffff" * 512
         channel = "\U0010ffff" * 256
-        payload = b"x" * protocol.MAX_LEN
+        payload = b"x" * protocol.MAX_FIELD_BYTES
         for command in (Set(key, payload), Publish(channel, payload)):
             with self.subTest(command=type(command).__name__):
                 request = command
-                encoded = protocol.DEFAULT_PROTOCOL.commands.encode(request)
+                encoded = protocol.DEFAULT_PROTOCOL.framed_commands.encode(request)
                 self.assertEqual(
                     await anext(
                         protocol.DEFAULT_PROTOCOL.read_commands(stream(encoded))
@@ -294,15 +304,16 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
                     request,
                 )
         message = Message(channel, payload)
-        encoded = protocol.DEFAULT_PROTOCOL.frames.encode(message)
+        encoded = protocol.DEFAULT_PROTOCOL.framed_messages.encode(message)
         self.assertEqual(
-            await anext(protocol.DEFAULT_PROTOCOL.read_frames(stream(encoded))), message
+            await anext(protocol.DEFAULT_PROTOCOL.read_messages(stream(encoded))),
+            message,
         )
 
     async def test_reply_and_message_roundtrips(self) -> None:
         for reply in (
             Ok(),
-            TtlValue(1 << 62),
+            TTLValue(1 << 62),
             Persistent(),
             Nil(),
             Value(b"\xff"),
@@ -313,17 +324,19 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         ):
             with self.subTest(reply=reply):
                 response = reply
-                encoded = protocol.DEFAULT_PROTOCOL.frames.encode(response)
+                encoded = protocol.DEFAULT_PROTOCOL.framed_messages.encode(response)
                 self.assertEqual(
-                    await anext(protocol.DEFAULT_PROTOCOL.read_frames(stream(encoded))),
+                    await anext(
+                        protocol.DEFAULT_PROTOCOL.read_messages(stream(encoded))
+                    ),
                     response,
                 )
-        payload = b"x" * protocol.MAX_LEN
+        payload = b"x" * protocol.MAX_FIELD_BYTES
         self.assertEqual(
             await anext(
-                protocol.DEFAULT_PROTOCOL.read_frames(
+                protocol.DEFAULT_PROTOCOL.read_messages(
                     stream(
-                        protocol.DEFAULT_PROTOCOL.frames.encode(
+                        protocol.DEFAULT_PROTOCOL.framed_messages.encode(
                             Message("news", payload)
                         )
                     )
@@ -333,13 +346,15 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_encoders_reject_oversized_fields(self) -> None:
-        big = b"x" * (protocol.MAX_LEN + 1)
+        big = b"x" * (protocol.MAX_FIELD_BYTES + 1)
         encoders = (
-            lambda: protocol.DEFAULT_PROTOCOL.commands.encode(Set("key", big)),
-            lambda: protocol.DEFAULT_PROTOCOL.frames.encode(Value(big)),
-            lambda: protocol.DEFAULT_PROTOCOL.frames.encode(Message("news", big)),
-            lambda: protocol.DEFAULT_PROTOCOL.frames.encode(
-                Message("x" * (protocol.MAX_LEN + 1), b"")
+            lambda: protocol.DEFAULT_PROTOCOL.framed_commands.encode(Set("key", big)),
+            lambda: protocol.DEFAULT_PROTOCOL.framed_messages.encode(Value(big)),
+            lambda: protocol.DEFAULT_PROTOCOL.framed_messages.encode(
+                Message("news", big)
+            ),
+            lambda: protocol.DEFAULT_PROTOCOL.framed_messages.encode(
+                Message("x" * (protocol.MAX_FIELD_BYTES + 1), b"")
             ),
         )
         for encode in encoders:
@@ -349,18 +364,18 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
     async def test_encoders_reject_invalid_integer_ranges(self) -> None:
         for value in (-1, 1 << 64):
             with self.subTest(ttl=value), self.assertRaises(ProtocolError):
-                protocol.DEFAULT_PROTOCOL.commands.encode(Expire("key", value))
+                protocol.DEFAULT_PROTOCOL.framed_commands.encode(Expire("key", value))
         for value in (-1, 1 << 32):
             with self.subTest(delivered=value), self.assertRaises(ProtocolError):
-                protocol.DEFAULT_PROTOCOL.frames.encode(Delivered(value))
+                protocol.DEFAULT_PROTOCOL.framed_messages.encode(Delivered(value))
 
     async def test_encoder_rejects_invalid_utf8(self) -> None:
         with self.assertRaisesRegex(ProtocolError, "invalid utf-8"):
-            protocol.DEFAULT_PROTOCOL.commands.encode(Get("\ud800"))
+            protocol.DEFAULT_PROTOCOL.framed_commands.encode(Get("\ud800"))
 
     async def test_decoder_rejects_invalid_fields(self) -> None:
         frames = (
-            struct.pack(">I", protocol.MAX_LEN + 1),
+            struct.pack(">I", protocol.MAX_FIELD_BYTES + 1),
             b"\x00\x00\x00\x01\xff",
             b"\x00\x00\x00\x04NOPE",
         )
@@ -373,7 +388,7 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
                 )
 
     async def test_truncated_command_raises_incomplete_read(self) -> None:
-        encoded = protocol.DEFAULT_PROTOCOL.commands.encode(Set("key", b"value"))
+        encoded = protocol.DEFAULT_PROTOCOL.framed_commands.encode(Set("key", b"value"))
         with self.assertRaises(asyncio.IncompleteReadError):
             await anext(protocol.DEFAULT_PROTOCOL.read_commands(stream(encoded[:-1])))
 
@@ -398,14 +413,16 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
                     ):
                         [value async for value in read(stream(partial))]
 
-        await check(wire.read_commands, wire.commands, (Get("a"), Ttl("b")))
-        await check(wire.read_frames, wire.frames, (Ok(), Message("news", b"push")))
+        await check(wire.read_commands, wire.framed_commands, (Get("a"), TTL("b")))
+        await check(
+            wire.read_messages, wire.framed_messages, (Ok(), Message("news", b"push"))
+        )
 
     async def test_fragmented_and_consecutive_messages(self) -> None:
         first, second = Set("key", b"value"), Get("key")
-        encoded = protocol.DEFAULT_PROTOCOL.commands.encode(
+        encoded = protocol.DEFAULT_PROTOCOL.framed_commands.encode(
             first
-        ) + protocol.DEFAULT_PROTOCOL.commands.encode(second)
+        ) + protocol.DEFAULT_PROTOCOL.framed_commands.encode(second)
         reader = asyncio.StreamReader()
         commands = protocol.DEFAULT_PROTOCOL.read_commands(reader)
         await self.enterAsyncContext(contextlib.aclosing(commands))
@@ -420,13 +437,13 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
             await anext(commands)
 
     async def test_oversized_outer_length_rejected_before_reading_body(self) -> None:
-        self.assertEqual(protocol.MAX_FRAME_LEN, 2 << 20)
+        self.assertEqual(protocol.MAX_FRAME_BODY_BYTES, 2 << 20)
         for read in (
             protocol.DEFAULT_PROTOCOL.read_commands,
-            protocol.DEFAULT_PROTOCOL.read_frames,
+            protocol.DEFAULT_PROTOCOL.read_messages,
         ):
             reader = asyncio.StreamReader()
-            reader.feed_data(struct.pack(">I", protocol.MAX_FRAME_LEN + 1))
+            reader.feed_data(struct.pack(">I", protocol.MAX_FRAME_BODY_BYTES + 1))
             with (
                 self.subTest(read=read.__name__),
                 self.assertRaisesRegex(ProtocolError, "field too long"),
@@ -446,11 +463,11 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
 
     def test_wire_bytes_are_explicitly_length_prefixed(self) -> None:
         self.assertEqual(
-            protocol.DEFAULT_PROTOCOL.commands.encode(Get("k")),
+            protocol.DEFAULT_PROTOCOL.framed_commands.encode(Get("k")),
             b"\x00\x00\x00\x0c\x00\x00\x00\x03GET\x00\x00\x00\x01k",
         )
         self.assertEqual(
-            protocol.DEFAULT_PROTOCOL.frames.encode(Ok()),
+            protocol.DEFAULT_PROTOCOL.framed_messages.encode(Ok()),
             b"\x00\x00\x00\x06\x00\x00\x00\x02OK",
         )
 
@@ -463,10 +480,12 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
             command,
         )
         self.assertEqual(
-            protocol.FRAMES.decode(protocol.FRAMES.encode(Message("ch", b"v"))),
+            protocol.SERVER_MESSAGES.decode(
+                protocol.SERVER_MESSAGES.encode(Message("ch", b"v"))
+            ),
             Message("ch", b"v"),
         )
         with self.assertRaisesRegex(ProtocolError, "unknown command"):
-            protocol.COMMANDS.decode(protocol.FRAMES.encode(Ok()))
+            protocol.COMMANDS.decode(protocol.SERVER_MESSAGES.encode(Ok()))
         with self.assertRaisesRegex(ProtocolError, "unknown frame"):
-            protocol.FRAMES.decode(protocol.COMMANDS.encode(Get("key")))
+            protocol.SERVER_MESSAGES.decode(protocol.COMMANDS.encode(Get("key")))

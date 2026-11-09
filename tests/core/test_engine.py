@@ -3,7 +3,8 @@ from unittest.mock import Mock
 
 from tests.helpers import ManualClock, RecordingSubscriber
 from velis.core.broker import Broker
-from velis.core.commands import (
+from velis.core.engine import Engine
+from velis.core.messages import (
     Delivered,
     Expire,
     Get,
@@ -15,7 +16,6 @@ from velis.core.commands import (
     Subscribed,
     Value,
 )
-from velis.core.engine import Engine
 from velis.core.store import Store
 from velis.errors import CommandError
 

@@ -2,11 +2,11 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock, Mock
 
-from velis.core.commands import Err, Get, Message, Ok, Subscribed, Unsubscribed, Value
+from velis.core.messages import Err, Get, Message, Ok, Subscribed, Unsubscribed, Value
 from velis.errors import CommandError, ProtocolError
 from velis.net import protocol
 from velis.net.client import Client
-from velis.net.session import SessionLimits, TcpSession
+from velis.net.session import SessionLimits, TCPSession
 
 
 class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
@@ -15,7 +15,7 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.writer = Mock(spec=asyncio.StreamWriter)
         self.writer.drain = AsyncMock()
         self.writer.wait_closed = AsyncMock()
-        self.session = TcpSession(
+        self.session = TCPSession(
             self.reader,
             self.writer,
             limits=SessionLimits(
@@ -45,8 +45,8 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_local_close_preserves_a_full_message_queue(self) -> None:
         self.reader.feed_data(
-            protocol.DEFAULT_PROTOCOL.frames.encode(Message("", b"a"))
-            + protocol.DEFAULT_PROTOCOL.frames.encode(Message("", b"b"))
+            protocol.DEFAULT_PROTOCOL.framed_messages.encode(Message("", b"a"))
+            + protocol.DEFAULT_PROTOCOL.framed_messages.encode(Message("", b"b"))
         )
         await asyncio.sleep(0)
         await self.client.close()
@@ -65,7 +65,7 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.CancelledError):
             await pending
         self.reader.feed_data(
-            protocol.DEFAULT_PROTOCOL.frames.encode(Message("ch", b"next"))
+            protocol.DEFAULT_PROTOCOL.framed_messages.encode(Message("ch", b"next"))
         )
         async with asyncio.timeout(1):
             self.assertEqual(await self.client.next_message(), Message("ch", b"next"))
@@ -94,8 +94,8 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
             another = asyncio.create_task(self.client.get("another"))
             await asyncio.sleep(0)
             self.reader.feed_data(
-                protocol.DEFAULT_PROTOCOL.frames.encode(Value(b"late"))
-                + protocol.DEFAULT_PROTOCOL.frames.encode(Value(b"current"))
+                protocol.DEFAULT_PROTOCOL.framed_messages.encode(Value(b"late"))
+                + protocol.DEFAULT_PROTOCOL.framed_messages.encode(Value(b"current"))
             )
             self.assertEqual(await another, b"current")
         self.writer.close.assert_not_called()
@@ -110,7 +110,7 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.writer.close.assert_called_once()
 
     async def test_close_before_pump_starts(self) -> None:
-        client = Client(TcpSession(asyncio.StreamReader(), self.writer))
+        client = Client(TCPSession(asyncio.StreamReader(), self.writer))
         await client.close()
         async with asyncio.timeout(1):
             with self.assertRaises(ConnectionError):
@@ -123,34 +123,36 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0)
             self.assertEqual(self.writer.write.call_count, 2)
             sent = [
-                protocol.DEFAULT_PROTOCOL.commands.decode(call.args[0])
+                protocol.DEFAULT_PROTOCOL.framed_commands.decode(call.args[0])
                 for call in self.writer.write.call_args_list
             ]
             self.assertEqual(sent, [Get("first"), Get("second")])
             self.reader.feed_data(
-                protocol.DEFAULT_PROTOCOL.frames.encode(Value(b"one"))
+                protocol.DEFAULT_PROTOCOL.framed_messages.encode(Value(b"one"))
             )
             self.assertEqual(await first, b"one")
             self.assertFalse(second.done())
             self.reader.feed_data(
-                protocol.DEFAULT_PROTOCOL.frames.encode(Value(b"two"))
+                protocol.DEFAULT_PROTOCOL.framed_messages.encode(Value(b"two"))
             )
             self.assertEqual(await second, b"two")
 
     async def test_invalid_outgoing_data_leaves_connection_usable(self) -> None:
         with self.assertRaises(ProtocolError):
-            await self.client.set("key", b"x" * (protocol.MAX_LEN + 1))
+            await self.client.set("key", b"x" * (protocol.MAX_FIELD_BYTES + 1))
         self.writer.write.assert_not_called()
         pending = asyncio.create_task(self.client.get("key"))
         async with asyncio.timeout(1):
             await asyncio.sleep(0)
-            self.reader.feed_data(protocol.DEFAULT_PROTOCOL.frames.encode(Value(b"ok")))
+            self.reader.feed_data(
+                protocol.DEFAULT_PROTOCOL.framed_messages.encode(Value(b"ok"))
+            )
             self.assertEqual(await pending, b"ok")
 
     async def test_waiting_requests_do_not_encode_before_admission(self) -> None:
         codec = Mock(wraps=protocol.COMMANDS)
         reader = asyncio.StreamReader()
-        session = TcpSession(
+        session = TCPSession(
             reader,
             self.writer,
             wire=protocol.WireProtocol(command_codec=codec),
@@ -165,7 +167,7 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
             waiting.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await waiting
-            reader.feed_data(protocol.DEFAULT_PROTOCOL.frames.encode(Ok()))
+            reader.feed_data(protocol.DEFAULT_PROTOCOL.framed_messages.encode(Ok()))
             self.assertEqual(await active, Ok())
             codec.encode.assert_called_once()
 
@@ -173,7 +175,7 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
         codec = Mock(wraps=protocol.COMMANDS)
         codec.encode.side_effect = ProtocolError("cannot encode")
         reader = asyncio.StreamReader()
-        session = TcpSession(
+        session = TCPSession(
             reader,
             self.writer,
             wire=protocol.WireProtocol(command_codec=codec),
@@ -186,7 +188,7 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
         active = asyncio.create_task(session.request(Get("valid")))
         async with asyncio.timeout(1):
             await asyncio.sleep(0)
-            reader.feed_data(protocol.DEFAULT_PROTOCOL.frames.encode(Ok()))
+            reader.feed_data(protocol.DEFAULT_PROTOCOL.framed_messages.encode(Ok()))
             self.assertEqual(await active, Ok())
         self.assertFalse(session._pending)
         self.writer.write.assert_called_once()
@@ -200,7 +202,7 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0)
             self.assertFalse(invalid.done())
             self.reader.feed_data(
-                protocol.DEFAULT_PROTOCOL.frames.encode(Value(b"first"))
+                protocol.DEFAULT_PROTOCOL.framed_messages.encode(Value(b"first"))
             )
             self.assertEqual(await active[0], b"first")
             with self.assertRaisesRegex(ProtocolError, "must not be empty"):
@@ -208,15 +210,15 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
             next_request = asyncio.create_task(self.client.get("next"))
             await asyncio.sleep(0)
             self.reader.feed_data(
-                protocol.DEFAULT_PROTOCOL.frames.encode(Value(b"second"))
-                + protocol.DEFAULT_PROTOCOL.frames.encode(Value(b"next"))
+                protocol.DEFAULT_PROTOCOL.framed_messages.encode(Value(b"second"))
+                + protocol.DEFAULT_PROTOCOL.framed_messages.encode(Value(b"next"))
             )
             self.assertEqual(await active[1], b"second")
             self.assertEqual(await next_request, b"next")
 
     async def test_message_count_overflow_preserves_queued_messages(self) -> None:
         self.reader.feed_data(
-            protocol.DEFAULT_PROTOCOL.frames.encode(Message("", b"")) * 3
+            protocol.DEFAULT_PROTOCOL.framed_messages.encode(Message("", b"")) * 3
         )
         async with asyncio.timeout(1):
             for _ in range(2):
@@ -230,7 +232,9 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
         async with asyncio.timeout(1):
             await asyncio.sleep(0)
             self.reader.feed_data(
-                protocol.DEFAULT_PROTOCOL.frames.encode(Message("news", b"12345"))
+                protocol.DEFAULT_PROTOCOL.framed_messages.encode(
+                    Message("news", b"12345")
+                )
             )
             with self.assertRaisesRegex(ConnectionError, "buffer limit exceeded"):
                 await pending
@@ -238,7 +242,9 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 await self.client.next_message()
 
     async def test_reading_messages_releases_byte_budget(self) -> None:
-        frame = protocol.DEFAULT_PROTOCOL.frames.encode(Message("ch", b"123456"))
+        frame = protocol.DEFAULT_PROTOCOL.framed_messages.encode(
+            Message("ch", b"123456")
+        )
         async with asyncio.timeout(1):
             for _ in range(3):
                 self.reader.feed_data(frame)
@@ -249,13 +255,13 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_full_message_buffer_does_not_block_replies(self) -> None:
         self.reader.feed_data(
-            protocol.DEFAULT_PROTOCOL.frames.encode(Message("", b"x")) * 2
+            protocol.DEFAULT_PROTOCOL.framed_messages.encode(Message("", b"x")) * 2
         )
         pending = asyncio.create_task(self.client.get("key"))
         async with asyncio.timeout(1):
             await asyncio.sleep(0)
             self.reader.feed_data(
-                protocol.DEFAULT_PROTOCOL.frames.encode(Value(b"reply"))
+                protocol.DEFAULT_PROTOCOL.framed_messages.encode(Value(b"reply"))
             )
             self.assertEqual(await pending, b"reply")
             for _ in range(2):
@@ -266,9 +272,9 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
         async with asyncio.timeout(1):
             await asyncio.sleep(0)
             self.reader.feed_data(
-                protocol.DEFAULT_PROTOCOL.frames.encode(Message("", b"one"))
-                + protocol.DEFAULT_PROTOCOL.frames.encode(Value(b"reply"))
-                + protocol.DEFAULT_PROTOCOL.frames.encode(Message("", b"two"))
+                protocol.DEFAULT_PROTOCOL.framed_messages.encode(Message("", b"one"))
+                + protocol.DEFAULT_PROTOCOL.framed_messages.encode(Value(b"reply"))
+                + protocol.DEFAULT_PROTOCOL.framed_messages.encode(Message("", b"two"))
             )
             self.assertEqual(await request, b"reply")
             self.assertEqual(await self.client.next_message(), Message("", b"one"))
@@ -286,13 +292,13 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
                     request = asyncio.create_task(operation())
                     await asyncio.sleep(0)
                     self.reader.feed_data(
-                        protocol.DEFAULT_PROTOCOL.frames.encode(reply)
+                        protocol.DEFAULT_PROTOCOL.framed_messages.encode(reply)
                     )
                     with self.assertRaises(ProtocolError):
                         await request
 
     async def test_unsolicited_reply_closes_connection(self) -> None:
-        self.reader.feed_data(protocol.DEFAULT_PROTOCOL.frames.encode(Ok()))
+        self.reader.feed_data(protocol.DEFAULT_PROTOCOL.framed_messages.encode(Ok()))
         async with asyncio.timeout(1):
             with self.assertRaisesRegex(
                 ConnectionError, "reply received without a pending request"
@@ -302,7 +308,9 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_unsolicited_error_preserves_server_rejection_reason(self) -> None:
         self.reader.feed_data(
-            protocol.DEFAULT_PROTOCOL.frames.encode(Err("connection limit exceeded"))
+            protocol.DEFAULT_PROTOCOL.framed_messages.encode(
+                Err("connection limit exceeded")
+            )
         )
         self.reader.feed_eof()
         async with asyncio.timeout(1):
@@ -316,20 +324,24 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
         request = asyncio.create_task(self.client.get("key"))
         await asyncio.sleep(0)
         self.reader.feed_data(
-            protocol.DEFAULT_PROTOCOL.frames.encode(Err("bad command"))
+            protocol.DEFAULT_PROTOCOL.framed_messages.encode(Err("bad command"))
         )
         async with asyncio.timeout(1):
             with self.assertRaisesRegex(CommandError, "bad command"):
                 await request
             request = asyncio.create_task(self.client.get("key"))
             await asyncio.sleep(0)
-            self.reader.feed_data(protocol.DEFAULT_PROTOCOL.frames.encode(Value(b"ok")))
+            self.reader.feed_data(
+                protocol.DEFAULT_PROTOCOL.framed_messages.encode(Value(b"ok"))
+            )
             self.assertEqual(await request, b"ok")
 
     async def test_duplicate_reply_closes_connection(self) -> None:
         request = asyncio.create_task(self.client.get("key"))
         await asyncio.sleep(0)
-        self.reader.feed_data(protocol.DEFAULT_PROTOCOL.frames.encode(Value(b"ok")) * 2)
+        self.reader.feed_data(
+            protocol.DEFAULT_PROTOCOL.framed_messages.encode(Value(b"ok")) * 2
+        )
         async with asyncio.timeout(1):
             self.assertEqual(await request, b"ok")
             with self.assertRaisesRegex(
@@ -339,7 +351,9 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_reply_received_during_drain_survives_eof(self) -> None:
         async def drain() -> None:
-            self.reader.feed_data(protocol.DEFAULT_PROTOCOL.frames.encode(Value(b"ok")))
+            self.reader.feed_data(
+                protocol.DEFAULT_PROTOCOL.framed_messages.encode(Value(b"ok"))
+            )
             self.reader.feed_eof()
             await asyncio.sleep(0)
 
@@ -373,14 +387,14 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0)
             self.assertEqual(self.writer.write.call_count, 2)
             self.reader.feed_data(
-                protocol.DEFAULT_PROTOCOL.frames.encode(Value(b"first"))
+                protocol.DEFAULT_PROTOCOL.framed_messages.encode(Value(b"first"))
             )
             self.assertEqual(await requests[0], b"first")
             await asyncio.sleep(0)
             self.assertEqual(self.writer.write.call_count, 3)
             self.reader.feed_data(
-                protocol.DEFAULT_PROTOCOL.frames.encode(Value(b"second"))
-                + protocol.DEFAULT_PROTOCOL.frames.encode(Value(b"third"))
+                protocol.DEFAULT_PROTOCOL.framed_messages.encode(Value(b"second"))
+                + protocol.DEFAULT_PROTOCOL.framed_messages.encode(Value(b"third"))
             )
             self.assertEqual(await requests[1], b"second")
             self.assertEqual(await requests[2], b"third")
@@ -398,14 +412,14 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0)
             self.assertEqual(self.writer.write.call_count, 2)
             self.reader.feed_data(
-                protocol.DEFAULT_PROTOCOL.frames.encode(Err("late error"))
+                protocol.DEFAULT_PROTOCOL.framed_messages.encode(Err("late error"))
             )
             await asyncio.sleep(0)
             await asyncio.sleep(0)
             self.assertEqual(self.writer.write.call_count, 3)
             self.reader.feed_data(
-                protocol.DEFAULT_PROTOCOL.frames.encode(Value(b"late"))
-                + protocol.DEFAULT_PROTOCOL.frames.encode(Value(b"ok"))
+                protocol.DEFAULT_PROTOCOL.framed_messages.encode(Value(b"late"))
+                + protocol.DEFAULT_PROTOCOL.framed_messages.encode(Value(b"ok"))
             )
             self.assertEqual(await waiting, b"ok")
         self.assertFalse(self.session._pending)
@@ -421,17 +435,19 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 await waiting
             self.assertEqual(self.writer.write.call_count, 2)
             self.reader.feed_data(
-                protocol.DEFAULT_PROTOCOL.frames.encode(Value(b"a"))
-                + protocol.DEFAULT_PROTOCOL.frames.encode(Value(b"b"))
+                protocol.DEFAULT_PROTOCOL.framed_messages.encode(Value(b"a"))
+                + protocol.DEFAULT_PROTOCOL.framed_messages.encode(Value(b"b"))
             )
             self.assertEqual(await asyncio.gather(*active), [b"a", b"b"])
             next_request = asyncio.create_task(self.client.get("next"))
             await asyncio.sleep(0)
-            sent = protocol.DEFAULT_PROTOCOL.commands.decode(
+            sent = protocol.DEFAULT_PROTOCOL.framed_commands.decode(
                 self.writer.write.call_args.args[0]
             )
             self.assertEqual(sent, Get("next"))
-            self.reader.feed_data(protocol.DEFAULT_PROTOCOL.frames.encode(Value(b"c")))
+            self.reader.feed_data(
+                protocol.DEFAULT_PROTOCOL.framed_messages.encode(Value(b"c"))
+            )
             self.assertEqual(await next_request, b"c")
 
     async def test_cancelling_during_drain_does_not_block_other_requests(self) -> None:
@@ -449,8 +465,8 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await first
             self.reader.feed_data(
-                protocol.DEFAULT_PROTOCOL.frames.encode(Value(b"late"))
-                + protocol.DEFAULT_PROTOCOL.frames.encode(Value(b"second"))
+                protocol.DEFAULT_PROTOCOL.framed_messages.encode(Value(b"late"))
+                + protocol.DEFAULT_PROTOCOL.framed_messages.encode(Value(b"second"))
             )
             self.assertEqual(await second, b"second")
         self.writer.close.assert_not_called()
@@ -471,7 +487,7 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
         requests = [asyncio.create_task(self.client.get(str(i))) for i in range(3)]
         await asyncio.sleep(0)
         self.reader.feed_data(
-            protocol.DEFAULT_PROTOCOL.frames.encode(Err("server closing"))
+            protocol.DEFAULT_PROTOCOL.framed_messages.encode(Err("server closing"))
         )
         self.reader.feed_eof()
         async with asyncio.timeout(1):
@@ -492,7 +508,7 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
                     self.subTest(setting=setting, limit=limit),
                     self.assertRaisesRegex(ValueError, setting),
                 ):
-                    TcpSession(
+                    TCPSession(
                         self.reader,
                         self.writer,
                         limits=SessionLimits(**{setting: limit}),

@@ -1,12 +1,13 @@
 from typing import assert_never
 
 from velis.core.broker import Broker, Subscriber
-from velis.core.commands import (
+from velis.core.messages import (
     MISSING,
     NIL,
     NO_EXPIRY,
     OK,
     PERSISTENT,
+    TTL,
     Command,
     Delete,
     Delivered,
@@ -21,8 +22,7 @@ from velis.core.commands import (
     Set,
     Subscribe,
     Subscribed,
-    Ttl,
-    TtlValue,
+    TTLValue,
     Unsubscribe,
     Unsubscribed,
     Value,
@@ -34,11 +34,11 @@ def _ok_or_nil(found: bool) -> Ok | Nil:
     return OK if found else NIL
 
 
-def _ttl_reply(ms: int) -> Nil | Persistent | TtlValue:
+def _ttl_reply(ms: int) -> Nil | Persistent | TTLValue:
     """Map Store.ttl() results to replies: MISSING, NO_EXPIRY or remaining ms."""
     if ms == MISSING:
         return NIL
-    return PERSISTENT if ms == NO_EXPIRY else TtlValue(ms)
+    return PERSISTENT if ms == NO_EXPIRY else TTLValue(ms)
 
 
 class Engine:
@@ -68,7 +68,7 @@ class Engine:
                 return _ok_or_nil(self._store.delete(key))
             case Persist(key):
                 return _ok_or_nil(self._store.persist(key))
-            case Ttl(key):
+            case TTL(key):
                 return _ttl_reply(self._store.ttl(key))
             case Subscribe(channel):
                 self._broker.subscribe(channel, subscriber)

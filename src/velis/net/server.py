@@ -2,9 +2,9 @@ import asyncio
 import contextlib
 import logging
 
-from velis.config import Server as ServerConfig
-from velis.core.commands import Err
+from velis.config import ServerConfig
 from velis.core.engine import Engine
+from velis.core.messages import Err
 from velis.errors import CommandError, ProtocolError
 from velis.net.connection import Connection, share_message_encodings
 from velis.net.protocol import DEFAULT_PROTOCOL, WireProtocol
@@ -13,7 +13,7 @@ log = logging.getLogger(__name__)
 COMMANDS_PER_TURN = 64
 
 
-class TcpServer:
+class TCPServer:
     """Serve commands over TCP within a configured connection limit."""
 
     def __init__(

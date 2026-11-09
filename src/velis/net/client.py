@@ -2,9 +2,10 @@ from types import TracebackType
 from typing import Self, final
 
 from velis.codec import Codec, Identity
-from velis.core.commands import (
+from velis.core.messages import (
     MISSING,
     NO_EXPIRY,
+    TTL,
     Command,
     Delete,
     Delivered,
@@ -21,15 +22,14 @@ from velis.core.commands import (
     Set,
     Subscribe,
     Subscribed,
-    Ttl,
-    TtlValue,
+    TTLValue,
     Unsubscribe,
     Unsubscribed,
     Value,
 )
 from velis.errors import CommandError, ProtocolError
 from velis.net.protocol import DEFAULT_PROTOCOL, WireProtocol
-from velis.net.session import DEFAULT_LIMITS, Session, SessionLimits, TcpSession
+from velis.net.session import DEFAULT_SESSION_LIMITS, Session, SessionLimits, TCPSession
 
 DEFAULT_CODEC: Codec[bytes, bytes] = Identity()
 
@@ -58,10 +58,10 @@ class Client:
         codec: Codec[bytes, bytes] = DEFAULT_CODEC,
         *,
         wire: WireProtocol = DEFAULT_PROTOCOL,
-        limits: SessionLimits = DEFAULT_LIMITS,
+        limits: SessionLimits = DEFAULT_SESSION_LIMITS,
     ) -> Self:
         """Create a TCP client with bounded requests and unread messages."""
-        session = await TcpSession.connect(host, port, wire=wire, limits=limits)
+        session = await TCPSession.connect(host, port, wire=wire, limits=limits)
         return cls(session, codec)
 
     async def __aenter__(self) -> Self:
@@ -129,9 +129,9 @@ class Client:
 
     async def ttl(self, key: str) -> int:
         """Remaining milliseconds; MISSING (-2) or NO_EXPIRY (-1) otherwise."""
-        command = Ttl(key)
+        command = TTL(key)
         match await self._request(command):
-            case TtlValue(ms):
+            case TTLValue(ms):
                 return ms
             case Persistent():
                 return NO_EXPIRY

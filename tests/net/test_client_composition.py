@@ -4,8 +4,8 @@ from tests.codec.helpers import Prefix, Reverse
 from tests.helpers import RecordingSubscriber
 from velis.codec import CompositeCodec
 from velis.core.broker import Broker
-from velis.core.commands import Command, Err, Message, Reply
 from velis.core.engine import Engine
+from velis.core.messages import Command, Err, Message, Reply
 from velis.core.store import Store
 from velis.errors import CommandError
 from velis.net.client import Client

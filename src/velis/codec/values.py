@@ -49,7 +49,7 @@ U64 = UInt(8)
 
 
 @dataclass(frozen=True, slots=True)
-class Utf8:
+class UTF8:
     def encode(self, value: str) -> bytes:
         try:
             return value.encode()

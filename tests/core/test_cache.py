@@ -3,7 +3,8 @@ import unittest
 from tests.helpers import ManualClock, RecordingSubscriber
 from velis.app import build_engine
 from velis.core.broker import Broker
-from velis.core.commands import (
+from velis.core.engine import Engine
+from velis.core.messages import (
     Delivered,
     Expire,
     Get,
@@ -15,7 +16,6 @@ from velis.core.commands import (
     Unsubscribe,
     Value,
 )
-from velis.core.engine import Engine
 from velis.core.store import Store
 
 

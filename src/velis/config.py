@@ -42,7 +42,7 @@ def _env_policy(name: str, default: EvictionPolicy) -> EvictionPolicy:
 
 
 @dataclass(frozen=True, slots=True)
-class Server:
+class ServerConfig:
     """Validated TCP listener and subscriber buffer settings.
 
     max_buffer caps queued server writes when pushing messages; allow
@@ -64,7 +64,7 @@ class Server:
         require_positive("max_subscriptions", self.max_subscriptions)
 
     @classmethod
-    def from_env(cls) -> Server:
+    def from_env(cls) -> ServerConfig:
         """Load listener settings from VELIS_* environment variables."""
         return cls(
             host=os.environ.get("VELIS_HOST", DEFAULT_HOST),
@@ -82,7 +82,7 @@ class Config:
     """Validated logging, TCP server, store and expiry sweep settings."""
 
     log_level: str = DEFAULT_LOG_LEVEL
-    server: Server = field(default_factory=Server)
+    server: ServerConfig = field(default_factory=ServerConfig)
     sweep_interval_ms: int = DEFAULT_SWEEP_INTERVAL_MS
     store: StoreLimits = field(default_factory=StoreLimits)
 
@@ -96,7 +96,7 @@ class Config:
         """Load configuration from VELIS_* environment variables."""
         return cls(
             log_level=os.environ.get("VELIS_LOG_LEVEL", DEFAULT_LOG_LEVEL).upper(),
-            server=Server.from_env(),
+            server=ServerConfig.from_env(),
             sweep_interval_ms=_env_int("VELIS_SWEEP_MS", DEFAULT_SWEEP_INTERVAL_MS),
             store=StoreLimits(
                 max_keys=_env_int("VELIS_MAX_KEYS", DEFAULT_MAX_KEYS),

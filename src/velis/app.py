@@ -10,7 +10,7 @@ from velis.core.broker import Broker
 from velis.core.engine import Engine
 from velis.core.store import Store
 from velis.net.protocol import DEFAULT_PROTOCOL, WireProtocol
-from velis.net.server import TcpServer
+from velis.net.server import TCPServer
 
 log = logging.getLogger(__name__)
 _DEFAULT_CONFIG = Config()
@@ -44,7 +44,7 @@ async def serve(
     *,
     engine: Engine | None = None,
     wire: WireProtocol = DEFAULT_PROTOCOL,
-) -> AsyncGenerator[TcpServer]:
+) -> AsyncGenerator[TCPServer]:
     """Own server and maintenance resources across startup, serving and cleanup.
 
     Supply an engine to reuse application state or an injected clock, and
@@ -55,7 +55,7 @@ async def serve(
     """
     if engine is None:
         engine = build_engine(config)
-    server = TcpServer(engine, config.server, wire=wire)
+    server = TCPServer(engine, config.server, wire=wire)
     try:
         await server.start()
         async with asyncio.TaskGroup() as workers:

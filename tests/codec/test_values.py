@@ -3,20 +3,20 @@ from typing import assert_type
 
 from tests.codec.helpers import Reverse
 from velis.codec import (
+    UTF8,
     CompositeCodec,
     Identity,
     LengthPrefixedField,
     UInt,
-    Utf8,
     Validate,
 )
 from velis.errors import ProtocolError
 
 
-class BinaryCodecTests(unittest.TestCase):
+class ValueCodecTests(unittest.TestCase):
     def test_typed_chain_composes_different_representations(self) -> None:
         chain = (
-            CompositeCodec.of(Utf8())
+            CompositeCodec.of(UTF8())
             | Reverse()
             | LengthPrefixedField(Identity(), 64, prefix=UInt(4))
         )
@@ -26,7 +26,7 @@ class BinaryCodecTests(unittest.TestCase):
         assert_type(chain.decode(b"\x00\x00\x00\x00"), str)
 
     def test_typed_chain_composition_and_identity(self) -> None:
-        chain = CompositeCodec.of(Utf8()) | CompositeCodec.of(Reverse())
+        chain = CompositeCodec.of(UTF8()) | CompositeCodec.of(Reverse())
         assert_type(chain, CompositeCodec[str, bytes])
         wrapped = chain | Identity()
         assert_type(wrapped, CompositeCodec[str, bytes])
@@ -38,7 +38,7 @@ class BinaryCodecTests(unittest.TestCase):
             if not value:
                 raise ValueError("empty text")
 
-        chain = CompositeCodec.of(Validate(nonempty)) | Utf8() | Reverse()
+        chain = CompositeCodec.of(Validate(nonempty)) | UTF8() | Reverse()
         assert_type(chain, CompositeCodec[str, bytes])
         self.assertEqual(chain.decode(chain.encode("hello")), "hello")
         with self.assertRaisesRegex(ValueError, "empty text"):
@@ -86,6 +86,6 @@ class BinaryCodecTests(unittest.TestCase):
 
     def test_utf8_rejects_invalid_data_in_both_directions(self) -> None:
         with self.assertRaisesRegex(ProtocolError, "invalid utf-8"):
-            Utf8().encode("\ud800")
+            UTF8().encode("\ud800")
         with self.assertRaisesRegex(ProtocolError, "invalid utf-8"):
-            Utf8().decode(b"\xff")
+            UTF8().decode(b"\xff")

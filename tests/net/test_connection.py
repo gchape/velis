@@ -6,7 +6,7 @@ from tests.codec.helpers import Reverse
 from tests.helpers import RecordingSubscriber
 from velis.codec import CompositeCodec, Identity, LengthPrefixedField, UInt
 from velis.core.broker import Broker
-from velis.core.commands import Message
+from velis.core.messages import Message
 from velis.net import protocol
 from velis.net.connection import Connection, share_message_encodings
 
@@ -17,14 +17,14 @@ class ConnectionDeliveryTests(unittest.TestCase):
     ) -> None:
         for transformed in (False, True):
             with self.subTest(transformed=transformed):
-                codec = Mock(wraps=protocol.FRAMES)
-                wire = protocol.WireProtocol(frame_codec=codec)
+                codec = Mock(wraps=protocol.SERVER_MESSAGES)
+                wire = protocol.WireProtocol(message_codec=codec)
                 if transformed:
                     wire = protocol.WireProtocol(
-                        frame_codec=CompositeCodec.of(codec) | Reverse()
+                        message_codec=CompositeCodec.of(codec) | Reverse()
                     )
-                other_codec = Mock(wraps=protocol.FRAMES)
-                other_wire = protocol.WireProtocol(frame_codec=other_codec)
+                other_codec = Mock(wraps=protocol.SERVER_MESSAGES)
+                other_wire = protocol.WireProtocol(message_codec=other_codec)
                 first = Connection(Mock(), self.writer, 16, wire=wire)
                 second = Connection(Mock(), self.writer, 16, wire=wire)
                 third = Connection(Mock(), self.writer, 16, wire=other_wire)
@@ -41,10 +41,12 @@ class ConnectionDeliveryTests(unittest.TestCase):
                     )
                     self.assertIs(first_data, second_data)
                     self.assertEqual(
-                        wire.frames.decode(first_data), Message("news", b"hello")
+                        wire.framed_messages.decode(first_data),
+                        Message("news", b"hello"),
                     )
                     self.assertEqual(
-                        other_wire.frames.decode(third_data), Message("news", b"hello")
+                        other_wire.framed_messages.decode(third_data),
+                        Message("news", b"hello"),
                     )
 
     def setUp(self) -> None:
@@ -82,7 +84,7 @@ class ConnectionDeliveryTests(unittest.TestCase):
 
     def test_encoding_failure_drops_only_subscriber_and_preserves_fanout(self) -> None:
         wire = protocol.WireProtocol(
-            frame_codec=CompositeCodec.of(protocol.FRAMES)
+            message_codec=CompositeCodec.of(protocol.SERVER_MESSAGES)
             | LengthPrefixedField(Identity(), 64, prefix=UInt(4))
         )
         failing = Connection(Mock(), self.writer, 16, wire=wire)

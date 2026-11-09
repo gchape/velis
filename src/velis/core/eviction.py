@@ -13,7 +13,7 @@ class Eviction(Protocol):
     def victim(self) -> str: ...
 
 
-class Lru:
+class LRU:
     """Promote accesses to the newest end and evict the oldest key."""
 
     def __init__(self) -> None:
@@ -31,7 +31,7 @@ class Lru:
         return next(iter(self._order))
 
 
-class Fifo:
+class FIFO:
     """Evict the oldest inserted key; hits change nothing."""
 
     def __init__(self) -> None:
@@ -48,7 +48,7 @@ class Fifo:
         return next(iter(self._order))
 
 
-class Lfu:
+class LFU:
     """Evict the least frequently used key; ties go to the least recently used."""
 
     def __init__(self) -> None:

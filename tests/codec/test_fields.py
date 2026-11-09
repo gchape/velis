@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import Mock
 
-from velis.codec import Identity, LengthPrefixedField, UInt, Utf8
+from velis.codec import UTF8, Identity, LengthPrefixedField, UInt
 from velis.codec.cursor import Cursor
 from velis.errors import ProtocolError
 
@@ -21,7 +21,7 @@ class LengthPrefixedFieldTests(unittest.TestCase):
                     cursor.finish()
 
     def test_limits_fit_the_prefix_and_count_encoded_bytes(self) -> None:
-        field = LengthPrefixedField(Utf8(), 2, prefix=UInt(1))
+        field = LengthPrefixedField(UTF8(), 2, prefix=UInt(1))
         self.assertEqual(field.encode("é"), b"\x02\xc3\xa9")
         self.assertEqual(field.decode(b"\x02\xc3\xa9"), "é")
         with self.assertRaisesRegex(ProtocolError, "too long"):

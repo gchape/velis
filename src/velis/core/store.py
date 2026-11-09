@@ -3,9 +3,9 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import NamedTuple
 
-from velis.core.clock import Clock, SystemClock
-from velis.core.commands import MISSING, NO_EXPIRY
-from velis.core.eviction import Eviction, Fifo, Lfu, Lru, Random
+from velis.core.clock import Clock, MonotonicClock
+from velis.core.eviction import FIFO, LFU, LRU, Eviction, Random
+from velis.core.messages import MISSING, NO_EXPIRY
 from velis.core.timing_wheel import TimingWheel
 from velis.errors import CapacityError, CommandError
 from velis.validation import require_positive
@@ -39,9 +39,9 @@ class EvictionPolicy(StrEnum):
 
 _POLICIES: dict[EvictionPolicy, Callable[[], Eviction]] = {
     EvictionPolicy.REJECT: _Reject,
-    EvictionPolicy.LRU: Lru,
-    EvictionPolicy.FIFO: Fifo,
-    EvictionPolicy.LFU: Lfu,
+    EvictionPolicy.LRU: LRU,
+    EvictionPolicy.FIFO: FIFO,
+    EvictionPolicy.LFU: LFU,
     EvictionPolicy.RANDOM: Random,
 }
 
@@ -67,7 +67,7 @@ class StoreLimits:
         )
 
 
-DEFAULT_LIMITS = StoreLimits()
+DEFAULT_STORE_LIMITS = StoreLimits()
 
 
 class _Entry(NamedTuple):
@@ -90,9 +90,9 @@ class Store:
         self,
         clock: Clock | None = None,
         *,
-        limits: StoreLimits = DEFAULT_LIMITS,
+        limits: StoreLimits = DEFAULT_STORE_LIMITS,
     ) -> None:
-        self._clock: Clock = SystemClock() if clock is None else clock
+        self._clock: Clock = MonotonicClock() if clock is None else clock
         self._limits = limits
         self._entries: dict[str, _Entry] = {}
         self._stored_bytes = 0

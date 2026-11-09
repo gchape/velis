@@ -6,7 +6,7 @@ import logging
 from collections.abc import AsyncGenerator, Generator
 from contextvars import ContextVar
 
-from velis.core.commands import Command, Message, Reply
+from velis.core.messages import Command, Message, Reply
 from velis.errors import ProtocolError
 from velis.net.protocol import DEFAULT_PROTOCOL, WireProtocol
 
@@ -55,10 +55,10 @@ class Connection:
 
     def write_reply(self, reply: Reply) -> None:
         """Validate and encode the complete reply before writing any bytes."""
-        self._writer.write(self._wire.frames.encode(reply))
+        self._writer.write(self._wire.framed_messages.encode(reply))
 
     def _encode(self, channel: str, payload: bytes) -> bytes:
-        return self._wire.frames.encode(Message(channel, payload))
+        return self._wire.framed_messages.encode(Message(channel, payload))
 
     def _encode_push(self, channel: str, payload: bytes) -> bytes:
         """Encode once per wire protocol within the current dispatch scope."""

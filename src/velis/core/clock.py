@@ -11,7 +11,7 @@ class Clock(Protocol):
 
 
 @final
-class SystemClock:
+class MonotonicClock:
     """Read the system monotonic clock without instance state."""
 
     @staticmethod

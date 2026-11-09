@@ -65,7 +65,7 @@ class Delete:
 
 
 @dataclass(frozen=True, slots=True)
-class Ttl:
+class TTL:
     """Read a key's remaining TTL in milliseconds."""
 
     key: str
@@ -79,7 +79,7 @@ class Persist:
 
 
 type Command = (
-    Get | Set | Expire | Delete | Ttl | Persist | Subscribe | Unsubscribe | Publish
+    Get | Set | Expire | Delete | TTL | Persist | Subscribe | Unsubscribe | Publish
 )
 
 
@@ -129,7 +129,7 @@ class Delivered:
 
 
 @dataclass(frozen=True, slots=True)
-class TtlValue:
+class TTLValue:
     """Remaining TTL in milliseconds."""
 
     ms: int
@@ -148,7 +148,7 @@ type Reply = (
     | Subscribed
     | Unsubscribed
     | Delivered
-    | TtlValue
+    | TTLValue
     | Persistent
 )
 

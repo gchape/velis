@@ -25,11 +25,7 @@ def build_engine(config: Config = _DEFAULT_CONFIG) -> Engine:
 
 
 async def _maintain(engine: Engine, interval: float) -> None:
-    """Sweep periodically and yield between rounds while ready timers remain.
-
-    The interval is in seconds. Cascades count as maintenance work even when a
-    round expires no values.
-    """
+    """Sweep periodically, yielding between due batches; interval is in seconds."""
     while True:
         await asyncio.sleep(interval)
         engine.sweep()

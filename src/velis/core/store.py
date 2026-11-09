@@ -5,8 +5,8 @@ from typing import NamedTuple
 
 from velis.core.clock import Clock, MonotonicClock
 from velis.core.eviction import DEFAULT_EVICTION_POLICY, EvictionPolicy
+from velis.core.indexed_heap import IndexedBinaryHeap
 from velis.core.messages import MISSING, NO_EXPIRY
-from velis.core.timing_wheel import TimingWheel
 from velis.errors import CapacityError, CommandError
 from velis.validation import require_positive
 
@@ -63,7 +63,7 @@ class Store:
         self._entries: dict[str, _Entry] = {}
         self._stored_bytes = 0
         self._eviction = limits.eviction_policy.create()
-        self._expiry = TimingWheel(self._clock.now_ms())
+        self._expiry = IndexedBinaryHeap()
 
     def __len__(self) -> int:
         """Return the stored key count without purging expired entries."""
@@ -76,7 +76,7 @@ class Store:
 
     @property
     def has_due_expirations(self) -> bool:
-        """Whether due timers or wheel cascades need another bounded sweep."""
+        """Whether due timers need another bounded sweep."""
         return self._expiry.has_due(self._clock.now_ms())
 
     def _remove(self, key: str) -> bool:
@@ -167,7 +167,7 @@ class Store:
         return self._live(key) is not None and self._expiry.clear(key)
 
     def sweep(self, limit: int = 1000) -> int:
-        """Remove due keys, processing at most limit timers, including cascades."""
+        """Remove at most limit due keys in deadline order."""
         return sum(
             self._remove(key)
             for key in self._expiry.pop_due(self._clock.now_ms(), limit)

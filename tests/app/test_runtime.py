@@ -8,8 +8,7 @@ from velis.app import _maintain, serve
 from velis.config import Config, ServerConfig
 from velis.core.broker import Broker
 from velis.core.engine import Engine
-from velis.core.eviction import EvictionPolicy
-from velis.core.store import Store, StoreLimits
+from velis.core.store import Store
 from velis.net.server import TCPServer
 
 
@@ -18,7 +17,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         clock = ManualClock()
-        store = Store(clock, limits=StoreLimits(eviction_policy=EvictionPolicy.REJECT))
+        store = Store(clock)
         for index in range(3001):
             key = str(index)
             store.set(key, b"v")
@@ -46,11 +45,11 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(store), 0)
         self.assertEqual(store.stored_bytes, 0)
 
-    async def test_maintenance_continues_after_round_only_cascading_timers(
+    async def test_maintenance_leaves_future_timers_until_the_next_interval(
         self,
     ) -> None:
         clock = ManualClock()
-        store = Store(clock, limits=StoreLimits(eviction_policy=EvictionPolicy.REJECT))
+        store = Store(clock)
         for index in range(1000):
             key = f"a{index}"
             store.set(key, b"v")
@@ -75,7 +74,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertRaises(asyncio.CancelledError),
         ):
             await _maintain(Engine(store, Broker()), 60)
-        self.assertEqual(yields, 1)
+        self.assertEqual(yields, 0)
         self.assertEqual(len(store), 1000)
         self.assertFalse(store.has_due_expirations)
 

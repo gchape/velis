@@ -1,5 +1,6 @@
 import unittest
 from typing import assert_type
+from unittest.mock import Mock
 
 from tests.codec.helpers import Reverse
 from velis.codec import (
@@ -14,6 +15,12 @@ from velis.errors import ProtocolError
 
 
 class ValueCodecTests(unittest.TestCase):
+    def test_boolean_validation_result_rejects_in_both_directions(self) -> None:
+        codec = Validate[str](Mock(return_value=False))
+        for transform in (codec.encode, codec.decode):
+            with self.assertRaises(ProtocolError):
+                transform("hello")
+
     def test_typed_chain_composes_different_representations(self) -> None:
         chain = (
             CompositeCodec.of(UTF8())
@@ -34,16 +41,17 @@ class ValueCodecTests(unittest.TestCase):
         self.assertEqual(CompositeCodec.of(wrapped).codecs, wrapped.codecs)
 
     def test_rules_validate_both_directions_at_their_position(self) -> None:
-        def nonempty(value: str) -> None:
+        def nonempty(value: str) -> str | None:
             if not value:
-                raise ValueError("empty text")
+                return "empty text"
+            return None
 
         chain = CompositeCodec.of(Validate(nonempty)) | UTF8() | Reverse()
         assert_type(chain, CompositeCodec[str, bytes])
         self.assertEqual(chain.decode(chain.encode("hello")), "hello")
-        with self.assertRaisesRegex(ValueError, "empty text"):
+        with self.assertRaisesRegex(ProtocolError, "empty text"):
             chain.encode("")
-        with self.assertRaisesRegex(ValueError, "empty text"):
+        with self.assertRaisesRegex(ProtocolError, "empty text"):
             chain.decode(b"")
 
     def test_unsigned_integer_boundaries_and_exact_width(self) -> None:

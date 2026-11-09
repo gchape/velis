@@ -1,11 +1,31 @@
 import unittest
 
-from velis.codec import U32, UTF8, FixedLengthField, Identity, LengthPrefixedField, UInt
-from velis.codec.cursor import Cursor
+from velis.codec import (
+    U32,
+    UTF8,
+    Cursor,
+    CursorCodec,
+    FixedLengthField,
+    Identity,
+    LengthPrefixedField,
+    UInt,
+)
 from velis.errors import ProtocolError
 
 
 class CursorTests(unittest.TestCase):
+    def test_custom_cursor_codec_requires_exact_consumption(self) -> None:
+        class Pair(CursorCodec[bytes]):
+            def read(self, cursor: Cursor) -> bytes:
+                return cursor.take(2)
+
+        codec = Pair()
+        self.assertEqual(codec.decode(b"ab"), b"ab")
+        with self.assertRaisesRegex(ProtocolError, "trailing bytes"):
+            codec.decode(b"abc")
+        with self.assertRaisesRegex(ProtocolError, "truncated record: need 2 bytes"):
+            codec.decode(b"a")
+
     def test_context_requires_complete_consumption_on_normal_exit(self) -> None:
         with Cursor(b"abc") as cursor:
             self.assertEqual(cursor.take(3), b"abc")

@@ -5,7 +5,7 @@ from inspect import Parameter, signature
 from typing import Any
 
 from velis.codec.cursor import Cursor
-from velis.codec.fields import Field, LengthPrefixedField
+from velis.codec.fields import CursorCodec, Field, LengthPrefixedField
 from velis.codec.values import U32, UTF8
 from velis.errors import ProtocolError
 
@@ -13,7 +13,7 @@ _POSITIONAL = (Parameter.POSITIONAL_ONLY, Parameter.POSITIONAL_OR_KEYWORD)
 TAG = LengthPrefixedField(UTF8(), 32, prefix=U32)
 
 
-class Record[T]:
+class Record[T](CursorCodec[T]):
     """Encode constructor fields in order, one codec per positional parameter.
 
     Each parameter must correspond to a readable attribute of the same name.
@@ -41,12 +41,8 @@ class Record[T]:
     def read(self, cursor: Cursor) -> T:
         return self.cls(*(codec.read(cursor) for _, codec in self._parts))
 
-    def decode(self, data: bytes) -> T:
-        with Cursor(data) as cursor:
-            return self.read(cursor)
 
-
-class Choice[T]:
+class Choice[T](CursorCodec[T]):
     """Choose a Record by a text tag; one table drives both directions."""
 
     def __init__(self, kind: str, variants: Mapping[str, Record[Any]]) -> None:
@@ -78,7 +74,3 @@ class Choice[T]:
         if (record := self._by_tag.get(tag)) is None:
             raise ProtocolError(f"unknown {self._kind}: {tag!r}")
         return record.read(cursor)
-
-    def decode(self, data: bytes) -> T:
-        with Cursor(data) as cursor:
-            return self.read(cursor)

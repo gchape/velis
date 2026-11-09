@@ -487,5 +487,5 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         )
         with self.assertRaisesRegex(ProtocolError, "unknown command"):
             protocol.COMMANDS.decode(protocol.SERVER_MESSAGES.encode(Ok()))
-        with self.assertRaisesRegex(ProtocolError, "unknown frame"):
+        with self.assertRaisesRegex(ProtocolError, "unknown server message"):
             protocol.SERVER_MESSAGES.decode(protocol.COMMANDS.encode(Get("key")))

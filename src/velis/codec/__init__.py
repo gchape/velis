@@ -1,5 +1,7 @@
 from velis.codec.base import Codec, CompositeCodec
+from velis.codec.cursor import Cursor
 from velis.codec.fields import (
+    CursorCodec,
     Field,
     FixedLengthField,
     LengthPrefixedField,
@@ -15,6 +17,8 @@ __all__ = [
     "Choice",
     "Codec",
     "CompositeCodec",
+    "Cursor",
+    "CursorCodec",
     "Field",
     "FixedLengthField",
     "Identity",

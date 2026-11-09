@@ -1,3 +1,5 @@
+"""Exact byte consumption and whole-record validation."""
+
 from typing import Self
 
 from velis.errors import ProtocolError

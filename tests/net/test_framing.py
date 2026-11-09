@@ -32,7 +32,9 @@ class StreamFramingTests(unittest.IsolatedAsyncioTestCase):
                         reader = asyncio.StreamReader()
                         async with asyncio.TaskGroup() as tasks:
                             tasks.create_task(feed_chunks(reader, encoded, chunk_size))
-                            decoded = [body async for body in wire._read_bodies(reader)]
+                            decoded = [
+                                body async for body in wire._read(reader, Identity())
+                            ]
                         self.assertEqual(decoded, bodies)
 
     async def test_oversized_header_fails_before_body_is_requested(self) -> None:
@@ -47,7 +49,7 @@ class StreamFramingTests(unittest.IsolatedAsyncioTestCase):
                     return_value=(11).to_bytes(prefix_length)
                 )
                 with self.assertRaisesRegex(ProtocolError, "too long"):
-                    await anext(wire._read_bodies(reader))
+                    await anext(wire._read(reader, Identity()))
                 reader.readexactly.assert_awaited_once_with(prefix_length)
 
     async def test_clean_eof_and_truncated_next_frame(self) -> None:
@@ -65,14 +67,15 @@ class StreamFramingTests(unittest.IsolatedAsyncioTestCase):
                     if complete == first + second:
                         expected.append(b"abcdef")
                     self.assertEqual(
-                        [body async for body in wire._read_bodies(reader)], expected
+                        [body async for body in wire._read(reader, Identity())],
+                        expected,
                     )
             for end in range(1, len(second)):
                 with self.subTest(prefix_length=prefix_length, end=end):
                     reader = asyncio.StreamReader()
                     reader.feed_data(first + second[:end])
                     reader.feed_eof()
-                    bodies = wire._read_bodies(reader)
+                    bodies = wire._read(reader, Identity())
                     self.assertEqual(await anext(bodies), b"first")
                     with self.assertRaises(asyncio.IncompleteReadError) as raised:
                         await anext(bodies)

@@ -1,5 +1,6 @@
 """Cursor-readable fields with explicit byte boundaries."""
 
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -13,6 +14,19 @@ class Field[T](Codec[T, bytes], Protocol):
     """A codec that can read one complete field from a record cursor."""
 
     def read(self, cursor: Cursor) -> T: ...
+
+
+class CursorCodec[T](ABC):
+    """Decode one cursor-readable value and require complete consumption."""
+
+    __slots__ = ()
+
+    @abstractmethod
+    def read(self, cursor: Cursor) -> T: ...
+
+    def decode(self, data: bytes) -> T:
+        with Cursor(data) as cursor:
+            return self.read(cursor)
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,7 +58,7 @@ class FixedLengthField[T]:
 
 
 @dataclass(frozen=True, slots=True)
-class LengthPrefixedField[T]:
+class LengthPrefixedField[T](CursorCodec[T]):
     """A field whose encoded byte length precedes its encoded value.
 
     prefix explicitly selects the unsigned integer codec for the length.
@@ -74,7 +88,3 @@ class LengthPrefixedField[T]:
         length = self.prefix.decode(cursor.take(self.prefix.length))
         self.check_length(length)
         return self.codec.decode(cursor.take(length))
-
-    def decode(self, data: bytes) -> T:
-        with Cursor(data) as cursor:
-            return self.read(cursor)

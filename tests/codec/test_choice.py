@@ -78,9 +78,10 @@ class ChoiceTests(unittest.TestCase):
             Record(str)
 
     def test_composed_integer_field_preserves_its_layout(self) -> None:
-        def positive(value: int) -> None:
+        def positive(value: int) -> str | None:
             if value <= 0:
-                raise ProtocolError("must be positive")
+                return "must be positive"
+            return None
 
         integer = FixedLengthField(CompositeCodec.of(Validate(positive)) | UInt(2), 2)
         codec = Choice(

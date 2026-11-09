@@ -1,4 +1,4 @@
-"""Composable command/frame codecs and bounded TCP message framing.
+"""Composable command/message codecs and bounded TCP message framing.
 
 Default messages use a u32 body length followed by the encoded body. Bodies
 use a text tag and ordered fields; tagged tables map each tag to its dataclass
@@ -47,7 +47,6 @@ from velis.core.messages import (
     Unsubscribed,
     Value,
 )
-from velis.errors import ProtocolError
 
 MAX_FIELD_BYTES = 1 << 20
 MAX_FRAME_BODY_BYTES = 2 * MAX_FIELD_BYTES
@@ -56,14 +55,17 @@ type ServerMessage = Reply | Message
 
 BYTES = LengthPrefixedField(Identity(), MAX_FIELD_BYTES, prefix=U32)
 TEXT = LengthPrefixedField(UTF8(), MAX_FIELD_BYTES, prefix=U32)
+U32_FIELD = FixedLengthField(U32, U32.length)
+U64_FIELD = FixedLengthField(U64, U64.length)
 
 
-def _text_rule(what: str, max_chars: int) -> Callable[[str], None]:
-    def check(value: str) -> None:
+def _text_rule(what: str, max_chars: int) -> Callable[[str], str | None]:
+    def check(value: str) -> str | None:
         if not value:
-            raise ProtocolError(f"{what} must not be empty")
+            return f"{what} must not be empty"
         if len(value) > max_chars:
-            raise ProtocolError(f"{what} exceeds {max_chars} characters")
+            return f"{what} exceeds {max_chars} characters"
+        return None
 
     return check
 
@@ -85,7 +87,7 @@ COMMANDS: Choice[Command] = Choice(
     {
         "GET": Record(Get, KEY),
         "SET": Record(Set, KEY, BYTES),
-        "EXPIRE": Record(Expire, KEY, FixedLengthField(U64, 8)),
+        "EXPIRE": Record(Expire, KEY, U64_FIELD),
         "DEL": Record(Delete, KEY),
         "TTL": Record(TTL, KEY),
         "PERSIST": Record(Persist, KEY),
@@ -96,7 +98,7 @@ COMMANDS: Choice[Command] = Choice(
 )
 
 SERVER_MESSAGES: Choice[ServerMessage] = Choice(
-    "frame",
+    "server message",
     {
         "OK": Record(Ok),
         "NIL": Record(Nil),
@@ -104,8 +106,8 @@ SERVER_MESSAGES: Choice[ServerMessage] = Choice(
         "ERR": Record(Err, TEXT),
         "SUBSCRIBED": Record(Subscribed, TEXT),
         "UNSUBSCRIBED": Record(Unsubscribed, TEXT),
-        "DELIVERED": Record(Delivered, FixedLengthField(U32, 4)),
-        "TTL_VALUE": Record(TTLValue, FixedLengthField(U64, 8)),
+        "DELIVERED": Record(Delivered, U32_FIELD),
+        "TTL_VALUE": Record(TTLValue, U64_FIELD),
         "PERSISTENT": Record(Persistent),
         "MESSAGE": Record(Message, TEXT, BYTES),
     },
@@ -136,7 +138,7 @@ class WireProtocol:
 
     @cached_property
     def framed_messages(self) -> CompositeCodec[ServerMessage, bytes]:
-        """Encode and decode whole framed replies and pushes."""
+        """Encode and decode complete server messages, including replies and pushes."""
         return CompositeCodec.of(self.message_codec) | self.framing
 
     async def _read_body(self, reader: asyncio.StreamReader) -> bytes | None:

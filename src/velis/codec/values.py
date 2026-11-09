@@ -65,18 +65,17 @@ class UTF8:
 
 @dataclass(frozen=True, slots=True)
 class Validate[T]:
-    """Apply a rule in both directions, returning the unchanged value.
+    """Preserve a value unless its rule returns an error message.
 
-    The rule raises an exception when it rejects a value; a return value
-    is ignored, so a rule that returns False will not reject anything.
-    Place this stage where its input type and meaning match the data
-    being validated.
+    Return None to accept the value; a message raises ProtocolError in either
+    direction. Place the rule at the representation it validates.
     """
 
-    rule: Callable[[T], None]
+    rule: Callable[[T], str | None]
 
     def encode(self, value: T) -> T:
-        self.rule(value)
+        if (problem := self.rule(value)) is not None:
+            raise ProtocolError(problem)
         return value
 
     decode = encode

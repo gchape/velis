@@ -9,7 +9,7 @@ replies carry no request identifiers.
 import asyncio
 from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass, field
-from functools import cached_property
+from functools import cached_property, partial
 
 from velis.codec import (
     U32,
@@ -18,7 +18,6 @@ from velis.codec import (
     Choice,
     Codec,
     CompositeCodec,
-    FixedLengthField,
     Identity,
     LengthPrefixedField,
     Record,
@@ -51,29 +50,25 @@ from velis.core.messages import (
 MAX_FIELD_BYTES = 1 << 20
 MAX_FRAME_BODY_BYTES = 2 * MAX_FIELD_BYTES
 
-type ServerMessage = Reply | Message
+type ServerFrame = Reply | Message
 
 BYTES = LengthPrefixedField(Identity(), MAX_FIELD_BYTES, prefix=U32)
 TEXT = LengthPrefixedField(UTF8(), MAX_FIELD_BYTES, prefix=U32)
-U32_FIELD = FixedLengthField(U32, U32.length)
-U64_FIELD = FixedLengthField(U64, U64.length)
 
 
-def _text_rule(what: str, max_chars: int) -> Callable[[str], str | None]:
-    def check(value: str) -> str | None:
-        if not value:
-            return f"{what} must not be empty"
-        if len(value) > max_chars:
-            return f"{what} exceeds {max_chars} characters"
-        return None
-
-    return check
+def _check_text(value: str, *, what: str, max_chars: int) -> str | None:
+    if not value:
+        return f"{what} must not be empty"
+    if len(value) > max_chars:
+        return f"{what} exceeds {max_chars} characters"
+    return None
 
 
 def _text_field(what: str, max_chars: int) -> LengthPrefixedField[str]:
     """Bound text by characters and allow up to four UTF-8 bytes per character."""
+    rule = Validate[str](partial(_check_text, what=what, max_chars=max_chars))
     return LengthPrefixedField(
-        CompositeCodec.of(Validate(_text_rule(what, max_chars))) | UTF8(),
+        CompositeCodec.of(rule) | UTF8(),
         max_chars * 4,
         prefix=U32,
     )
@@ -87,7 +82,7 @@ COMMANDS: Choice[Command] = Choice(
     {
         "GET": Record(Get, KEY),
         "SET": Record(Set, KEY, BYTES),
-        "EXPIRE": Record(Expire, KEY, U64_FIELD),
+        "EXPIRE": Record(Expire, KEY, U64),
         "DEL": Record(Delete, KEY),
         "TTL": Record(TTL, KEY),
         "PERSIST": Record(Persist, KEY),
@@ -97,7 +92,7 @@ COMMANDS: Choice[Command] = Choice(
     },
 )
 
-SERVER_MESSAGES: Choice[ServerMessage] = Choice(
+SERVER_MESSAGES: Choice[ServerFrame] = Choice(
     "server message",
     {
         "OK": Record(Ok),
@@ -106,12 +101,30 @@ SERVER_MESSAGES: Choice[ServerMessage] = Choice(
         "ERR": Record(Err, TEXT),
         "SUBSCRIBED": Record(Subscribed, TEXT),
         "UNSUBSCRIBED": Record(Unsubscribed, TEXT),
-        "DELIVERED": Record(Delivered, U32_FIELD),
-        "TTL_VALUE": Record(TTLValue, U64_FIELD),
+        "DELIVERED": Record(Delivered, U32),
+        "TTL_VALUE": Record(TTLValue, U64),
         "PERSISTENT": Record(Persistent),
         "MESSAGE": Record(Message, TEXT, BYTES),
     },
 )
+
+
+class PushEncoder:
+    """Encode a push once for consecutive deliveries of the same object.
+
+    Retain only the latest push and its bytes. Equal but distinct pushes are
+    encoded separately; encoding failures propagate without replacing the cache.
+    """
+
+    def __init__(self, encode: Callable[[Message], bytes]) -> None:
+        self._encode = encode
+        self._last: tuple[Message, bytes] | None = None
+
+    def __call__(self, message: Message) -> bytes:
+        last = self._last
+        if last is None or last[0] is not message:
+            self._last = last = (message, self._encode(message))
+        return last[1]
 
 
 @dataclass(frozen=True)
@@ -124,7 +137,7 @@ class WireProtocol:
     """
 
     command_codec: Codec[Command, bytes] = COMMANDS
-    message_codec: Codec[ServerMessage, bytes] = SERVER_MESSAGES
+    message_codec: Codec[ServerFrame, bytes] = SERVER_MESSAGES
     framing: LengthPrefixedField[bytes] = field(
         default_factory=lambda: LengthPrefixedField(
             Identity(), MAX_FRAME_BODY_BYTES, prefix=U32
@@ -137,9 +150,14 @@ class WireProtocol:
         return CompositeCodec.of(self.command_codec) | self.framing
 
     @cached_property
-    def framed_messages(self) -> CompositeCodec[ServerMessage, bytes]:
+    def framed_messages(self) -> CompositeCodec[ServerFrame, bytes]:
         """Encode and decode complete server messages, including replies and pushes."""
         return CompositeCodec.of(self.message_codec) | self.framing
+
+    @cached_property
+    def push_encoder(self) -> PushEncoder:
+        """Share the latest push encoding across connections using this instance."""
+        return PushEncoder(self.framed_messages.encode)
 
     async def _read_body(self, reader: asyncio.StreamReader) -> bytes | None:
         """Return one frame body, or None on EOF at a frame boundary.
@@ -168,7 +186,7 @@ class WireProtocol:
 
     def read_messages(
         self, reader: asyncio.StreamReader
-    ) -> AsyncGenerator[ServerMessage]:
+    ) -> AsyncGenerator[ServerFrame]:
         """Yield decoded replies and pushes until the server disconnects cleanly."""
         return self._read(reader, self.message_codec)
 

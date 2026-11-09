@@ -79,26 +79,21 @@ class Client:
         """Close the session on both successful and exceptional scope exit."""
         await self.close()
 
-    async def _request(self, command: Command) -> Reply:
-        """Translate application error replies at the client API boundary."""
+    async def _call[R: Reply](self, command: Command, *accepted: type[R]) -> R:
+        """Send a command; raise error replies and reply types other than accepted."""
         reply = await self._session.request(command)
         if isinstance(reply, Err):
             raise CommandError(reply.message)
+        if not isinstance(reply, accepted):
+            raise _unexpected(command, reply)
         return reply
 
     async def _flag(self, command: Command) -> bool:
         """Interpret the common mutation acknowledgment: Ok is True, Nil False."""
         return isinstance(await self._call(command, Ok, Nil), Ok)
 
-    async def _call[R: Reply](self, command: Command, *accepted: type[R]) -> R:
-        """Validate the reply type once at the command boundary."""
-        reply = await self._request(command)
-        if not isinstance(reply, accepted):
-            raise _unexpected(command, reply)
-        return reply
-
-    async def _expect_reply(self, command: Command, expected: Reply) -> None:
-        """Validate acknowledgments, including the channel for subscriptions."""
+    async def _ack(self, command: Command, expected: Reply) -> None:
+        """Require the exact acknowledgment, including the echoed channel."""
         reply = await self._call(command, type(expected))
         if reply != expected:
             raise _unexpected(command, reply)
@@ -106,11 +101,11 @@ class Client:
     async def get(self, key: str) -> bytes | None:
         """Return the decoded value, or None for a missing or expired key."""
         reply = await self._call(Get(key), Value, Nil)
-        return None if isinstance(reply, Nil) else self._codec.decode(reply.value)
+        return self._codec.decode(reply.value) if isinstance(reply, Value) else None
 
     async def set(self, key: str, value: bytes) -> None:
         """Encode and store a value, clearing any previous TTL."""
-        await self._expect_reply(Set(key, self._codec.encode(value)), Ok())
+        await self._call(Set(key, self._codec.encode(value)), Ok)
 
     async def expire(self, key: str, ms: int) -> bool:
         """Set a TTL in milliseconds; return False if the key is missing."""
@@ -136,11 +131,11 @@ class Client:
 
     async def subscribe(self, channel: str) -> None:
         """Join a channel to receive server pushes."""
-        await self._expect_reply(Subscribe(channel), Subscribed(channel))
+        await self._ack(Subscribe(channel), Subscribed(channel))
 
     async def unsubscribe(self, channel: str) -> None:
         """Leave a channel without closing the connection."""
-        await self._expect_reply(Unsubscribe(channel), Unsubscribed(channel))
+        await self._ack(Unsubscribe(channel), Unsubscribed(channel))
 
     async def publish(self, channel: str, payload: bytes) -> int:
         """Encode a message and return the number of accepting subscribers."""

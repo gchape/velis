@@ -33,6 +33,40 @@ class SessionLimits:
 DEFAULT_SESSION_LIMITS = SessionLimits()
 
 
+class _MessageBuffer:
+    """Hold unread server messages within a count limit and a byte limit.
+
+    Each entry carries its size, measured once on arrival. Closing lets queued
+    messages drain before readers see the end.
+    """
+
+    def __init__(self, max_messages: int, max_bytes: int) -> None:
+        self._queue: asyncio.Queue[tuple[int, Message]] = asyncio.Queue(max_messages)
+        self._max_bytes = max_bytes
+        self._bytes = 0
+
+    def offer(self, message: Message) -> bool:
+        """Queue a message; return False if a limit would be exceeded."""
+        size = len(message.channel.encode()) + len(message.payload)
+        if self._bytes + size > self._max_bytes:
+            return False
+        try:
+            self._queue.put_nowait((size, message))
+        except asyncio.QueueFull:
+            return False
+        self._bytes += size
+        return True
+
+    async def take(self) -> Message:
+        """Wait for a message; raise QueueShutDown once closed and drained."""
+        size, message = await self._queue.get()
+        self._bytes -= size
+        return message
+
+    def close(self) -> None:
+        self._queue.shutdown()
+
+
 class Session(Protocol):
     """Exchange encoded application data independently of client codecs.
 
@@ -74,16 +108,12 @@ class TCPSession:
         self._wire = wire
         self._reader = reader
         self._writer = writer
-        self._slots = asyncio.Semaphore(limits.max_pending_requests)
+        self._slots = asyncio.BoundedSemaphore(limits.max_pending_requests)
         self._pending: deque[asyncio.Future[Reply]] = deque()
-        self._max_pending_bytes = limits.max_pending_bytes
-        self._queued_bytes = 0
-        # Each entry carries its byte size, measured once on arrival.
-        self._messages: asyncio.Queue[tuple[int, Message]] = asyncio.Queue(
-            maxsize=limits.max_pending_messages
+        self._messages = _MessageBuffer(
+            limits.max_pending_messages, limits.max_pending_bytes
         )
-        self._closed = False
-        self._close_reason = _CLOSED
+        self._close_reason: str | None = None
         self._reader_task = asyncio.create_task(self._receive_messages())
 
     @classmethod
@@ -100,33 +130,28 @@ class TCPSession:
         return cls(reader, writer, wire=wire, limits=limits)
 
     async def _receive_messages(self) -> None:
-        """Split the incoming stream into replies and server pushes."""
+        """Route replies and pushes until closure or a transport/protocol error.
+
+        EOF and OSError close normally; protocol errors preserve their reason.
+        Unexpected reader failures remain available to close() after cleanup.
+        """
         try:
             async with contextlib.aclosing(
                 self._wire.read_messages(self._reader)
             ) as messages:
                 async for message in messages:
-                    if isinstance(message, Message):
-                        self._enqueue_message(message)
-                    else:
+                    if not isinstance(message, Message):
                         self._resolve_reply(message)
-                    if self._closed:
+                    elif not self._messages.offer(message):
+                        self._begin_close("pending message buffer limit exceeded")
+                    if self._close_reason is not None:
                         break
         except ProtocolError as exc:
             self._begin_close(str(exc))
         except asyncio.IncompleteReadError, OSError:
-            pass  # EOF or any transport failure; ConnectionError is an OSError
+            pass
         finally:
             self._begin_close()
-
-    def _enqueue_message(self, message: Message) -> None:
-        """Buffer a publication within the message count and byte limits."""
-        size = len(message.channel.encode()) + len(message.payload)
-        if self._messages.full() or self._queued_bytes + size > self._max_pending_bytes:
-            self._begin_close("pending message buffer limit exceeded")
-            return
-        self._messages.put_nowait((size, message))
-        self._queued_bytes += size
 
     def _resolve_reply(self, reply: Reply) -> None:
         """Resolve the oldest request or discard its cancelled future's reply.
@@ -151,11 +176,11 @@ class TCPSession:
     def _begin_close(self, reason: str = _CLOSED) -> None:
         """Close and wake callers, preserving queued messages for draining.
 
+        Repeated calls retain the first close reason and do no further work.
         Mark failed futures as retrieved so abandoned callers leave no warnings.
         """
-        if self._closed:
+        if self._close_reason is not None:
             return
-        self._closed = True
         self._close_reason = reason
         self._writer.close()
         while self._pending:
@@ -163,7 +188,11 @@ class TCPSession:
             if not waiter.done():
                 waiter.set_exception(ConnectionError(reason))
                 waiter.exception()
-        self._messages.shutdown()
+        self._messages.close()
+
+    def _check_open(self) -> None:
+        if self._close_reason is not None:
+            raise ConnectionError(self._close_reason)
 
     def _submit(self, command: Command) -> asyncio.Future[Reply]:
         """Encode, write and queue one command without yielding to the loop.
@@ -171,8 +200,7 @@ class TCPSession:
         Staying synchronous keeps FIFO order equal to wire order. Once queued,
         the caller's slot belongs to the future: a reply or closure releases it.
         """
-        if self._closed:
-            raise ConnectionError(self._close_reason)
+        self._check_open()
         encoded = self._wire.framed_commands.encode(command)
         waiter = asyncio.get_running_loop().create_future()
         self._writer.write(encoded)
@@ -189,8 +217,7 @@ class TCPSession:
         it. Cancellation during drain also retains the future's position while
         discarding its eventual result.
         """
-        if self._closed:
-            raise ConnectionError(self._close_reason)
+        self._check_open()
         await self._slots.acquire()
         try:
             waiter = self._submit(command)
@@ -208,8 +235,7 @@ class TCPSession:
             await self.close()
             raise
         finally:
-            if not waiter.done():
-                waiter.cancel()
+            waiter.cancel()
 
     async def next_message(self) -> Message:
         """Wait for the next encoded message.
@@ -219,22 +245,21 @@ class TCPSession:
         have been drained and the connection is closed.
         """
         try:
-            size, message = await self._messages.get()
+            return await self._messages.take()
         except asyncio.QueueShutDown as exc:
             raise ConnectionError(self._close_reason) from exc
-        self._queued_bytes -= size
-        return message
 
     async def close(self) -> None:
         """Close the stream, wake waiting callers and stop the reader task.
 
         Safe to repeat. Cancelling the caller still propagates, and an
         unexpected reader failure is raised after cleanup completes.
+        Expected OSError failures while closing the transport are suppressed.
         """
         self._begin_close()
         self._reader_task.cancel()
         await asyncio.wait((self._reader_task,))
-        with contextlib.suppress(ConnectionError):
+        with contextlib.suppress(OSError):
             await self._writer.wait_closed()
         if not self._reader_task.cancelled():
             self._reader_task.result()

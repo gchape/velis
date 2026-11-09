@@ -35,6 +35,12 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ConnectionError):
                 await self.client.next_message()
 
+    async def test_close_suppresses_transport_oserror(self) -> None:
+        self.writer.wait_closed.side_effect = OSError("transport closed")
+        await self.session.close()
+        self.writer.wait_closed.assert_awaited_once()
+        self.assertTrue(self.session._reader_task.done())
+
     async def test_close_wakes_all_waiting_message_readers(self) -> None:
         pending = [asyncio.create_task(self.client.next_message()) for _ in range(3)]
         await asyncio.sleep(0)

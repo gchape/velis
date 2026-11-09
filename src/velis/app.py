@@ -1,26 +1,30 @@
-"""Composition root: wires config -> engine -> server, owns the lifecycle."""
+"""Compose the store, broker and TCP server and own their runtime lifecycle."""
 
 import asyncio
 import logging
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
-from velis.config import Config
-from velis.core.broker import Broker
+from velis.core.broker import DEFAULT_BROKER_LIMITS, Broker, BrokerLimits
 from velis.core.engine import Engine
-from velis.core.store import Store
+from velis.core.store import DEFAULT_STORE_LIMITS, Store, StoreLimits
 from velis.net.protocol import DEFAULT_PROTOCOL, WireProtocol
-from velis.net.server import TCPServer
+from velis.net.server import DEFAULT_SERVER_LIMITS, ServerLimits, TCPServer
+from velis.validation import require_positive
 
 log = logging.getLogger(__name__)
-_DEFAULT_CONFIG = Config()
+DEFAULT_SWEEP_INTERVAL_MS = 100
 
 
-def build_engine(config: Config = _DEFAULT_CONFIG) -> Engine:
+def build_engine(
+    *,
+    store_limits: StoreLimits = DEFAULT_STORE_LIMITS,
+    broker_limits: BrokerLimits = DEFAULT_BROKER_LIMITS,
+) -> Engine:
     """Create an engine with an empty in-memory store and pub-sub broker."""
     return Engine(
-        Store(limits=config.store),
-        Broker(max_subscriptions=config.server.max_subscriptions),
+        Store(limits=store_limits),
+        Broker(limits=broker_limits),
     )
 
 
@@ -36,8 +40,11 @@ async def _maintain(engine: Engine, interval: float) -> None:
 
 @asynccontextmanager
 async def serve(
-    config: Config,
+    server_limits: ServerLimits = DEFAULT_SERVER_LIMITS,
     *,
+    store_limits: StoreLimits = DEFAULT_STORE_LIMITS,
+    broker_limits: BrokerLimits = DEFAULT_BROKER_LIMITS,
+    sweep_interval_ms: int = DEFAULT_SWEEP_INTERVAL_MS,
     engine: Engine | None = None,
     wire: WireProtocol = DEFAULT_PROTOCOL,
 ) -> AsyncGenerator[TCPServer]:
@@ -45,21 +52,23 @@ async def serve(
 
     Supply an engine to reuse application state or an injected clock, and
     a wire protocol to compose custom serialization and validation.
+    Store and broker limits apply only when creating the default engine;
+    supplied engines keep their existing limits. Nonpositive sweep intervals
+    raise ValueError before any runtime resources are opened.
     Signal handling belongs to the CLI; embedding callers control this scope.
     Maintenance failure interrupts the caller and closes the server. TaskGroup
     reports worker or caller failures in an ExceptionGroup after cleanup.
     """
+    require_positive(sweep_interval_ms=sweep_interval_ms)
     if engine is None:
-        engine = build_engine(config)
+        engine = build_engine(store_limits=store_limits, broker_limits=broker_limits)
     async with (
-        TCPServer(engine, config.server, wire=wire) as server,
+        TCPServer(engine, server_limits, wire=wire) as server,
         asyncio.TaskGroup() as workers,
     ):
-        maintenance = workers.create_task(
-            _maintain(engine, config.sweep_interval_ms / 1000)
-        )
+        workers.create_task(_maintain(engine, sweep_interval_ms / 1000))
         try:
             yield server
         finally:
-            maintenance.cancel()
+            workers.cancel()
             log.info("shutting down")

@@ -4,7 +4,6 @@ import unittest
 
 from tests.codec.helpers import Reverse
 from velis.codec import CompositeCodec
-from velis.config import ServerConfig
 from velis.core.broker import Broker
 from velis.core.engine import Engine
 from velis.core.messages import (
@@ -21,7 +20,7 @@ from velis.core.messages import (
 from velis.core.store import MAX_TTL_MS, Store
 from velis.net import protocol
 from velis.net.client import Client
-from velis.net.server import TCPServer
+from velis.net.server import ServerLimits, TCPServer
 from velis.net.session import SessionLimits
 
 
@@ -29,7 +28,7 @@ class PipelineIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.store = Store()
         self.engine = Engine(self.store, Broker())
-        self.server = TCPServer(self.engine, ServerConfig("127.0.0.1", 0))
+        self.server = TCPServer(self.engine, ServerLimits("127.0.0.1", 0))
         await self.server.start()
         self.addAsyncCleanup(self.server.close)
 
@@ -74,7 +73,7 @@ class PipelineIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.store.set(str(i), str(i).encode())
         for wire in (protocol.DEFAULT_PROTOCOL, transformed):
             with self.subTest(wire=wire):
-                server = TCPServer(self.engine, ServerConfig("127.0.0.1", 0), wire=wire)
+                server = TCPServer(self.engine, ServerLimits("127.0.0.1", 0), wire=wire)
                 await server.start()
                 try:
                     async with await Client.connect(

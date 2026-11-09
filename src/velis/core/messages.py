@@ -1,8 +1,9 @@
 """Commands, replies and publication pushes as plain message data.
 
 The network layer translates bytes into these values. The engine receives
-commands and returns replies. TTL queries use MISSING (-2) and NO_EXPIRY (-1)
-when there is no remaining-milliseconds value.
+commands and returns replies. Client.ttl() uses MISSING (-2) and NO_EXPIRY (-1)
+when there is no remaining-milliseconds value; Store.ttl() uses TtlStatus.
+The payload-free reply instances OK, NIL and PERSISTENT are immutable and shared.
 """
 
 from dataclasses import dataclass
@@ -152,7 +153,6 @@ type Reply = (
     | Persistent
 )
 
-# Shared instances of the payload-free replies (safe: the classes are frozen).
 OK: Final = Ok()
 NIL: Final = Nil()
 PERSISTENT: Final = Persistent()

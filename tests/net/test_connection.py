@@ -5,10 +5,45 @@ from unittest.mock import AsyncMock, Mock
 from tests.codec.helpers import Reverse
 from tests.helpers import RecordingSubscriber
 from velis.codec import CompositeCodec, Identity, LengthPrefixedField, UInt
-from velis.core.broker import Broker, Publication
-from velis.core.messages import Message
+from velis.core.broker import Broker, Subscriber
+from velis.core.messages import Message, Value
+from velis.errors import ProtocolError
 from velis.net import protocol
 from velis.net.connection import Connection
+
+
+class PushEncoderTests(unittest.TestCase):
+    def test_cache_uses_message_identity_and_retains_empty_encodings(self) -> None:
+        first, second = Message("news", b"hello"), Message("news", b"hello")
+        encode = Mock(side_effect=[b"", b"second"])
+        encoder = protocol.PushEncoder(encode)
+        for _ in range(2):
+            self.assertEqual(encoder(first), b"")
+        for _ in range(2):
+            self.assertEqual(encoder(second), b"second")
+        self.assertEqual(encode.call_count, 2)
+        encode.assert_called_with(second)
+
+    def test_new_message_replaces_the_previous_cached_result(self) -> None:
+        first, second = Message("news", b"first"), Message("news", b"second")
+        encode = Mock(side_effect=[b"first", b"second", b"first again"])
+        encoder = protocol.PushEncoder(encode)
+        self.assertEqual(encoder(first), b"first")
+        self.assertEqual(encoder(second), b"second")
+        self.assertEqual(encoder(first), b"first again")
+        self.assertEqual(encode.call_count, 3)
+
+    def test_failed_encoding_preserves_the_previous_cached_result(self) -> None:
+        first, second = Message("news", b"first"), Message("news", b"second")
+        encode = Mock(side_effect=[b"first", ProtocolError("invalid"), b"second"])
+        encoder = protocol.PushEncoder(encode)
+        self.assertEqual(encoder(first), b"first")
+        with self.assertRaises(ProtocolError):
+            encoder(second)
+        self.assertEqual(encoder(first), b"first")
+        self.assertEqual(encoder(second), b"second")
+        self.assertEqual(encoder(second), b"second")
+        self.assertEqual(encode.call_count, 3)
 
 
 class ConnectionDeliveryTests(unittest.TestCase):
@@ -18,6 +53,27 @@ class ConnectionDeliveryTests(unittest.TestCase):
         self.writer.transport.is_closing.return_value = False
         self.writer.transport.get_write_buffer_size.return_value = 0
         self.connection = Connection(Mock(spec=asyncio.StreamReader), self.writer, 16)
+
+    def test_nested_publication_keeps_each_message_intact(self) -> None:
+        broker = Broker()
+
+        def publish_another(message: Message) -> bool:
+            if message.payload == b"outer":
+                self.assertEqual(broker.publish("news", b"inner"), 2)
+            return True
+
+        subscriber = Mock(spec=Subscriber)
+        subscriber.send.side_effect = publish_another
+        for peer in (self.connection, subscriber):
+            broker.subscribe("news", peer)
+        self.assertEqual(broker.publish("news", b"outer"), 2)
+        messages = [
+            protocol.DEFAULT_PROTOCOL.framed_messages.decode(call.args[0])
+            for call in self.writer.write.call_args_list
+        ]
+        self.assertCountEqual(
+            messages, [Message("news", b"outer"), Message("news", b"inner")]
+        )
 
     def test_publish_reuses_each_wire_encoding_only_within_one_publication(
         self,
@@ -74,15 +130,15 @@ class ConnectionDeliveryTests(unittest.TestCase):
 
     def test_closed_transport_rejects_without_writing(self) -> None:
         self.writer.transport.is_closing.return_value = True
-        self.assertFalse(self.connection.send(Publication("news", b"hello")))
+        self.assertFalse(self.connection.send(Message("news", b"hello")))
         self.writer.write.assert_not_called()
 
     def test_buffer_limit_accepts_boundary_and_rejects_overflow(self) -> None:
         self.writer.transport.get_write_buffer_size.return_value = 16
-        self.assertTrue(self.connection.send(Publication("news", b"hello")))
+        self.assertTrue(self.connection.send(Message("news", b"hello")))
         self.writer.transport.abort.assert_not_called()
         self.writer.transport.get_write_buffer_size.return_value = 17
-        self.assertFalse(self.connection.send(Publication("news", b"hello")))
+        self.assertFalse(self.connection.send(Message("news", b"hello")))
         self.writer.transport.abort.assert_called_once()
 
     def test_encoding_failure_drops_only_subscriber_and_preserves_fanout(self) -> None:
@@ -106,6 +162,25 @@ class ConnectionDeliveryTests(unittest.TestCase):
 
 
 class ConnectionLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reply_waits_for_stream_flow_control(self) -> None:
+        drained = asyncio.Event()
+        writer = Mock(spec=asyncio.StreamWriter)
+        writer.drain = AsyncMock(side_effect=drained.wait)
+        connection = Connection(Mock(), writer, 16)
+        reply = Value(b"hello")
+        pending = asyncio.create_task(connection.write_reply(reply))
+        await asyncio.sleep(0)
+        self.assertFalse(pending.done())
+        self.assertEqual(
+            protocol.DEFAULT_PROTOCOL.framed_messages.decode(
+                writer.write.call_args.args[0]
+            ),
+            reply,
+        )
+        drained.set()
+        async with asyncio.timeout(1):
+            await pending
+
     async def test_context_closes_stream_and_preserves_caller_failure(self) -> None:
         for failure in (None, RuntimeError("caller failed")):
             with self.subTest(failure=failure):

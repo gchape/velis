@@ -1,72 +1,26 @@
-import random
 import unittest
 from unittest.mock import Mock
 
 from tests.helpers import RecordingSubscriber
-from velis.core.broker import Broker, Publication, _Membership
-from velis.errors import CapacityError, ProtocolError
-
-
-class PublicationTests(unittest.TestCase):
-    def test_cache_uses_identity_and_retains_empty_encodings(self) -> None:
-        first: list[str] = []
-        second: list[str] = []
-        encode = Mock(side_effect=[b"", b"second"])
-        publication = Publication("news", b"hello")
-        for _ in range(2):
-            self.assertEqual(publication.encoded_by(first, encode), b"")
-        for _ in range(2):
-            self.assertEqual(publication.encoded_by(second, encode), b"second")
-        self.assertEqual(encode.call_count, 2)
-        encode.assert_called_with("news", b"hello")
-
-    def test_failed_encoding_does_not_poison_the_cache(self) -> None:
-        wire = object()
-        encode = Mock(side_effect=[ProtocolError("invalid"), b"ok"])
-        publication = Publication("news", b"hello")
-        with self.assertRaises(ProtocolError):
-            publication.encoded_by(wire, encode)
-        self.assertEqual(publication.encoded_by(wire, encode), b"ok")
-        self.assertEqual(publication.encoded_by(wire, encode), b"ok")
-        self.assertEqual(encode.call_count, 2)
-
-
-class MembershipTests(unittest.TestCase):
-    def test_mirrored_indexes_match_a_set_of_pairs_and_prune_empty_entries(
-        self,
-    ) -> None:
-        rng = random.Random(47)
-        membership: _Membership[int, int] = _Membership()
-        pairs: set[tuple[int, int]] = set()
-        for step in range(1000):
-            key, item = rng.randrange(8), rng.randrange(8)
-            match rng.randrange(3):
-                case 0:
-                    membership.add(key, item)
-                    pairs.add((key, item))
-                case 1:
-                    membership.discard(key, item)
-                    pairs.discard((key, item))
-                case 2:
-                    membership.discard_item(item)
-                    pairs = {(k, v) for k, v in pairs if v != item}
-            with self.subTest(step=step):
-                self.assertEqual(set(membership._by_key), {k for k, _ in pairs})
-                self.assertEqual(set(membership._by_item), {v for _, v in pairs})
-                for candidate in range(8):
-                    self.assertEqual(
-                        set(membership.items_for(candidate)),
-                        {v for k, v in pairs if k == candidate},
-                    )
-                    self.assertEqual(
-                        membership.item_count(candidate),
-                        sum(v == candidate for _, v in pairs),
-                    )
+from velis.core.broker import Broker, BrokerLimits, Subscriber
+from velis.core.messages import Message
+from velis.errors import CapacityError
 
 
 class BrokerTests(unittest.TestCase):
+    def test_publish_shares_one_message_across_subscribers(self) -> None:
+        broker = Broker()
+        first, second = Mock(spec=Subscriber), Mock(spec=Subscriber)
+        for subscriber in (first, second):
+            subscriber.send.return_value = True
+            broker.subscribe("news", subscriber)
+        self.assertEqual(broker.publish("news", b"hello"), 2)
+        message = first.send.call_args.args[0]
+        self.assertEqual(message, Message("news", b"hello"))
+        self.assertIs(second.send.call_args.args[0], message)
+
     def test_subscription_limit_preserves_membership_and_allows_reuse(self) -> None:
-        broker = Broker(max_subscriptions=1)
+        broker = Broker(limits=BrokerLimits(max_subscriptions=1))
         first, second = RecordingSubscriber(), RecordingSubscriber()
         broker.subscribe("a", first)
         broker.subscribe("a", first)
@@ -85,7 +39,7 @@ class BrokerTests(unittest.TestCase):
     def test_subscription_limit_must_be_positive(self) -> None:
         for limit in (0, -1):
             with self.subTest(limit=limit), self.assertRaises(ValueError):
-                Broker(max_subscriptions=limit)
+                BrokerLimits(max_subscriptions=limit)
 
     def test_publish_counts_deliveries(self) -> None:
         b, a1, a2 = Broker(), RecordingSubscriber(), RecordingSubscriber()

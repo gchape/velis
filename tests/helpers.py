@@ -1,4 +1,4 @@
-from velis.core.broker import Publication
+from velis.core.messages import Message
 
 
 class ManualClock:
@@ -21,8 +21,8 @@ class RecordingSubscriber:
         self.alive = True
         self.messages: list[tuple[str, bytes]] = []
 
-    def send(self, publication: Publication) -> bool:
+    def send(self, message: Message) -> bool:
         if not self.alive:
             return False
-        self.messages.append((publication.channel, publication.payload))
+        self.messages.append((message.channel, message.payload))
         return True

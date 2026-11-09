@@ -14,8 +14,7 @@ from velis.codec import (
     UInt,
     Validate,
 )
-from velis.config import Config, ServerConfig
-from velis.core.broker import Broker
+from velis.core.broker import Broker, BrokerLimits
 from velis.core.engine import Engine
 from velis.core.eviction import EvictionPolicy
 from velis.core.messages import Command, Err, Get, Message, Subscribe
@@ -24,7 +23,7 @@ from velis.errors import CommandError, ProtocolError
 from velis.net import protocol
 from velis.net.client import DEFAULT_CODEC, Client
 from velis.net.connection import Connection
-from velis.net.server import TCPServer
+from velis.net.server import ServerLimits, TCPServer
 
 
 class ServerTests(unittest.IsolatedAsyncioTestCase):
@@ -75,7 +74,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             message_codec=CompositeCodec.of(protocol.SERVER_MESSAGES)
             | LengthPrefixedField(Identity(), 64, prefix=UInt(4))
         )
-        server = TCPServer(self.engine, ServerConfig("127.0.0.1", 0), wire=wire)
+        server = TCPServer(self.engine, ServerLimits("127.0.0.1", 0), wire=wire)
         await server.start()
         self.addAsyncCleanup(server.close)
         limited = await Client.connect("127.0.0.1", server.port, wire=wire)
@@ -95,7 +94,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await healthy.next_message(), Message("news", b"again"))
 
     async def test_connection_limit_reason_reaches_idle_client(self) -> None:
-        server = TCPServer(self.engine, ServerConfig("127.0.0.1", 0, max_connections=1))
+        server = TCPServer(self.engine, ServerLimits("127.0.0.1", 0, max_connections=1))
         await server.start()
         self.addAsyncCleanup(server.close)
         first = await Client.connect("127.0.0.1", server.port)
@@ -111,7 +110,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await first.get("key"), b"value")
 
     async def test_connection_limit_rejects_excess_and_reuses_closed_slot(self) -> None:
-        server = TCPServer(self.engine, ServerConfig("127.0.0.1", 0, max_connections=1))
+        server = TCPServer(self.engine, ServerLimits("127.0.0.1", 0, max_connections=1))
         await server.start()
         self.addAsyncCleanup(server.close)
         first = await Client.connect("127.0.0.1", server.port)
@@ -146,7 +145,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncSetUp(self) -> None:
         self.engine = Engine(Store(), Broker())
-        self.server = TCPServer(self.engine, ServerConfig("127.0.0.1", 0))
+        self.server = TCPServer(self.engine, ServerLimits("127.0.0.1", 0))
         await self.server.start()
         self.addAsyncCleanup(self.server.close)
 
@@ -258,7 +257,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         )
         store = Store()
         server = TCPServer(
-            Engine(store, Broker()), ServerConfig("127.0.0.1", 0), wire=wire
+            Engine(store, Broker()), ServerLimits("127.0.0.1", 0), wire=wire
         )
         await server.start()
         self.addAsyncCleanup(server.close)
@@ -304,7 +303,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             command_codec=CompositeCodec.of(Validate(allow)) | protocol.COMMANDS,
             message_codec=CompositeCodec.of(protocol.SERVER_MESSAGES) | Reverse(),
         )
-        server = TCPServer(self.engine, ServerConfig("127.0.0.1", 0), wire=wire)
+        server = TCPServer(self.engine, ServerLimits("127.0.0.1", 0), wire=wire)
         await server.start()
         self.addAsyncCleanup(server.close)
         reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
@@ -323,14 +322,12 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
 
 
 class RuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_default_lru_eviction_over_tcp(self) -> None:
-        config = Config(
-            "INFO",
-            ServerConfig("127.0.0.1", 0),
-            store=StoreLimits(max_keys=2, max_bytes=4),
-        )
+    async def test_default_s3fifo_eviction_over_tcp(self) -> None:
         async with (
-            serve(config) as server,
+            serve(
+                ServerLimits("127.0.0.1", 0),
+                store_limits=StoreLimits(max_keys=2, max_bytes=4),
+            ) as server,
             await Client.connect("127.0.0.1", server.port) as client,
         ):
             await client.set("a", b"1")
@@ -349,9 +346,8 @@ class RuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
         clock = ManualClock()
         store = Store(clock, limits=StoreLimits(max_keys=1))
         engine = Engine(store, Broker())
-        config = Config("INFO", ServerConfig("127.0.0.1", 0))
         async with (
-            serve(config, engine=engine) as server,
+            serve(ServerLimits("127.0.0.1", 0), engine=engine) as server,
             await Client.connect("127.0.0.1", server.port) as client,
         ):
             self.assertEqual(await client.ttl("k"), -2)
@@ -383,13 +379,12 @@ class RuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_capacity_errors_keep_connection_and_existing_state_usable(
         self,
     ) -> None:
-        config = Config(
-            "INFO",
-            ServerConfig("127.0.0.1", 0, max_subscriptions=1),
-            store=StoreLimits(max_keys=1, max_bytes=4),
-        )
         async with (
-            serve(config) as server,
+            serve(
+                ServerLimits("127.0.0.1", 0),
+                store_limits=StoreLimits(max_keys=1, max_bytes=4),
+                broker_limits=BrokerLimits(max_subscriptions=1),
+            ) as server,
             await Client.connect("127.0.0.1", server.port) as client,
         ):
             await client.set("k", b"old")
@@ -411,13 +406,13 @@ class RuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await client.next_message(), Message("b", b"v"))
 
     async def test_lfu_eviction_and_deadline_cleanup_over_tcp(self) -> None:
-        config = Config(
-            "INFO",
-            ServerConfig("127.0.0.1", 0),
-            store=StoreLimits(max_keys=2, eviction_policy=EvictionPolicy.LFU),
-        )
         async with (
-            serve(config) as server,
+            serve(
+                ServerLimits("127.0.0.1", 0),
+                store_limits=StoreLimits(
+                    max_keys=2, eviction_policy=EvictionPolicy.LFU
+                ),
+            ) as server,
             await Client.connect("127.0.0.1", server.port) as client,
         ):
             await client.set("a", b"first")
@@ -435,9 +430,8 @@ class RuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
     ) -> None:
         codec = Mock(wraps=protocol.SERVER_MESSAGES)
         wire = protocol.WireProtocol(message_codec=codec)
-        config = Config("INFO", ServerConfig("127.0.0.1", 0))
         async with (
-            serve(config, wire=wire) as server,
+            serve(ServerLimits("127.0.0.1", 0), wire=wire) as server,
             await Client.connect("127.0.0.1", server.port) as first,
             await Client.connect("127.0.0.1", server.port) as second,
             await Client.connect("127.0.0.1", server.port) as publisher,
@@ -465,9 +459,8 @@ class RuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
         store = Store(clock)
         store.set("existing", b"value")
         engine = Engine(store, Broker())
-        config = Config("INFO", ServerConfig("127.0.0.1", 0))
         async with (
-            serve(config, engine=engine) as server,
+            serve(ServerLimits("127.0.0.1", 0), engine=engine) as server,
             await Client.connect("127.0.0.1", server.port) as client,
         ):
             self.assertEqual(await client.get("existing"), b"value")
@@ -478,12 +471,11 @@ class RuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(store.get("retained"), b"data")
 
     async def test_runtime_scope_serves_and_closes_live_connections(self) -> None:
-        config = Config("INFO", ServerConfig("127.0.0.1", 0))
         wire = protocol.WireProtocol(
             command_codec=CompositeCodec.of(protocol.COMMANDS) | Reverse(),
             message_codec=CompositeCodec.of(protocol.SERVER_MESSAGES) | Reverse(),
         )
-        async with serve(config, wire=wire) as server:
+        async with serve(ServerLimits("127.0.0.1", 0), wire=wire) as server:
             client = await Client.connect("127.0.0.1", server.port, wire=wire)
             self.addAsyncCleanup(client.close)
             await client.set("key", b"value")

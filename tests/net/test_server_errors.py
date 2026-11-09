@@ -3,20 +3,27 @@ import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 from velis.codec import Identity, LengthPrefixedField, UInt
-from velis.config import ServerConfig
 from velis.core.engine import Engine
 from velis.net.protocol import WireProtocol
-from velis.net.server import TCPServer
+from velis.net.server import ServerLimits, TCPServer
 
 
 class ServerErrorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_port_requires_a_running_listener(self) -> None:
+        server = TCPServer(Mock(spec=Engine), ServerLimits(port=0))
+        with self.assertRaisesRegex(RuntimeError, "not started"):
+            _ = server.port
+        await server.close()
+        with self.assertRaisesRegex(RuntimeError, "not started"):
+            _ = server.port
+
     async def test_nested_context_preserves_the_running_listener(self) -> None:
         listener = Mock(spec=asyncio.Server)
         listener.wait_closed = AsyncMock()
         socket = Mock()
         socket.getsockname.return_value = ("127.0.0.1", 9000)
         listener.sockets = (socket,)
-        server = TCPServer(Mock(spec=Engine), ServerConfig(port=0))
+        server = TCPServer(Mock(spec=Engine), ServerLimits(port=0))
         with patch("velis.net.server.asyncio.start_server", return_value=listener):
             async with server:
                 with self.assertRaisesRegex(RuntimeError, "already started"):
@@ -32,7 +39,7 @@ class ServerErrorTests(unittest.IsolatedAsyncioTestCase):
         listener = Mock(spec=asyncio.Server)
         listener.wait_closed = AsyncMock()
         listener.sockets = ()
-        server = TCPServer(Mock(spec=Engine), ServerConfig(port=0))
+        server = TCPServer(Mock(spec=Engine), ServerLimits(port=0))
         with (
             patch("velis.net.server.asyncio.start_server", return_value=listener),
             self.assertRaises(IndexError),
@@ -48,7 +55,7 @@ class ServerErrorTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         engine = Mock(spec=Engine)
-        server = TCPServer(engine, ServerConfig(port=0))
+        server = TCPServer(engine, ServerLimits(port=0))
         writer = Mock(spec=asyncio.StreamWriter)
         writer.wait_closed = AsyncMock()
         task = asyncio.create_task(
@@ -71,7 +78,7 @@ class ServerErrorTests(unittest.IsolatedAsyncioTestCase):
                 wire = WireProtocol(
                     framing=LengthPrefixedField(Identity(), max_frame, prefix=UInt(4))
                 )
-                server = TCPServer(engine, ServerConfig("127.0.0.1", 0), wire=wire)
+                server = TCPServer(engine, ServerLimits("127.0.0.1", 0), wire=wire)
                 reader = asyncio.StreamReader()
                 reader.feed_data(b"\x00\x00\x00\x00")
                 reader.feed_eof()

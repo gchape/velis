@@ -47,6 +47,39 @@ def stream(data: bytes) -> asyncio.StreamReader:
 
 
 class ProtocolTests(unittest.IsolatedAsyncioTestCase):
+    def test_default_framing_roundtrips_large_payloads(self) -> None:
+        payload = b"\x00\xff" * 8192
+        wire = protocol.DEFAULT_PROTOCOL
+        command = Set("key", payload)
+        self.assertEqual(
+            wire.framed_commands.decode(wire.framed_commands.encode(command)), command
+        )
+        for message in (Value(payload), Message("news", payload)):
+            with self.subTest(message_type=type(message)):
+                self.assertEqual(
+                    wire.framed_messages.decode(wire.framed_messages.encode(message)),
+                    message,
+                )
+
+    def test_custom_framing_validation_is_preserved(self) -> None:
+        class RestrictedFraming(LengthPrefixedField[bytes]):
+            def check_length(self, length: int) -> None:
+                super().check_length(length)
+                if length > 24:
+                    raise ProtocolError("custom framing limit")
+
+        wire = protocol.WireProtocol(
+            framing=RestrictedFraming(Identity(), 100, prefix=UInt(4))
+        )
+        command = Get("a")
+        self.assertEqual(
+            wire.framed_commands.decode(wire.framed_commands.encode(command)), command
+        )
+        with self.assertRaisesRegex(ProtocolError, "custom framing limit"):
+            wire.framed_commands.encode(Get("x" * 20))
+        with self.assertRaisesRegex(ProtocolError, "custom framing limit"):
+            wire.framed_messages.encode(Value(b"x" * 20))
+
     async def test_custom_outer_prefixes_match_sync_and_stream_decoding(self) -> None:
         for prefix_length in (1, 2, 3, 4, 8):
             for value_codec in (Identity(), Reverse()):

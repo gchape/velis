@@ -58,11 +58,9 @@ class StoreTests(unittest.TestCase):
     def test_key_limit_allows_replacement_and_reclaims_expired_capacity(self) -> None:
         store = Store(
             self.clock,
-            limits=StoreLimits(max_keys=1, eviction_policy=EvictionPolicy.REJECT),
+            limits=StoreLimits(max_keys=1, eviction_policy=EvictionPolicy.LRU),
         )
         store.set("a", b"old")
-        with self.assertRaisesRegex(CapacityError, "store limit"):
-            store.set("b", b"new")
         self.assertEqual(store.get("a"), b"old")
         store.set("a", b"replacement")
         store.expire("a", 1)
@@ -75,12 +73,10 @@ class StoreTests(unittest.TestCase):
     def test_byte_limit_counts_utf8_keys_and_replacement_deltas(self) -> None:
         store = Store(
             self.clock,
-            limits=StoreLimits(max_bytes=6, eviction_policy=EvictionPolicy.REJECT),
+            limits=StoreLimits(max_bytes=6, eviction_policy=EvictionPolicy.LRU),
         )
         store.set("é", b"1234")
         self.assertEqual(store.stored_bytes, 6)
-        with self.assertRaisesRegex(CapacityError, "store limit"):
-            store.set("x", b"")
         store.set("é", b"1")
         store.set("x", b"12")
         self.assertEqual(store.stored_bytes, 6)
@@ -112,18 +108,18 @@ class StoreTests(unittest.TestCase):
 
     def test_validated_limits_can_be_shared_without_unpacking(self) -> None:
         limits = StoreLimits(
-            max_keys=1, max_bytes=4, eviction_policy=EvictionPolicy.REJECT
+            max_keys=1, max_bytes=4, eviction_policy=EvictionPolicy.LRU
         )
         store = Store(self.clock, limits=limits)
         store.set("k", b"old")
         with self.assertRaises(CapacityError):
-            store.set("x", b"new")
+            store.set("x", b"oversized")
 
-    def test_reject_reclaims_expired_entries_before_refusing_a_write(self) -> None:
+    def test_capacity_pressure_reclaims_expired_entries(self) -> None:
         store = Store(
             self.clock,
             limits=StoreLimits(
-                max_keys=1, max_bytes=4, eviction_policy=EvictionPolicy.REJECT
+                max_keys=1, max_bytes=4, eviction_policy=EvictionPolicy.LRU
             ),
         )
         store.set("old", b"v")

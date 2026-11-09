@@ -62,7 +62,7 @@ class Store:
         self._limits = limits
         self._entries: dict[str, _Entry] = {}
         self._stored_bytes = 0
-        self._eviction = limits.eviction_policy.create()
+        self._eviction = limits.eviction_policy.create(max_keys=limits.max_keys)
         self._expiry = IndexedBinaryHeap()
 
     def __len__(self) -> int:
@@ -79,14 +79,15 @@ class Store:
         """Whether due timers need another bounded sweep."""
         return self._expiry.has_due(self._clock.now_ms())
 
-    def _remove(self, key: str) -> bool:
-        """Remove a value, its timer, size accounting and eviction metadata."""
+    def _remove(self, key: str, *, evicted: bool = False) -> bool:
+        """Remove a value and timer; preserve history from a policy eviction."""
         self._expiry.clear(key)
         entry = self._entries.pop(key, None)
         if entry is None:
             return False
         self._stored_bytes -= entry.size
-        self._eviction.discard(key)
+        if not evicted:
+            self._eviction.discard(key)
         return True
 
     def _live(self, key: str, now: int | None = None) -> _Entry | None:
@@ -111,7 +112,8 @@ class Store:
         if self._would_exceed(key, size) and self.has_due_expirations:
             self.sweep()
         while self._would_exceed(key, size):
-            self._remove(self._eviction.victim())
+            for victim in self._eviction.evict():
+                self._remove(victim, evicted=True)
 
     def get(self, key: str) -> bytes | None:
         """Return a live value, or None if the key is missing or expired."""
@@ -124,7 +126,7 @@ class Store:
         """Store a value and clear its TTL, applying the capacity policy.
 
         Reject oversized entries before changing values. Under capacity pressure,
-        every policy runs one bounded expiry sweep before evicting or refusing.
+        every policy runs one bounded expiry sweep before evicting live entries.
         """
         size = _entry_size(key, value)
         if size > self._limits.max_bytes:

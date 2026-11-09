@@ -40,15 +40,15 @@ class ConfigTests(unittest.TestCase):
             Config.from_env()
         self.assertIsInstance(raised.exception.__cause__, ValueError)
 
-    def test_default_environment_policy_is_lru(self) -> None:
+    def test_default_environment_policy_is_s3fifo(self) -> None:
         with patch.dict(
             os.environ,
             {"VELIS_MAX_KEYS": "1"},
             clear=True,
         ):
             config = Config.from_env()
-        self.assertEqual(config.store.eviction_policy, "lru")
-        self.assertEqual(StoreLimits().eviction_policy, "lru")
+        self.assertEqual(config.store.eviction_policy, EvictionPolicy.S3_FIFO)
+        self.assertEqual(StoreLimits().eviction_policy, EvictionPolicy.S3_FIFO)
         engine = build_engine(config)
         subscriber = RecordingSubscriber()
         engine.execute(Set("a", b"first"), subscriber)
@@ -80,7 +80,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(engine.execute(Get("b"), subscriber), Nil())
 
     def test_removed_policies_fail_with_the_environment_variable_name(self) -> None:
-        for policy in ("sieve", "rr", "invalid"):
+        for policy in ("fifo", "random", "reject", "sieve", "rr", "invalid"):
             with (
                 patch.dict(os.environ, {"VELIS_EVICTION_POLICY": policy}, clear=True),
                 self.assertRaisesRegex(ValueError, "VELIS_EVICTION_POLICY"),
@@ -93,7 +93,7 @@ class ConfigTests(unittest.TestCase):
             {
                 "VELIS_MAX_KEYS": "1",
                 "VELIS_MAX_BYTES": "4",
-                "VELIS_EVICTION_POLICY": "reject",
+                "VELIS_EVICTION_POLICY": "s3-fifo",
                 "VELIS_MAX_CONNECTIONS": "2",
                 "VELIS_MAX_SUBSCRIPTIONS": "1",
             },
@@ -102,14 +102,17 @@ class ConfigTests(unittest.TestCase):
             config = Config.from_env()
         self.assertEqual(
             config.store,
-            StoreLimits(max_keys=1, max_bytes=4, eviction_policy=EvictionPolicy.REJECT),
+            StoreLimits(
+                max_keys=1, max_bytes=4, eviction_policy=EvictionPolicy.S3_FIFO
+            ),
         )
         self.assertEqual(config.server.max_connections, 2)
         engine = build_engine(config)
         subscriber = RecordingSubscriber()
         engine.execute(Set("a", b"123"), subscriber)
-        with self.assertRaisesRegex(CapacityError, "store limit"):
-            engine.execute(Set("b", b""), subscriber)
+        engine.execute(Set("b", b""), subscriber)
+        self.assertEqual(engine.execute(Get("a"), subscriber), Nil())
+        self.assertEqual(engine.execute(Get("b"), subscriber), Value(b""))
         with self.assertRaisesRegex(CapacityError, "byte limit"):
             engine.execute(Set("a", b"1234"), subscriber)
         engine.execute(Subscribe("a"), subscriber)

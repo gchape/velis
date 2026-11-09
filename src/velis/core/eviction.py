@@ -1,24 +1,26 @@
 """Eviction policies and key ordering; Store owns values and capacity."""
 
-import random
 from collections import OrderedDict
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Protocol
+from typing import Protocol, assert_never
 
-from velis.errors import CapacityError
+from velis.validation import require_positive
 
 _EMPTY = "cannot evict from an empty store"
 
 
 class Eviction(Protocol):
+    """Track resident accesses; evict removes metadata and returns victim keys."""
+
     def access(self, key: str) -> None: ...
     def discard(self, key: str) -> None: ...
-    def victim(self) -> str: ...
+    def evict(self) -> list[str]: ...
 
 
-class _KeyOrder:
+class LRU:
+    """Promote accesses to the newest end and evict the oldest key."""
+
     def __init__(self) -> None:
         self._order: OrderedDict[str, None] = OrderedDict()
 
@@ -29,20 +31,14 @@ class _KeyOrder:
         assert self._order, _EMPTY
         return next(iter(self._order))
 
-
-class LRU(_KeyOrder):
-    """Promote accesses to the newest end and evict the oldest key."""
+    def evict(self) -> list[str]:
+        key = self.victim()
+        self.discard(key)
+        return [key]
 
     def access(self, key: str) -> None:
         self._order[key] = None
         self._order.move_to_end(key)
-
-
-class FIFO(_KeyOrder):
-    """Evict the oldest inserted key; hits change nothing."""
-
-    def access(self, key: str) -> None:
-        self._order.setdefault(key, None)
 
 
 @dataclass(slots=True, eq=False)
@@ -111,59 +107,92 @@ class LFU:
         assert self._head is not None, _EMPTY
         return next(iter(self._head.keys))
 
+    def evict(self) -> list[str]:
+        key = self.victim()
+        self.discard(key)
+        return [key]
 
-class RandomEviction:
-    """Evict a uniformly random key; O(1) via swap-remove."""
 
-    def __init__(self, seed: int | None = None) -> None:
-        self._keys: list[str] = []
-        self._index: dict[str, int] = {}
-        self._rng = random.Random(seed)
+class S3FIFO:
+    """Filter new keys through a small FIFO before the main FIFO.
+
+    Queue targets use key counts: 10% small, 90% main, rounded to at least
+    one key each. Ghost history stores at most the main target's key count.
+    Store independently enforces its byte budget. Hits increment counters
+    capped at three without changing queue order. One eviction can remove
+    multiple keys while promoting reused small-queue entries.
+    """
+
+    def __init__(self, capacity: int) -> None:
+        require_positive(capacity=capacity)
+        self._small_limit = max(1, capacity // 10)
+        self._main_limit = max(1, capacity - self._small_limit)
+        self._small: OrderedDict[str, int] = OrderedDict()
+        self._main: OrderedDict[str, int] = OrderedDict()
+        self._ghost: OrderedDict[str, None] = OrderedDict()
 
     def access(self, key: str) -> None:
-        if key not in self._index:
-            self._index[key] = len(self._keys)
-            self._keys.append(key)
+        if key in self._small:
+            if self._small[key] < 3:
+                self._small[key] += 1
+        elif key in self._main:
+            if self._main[key] < 3:
+                self._main[key] += 1
+        elif key in self._ghost:
+            del self._ghost[key]
+            self._main[key] = 0
+        else:
+            self._small[key] = 0
 
     def discard(self, key: str) -> None:
-        if (index := self._index.pop(key, None)) is None:
-            return
-        last = self._keys.pop()
-        if index < len(self._keys):
-            self._keys[index] = last
-            self._index[last] = index
+        self._small.pop(key, None)
+        self._main.pop(key, None)
+        self._ghost.pop(key, None)
 
-    def victim(self) -> str:
-        assert self._keys, _EMPTY
-        return self._rng.choice(self._keys)
+    def _evict_main(self) -> str:
+        while True:
+            key, frequency = self._main.popitem(last=False)
+            if not frequency:
+                return key
+            self._main[key] = frequency - 1
 
-
-class _Reject:
-    """Never evict; refuse a write when Store asks for a victim."""
-
-    def access(self, key: str) -> None: ...
-    def discard(self, key: str) -> None: ...
-
-    def victim(self) -> str:
-        raise CapacityError("store limit exceeded")
+    def evict(self) -> list[str]:
+        assert self._small or self._main, _EMPTY
+        if len(self._small) < self._small_limit and self._main:
+            return [self._evict_main()]
+        evicted: list[str] = []
+        while self._small:
+            key, frequency = self._small.popitem(last=False)
+            if frequency > 1:
+                self._main[key] = 0
+                if len(self._main) >= self._main_limit:
+                    evicted.append(self._evict_main())
+            else:
+                self._ghost[key] = None
+                if len(self._ghost) > self._main_limit:
+                    self._ghost.popitem(last=False)
+                evicted.append(key)
+                break
+        if not evicted:
+            evicted.append(self._evict_main())
+        return evicted
 
 
 class EvictionPolicy(StrEnum):
-    REJECT = "reject"
     LRU = "lru"
-    FIFO = "fifo"
     LFU = "lfu"
-    RANDOM = "random"
+    S3_FIFO = "s3-fifo"
 
-    def create(self) -> Eviction:
-        return _POLICIES[self]()
+    def create(self, *, max_keys: int) -> Eviction:
+        match self:
+            case EvictionPolicy.LRU:
+                return LRU()
+            case EvictionPolicy.LFU:
+                return LFU()
+            case EvictionPolicy.S3_FIFO:
+                return S3FIFO(max_keys)
+            case _:
+                assert_never(self)
 
 
-_POLICIES: dict[EvictionPolicy, Callable[[], Eviction]] = {
-    EvictionPolicy.REJECT: _Reject,
-    EvictionPolicy.LRU: LRU,
-    EvictionPolicy.FIFO: FIFO,
-    EvictionPolicy.LFU: LFU,
-    EvictionPolicy.RANDOM: RandomEviction,
-}
-DEFAULT_EVICTION_POLICY = EvictionPolicy.LRU
+DEFAULT_EVICTION_POLICY = EvictionPolicy.S3_FIFO

@@ -386,9 +386,7 @@ class RuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
         config = Config(
             "INFO",
             ServerConfig("127.0.0.1", 0, max_subscriptions=1),
-            store=StoreLimits(
-                max_keys=1, max_bytes=4, eviction_policy=EvictionPolicy.REJECT
-            ),
+            store=StoreLimits(max_keys=1, max_bytes=4),
         )
         async with (
             serve(config) as server,
@@ -396,11 +394,12 @@ class RuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
         ):
             await client.set("k", b"old")
             await client.expire("k", 60_000)
-            with self.assertRaisesRegex(CommandError, "store limit"):
-                await client.set("x", b"")
+            with self.assertRaisesRegex(CommandError, "byte limit"):
+                await client.set("x", b"oversized")
             with self.assertRaisesRegex(CommandError, "byte limit"):
                 await client.set("k", b"large")
             self.assertEqual(await client.get("k"), b"old")
+            self.assertGreater(await client.ttl("k"), 0)
             await client.subscribe("a")
             await client.subscribe("a")
             with self.assertRaisesRegex(CommandError, "subscription limit"):
@@ -411,7 +410,7 @@ class RuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
             async with asyncio.timeout(1):
                 self.assertEqual(await client.next_message(), Message("b", b"v"))
 
-    async def test_sieve_eviction_and_deadline_cleanup_over_tcp(self) -> None:
+    async def test_lfu_eviction_and_deadline_cleanup_over_tcp(self) -> None:
         config = Config(
             "INFO",
             ServerConfig("127.0.0.1", 0),

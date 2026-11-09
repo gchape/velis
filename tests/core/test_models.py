@@ -39,26 +39,28 @@ class ModelTests(unittest.TestCase):
                         del counts[expected]
                         del accessed[expected]
 
-    def test_reject_store_matches_a_scanning_model_across_ttl_and_capacity_changes(
+    def test_lru_store_matches_a_scanning_model_across_ttl_and_capacity_changes(
         self,
     ) -> None:
         for seed in range(5):
-            self._check_reject_model(seed)
+            self._check_lru_model(seed)
 
-    def _check_reject_model(self, seed: int) -> None:
+    def _check_lru_model(self, seed: int) -> None:
         rng = random.Random(seed)
         clock = ManualClock()
         store = Store(
             clock,
             limits=StoreLimits(
-                max_keys=4, max_bytes=20, eviction_policy=EvictionPolicy.REJECT
+                max_keys=4, max_bytes=20, eviction_policy=EvictionPolicy.LRU
             ),
         )
         values: dict[str, bytes] = {}
         deadlines: dict[str, int] = {}
+        accessed: dict[str, int] = {}
 
         def remove(key: str) -> None:
             values.pop(key, None)
+            accessed.pop(key, None)
             deadlines.pop(key, None)
 
         def lazy_expire(key: str) -> None:
@@ -92,17 +94,21 @@ class ModelTests(unittest.TestCase):
 
                             if not fits(key, new_size):
                                 sweep()
-                            rejected = not fits(key, new_size)
+                            while not fits(key, new_size):
+                                remove(min(values, key=accessed.__getitem__))
                         if rejected:
                             with self.assertRaises(CapacityError):
                                 store.set(key, value)
                         else:
                             values[key] = value
+                            accessed[key] = step
                             deadlines.pop(key, None)
                             store.set(key, value)
                     case 1:
                         lazy_expire(key)
                         self.assertEqual(store.get(key), values.get(key))
+                        if key in values:
+                            accessed[key] = step
                     case 2:
                         lazy_expire(key)
                         expected = key in values

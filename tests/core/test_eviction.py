@@ -29,8 +29,10 @@ class EvictionTests(unittest.TestCase):
         policy.access("again")
         self.assertEqual(policy.victim(), "again")
 
-    def test_standalone_store_defaults_to_lru(self) -> None:
-        store = Store(limits=StoreLimits(max_keys=2))
+    def test_lru_keeps_the_recently_accessed_key(self) -> None:
+        store = Store(
+            limits=StoreLimits(max_keys=2, eviction_policy=EvictionPolicy.LRU)
+        )
         store.set("a", b"first")
         store.set("b", b"second")
         self.assertEqual(store.get("a"), b"first")
@@ -50,16 +52,6 @@ class EvictionTests(unittest.TestCase):
                 self.assertIsNone(store.get("b"))
                 self.assertEqual(store.get("a"), b"a")
                 self.assertEqual(store.get("c"), b"c")
-
-    def test_fifo_reads_do_not_change_insertion_order(self) -> None:
-        store = Store(
-            limits=StoreLimits(max_keys=2, eviction_policy=EvictionPolicy.FIFO)
-        )
-        store.set("a", b"a")
-        store.set("b", b"b")
-        store.get("a")
-        store.set("c", b"c")
-        self.assertEqual(set(store._entries), {"b", "c"})
 
     def test_lfu_breaks_frequency_ties_by_least_recent_access(self) -> None:
         store = Store(
@@ -84,7 +76,7 @@ class EvictionTests(unittest.TestCase):
         self.assertIsNone(store.get("b"))
 
     def test_ttl_operations_do_not_promote_eviction_candidates(self) -> None:
-        for policy in (EvictionPolicy.LRU, EvictionPolicy.FIFO, EvictionPolicy.LFU):
+        for policy in EvictionPolicy:
             with self.subTest(policy=policy):
                 store = Store(limits=StoreLimits(max_keys=2, eviction_policy=policy))
                 store.set("a", b"a")
@@ -119,7 +111,7 @@ class EvictionTests(unittest.TestCase):
                 self.assertEqual(store.get("again"), b"ok")
 
     def test_all_policies_handle_byte_limits_and_replacement_victims(self) -> None:
-        for policy in tuple(EvictionPolicy)[1:]:
+        for policy in EvictionPolicy:
             with self.subTest(policy=policy):
                 store = Store(
                     limits=StoreLimits(max_keys=3, max_bytes=8, eviction_policy=policy)
@@ -157,7 +149,7 @@ class EvictionTests(unittest.TestCase):
     def test_eviction_cancels_ttl_before_a_key_is_reinserted(
         self,
     ) -> None:
-        for policy in tuple(EvictionPolicy)[1:]:
+        for policy in EvictionPolicy:
             with self.subTest(policy=policy):
                 clock = ManualClock()
                 store = Store(

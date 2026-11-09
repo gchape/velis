@@ -23,11 +23,6 @@ Velis is a lightweight in-memory key-value store with TTL expiration, pub-sub, a
   - [Composing the wire protocol](#composing-the-wire-protocol)
 - [Project layout](#project-layout)
 - [Development](#development)
-- [Benchmarks](#benchmarks)
-  - [Expiration index selection](#expiration-index-selection)
-  - [In-process operations](#in-process-operations)
-  - [Local TCP GET](#local-tcp-get)
-  - [Local TCP pub-sub](#local-tcp-pub-sub)
 - [Design notes and limitations](#design-notes-and-limitations)
 - [Roadmap](#roadmap)
 
@@ -38,11 +33,11 @@ Velis is a lightweight in-memory key-value store with TTL expiration, pub-sub, a
 | Area | Description |
 | --- | --- |
 | **Store** | `GET` / `SET` / `DEL` / `EXPIRE` / `TTL` / `PERSIST` on opaque `bytes` values, with key-count and byte limits. Single-owner, so no locks. |
-| **TTL** | Exact monotonic deadlines, an indexed binary heap, lazy read expiry and bounded background sweeps. |
+| **TTL** | Exact monotonic deadlines, a tick-bucket expiry index, lazy read expiry and bounded background sweeps. |
 | **Pub-sub** | `SUBSCRIBE` / `UNSUBSCRIBE` / `PUBLISH`. At-most-once delivery to connected subscribers on one server. Slow network connections are disconnected when their server write buffer exceeds the configured limit. |
 | **Network** | Length-prefixed binary protocol over TCP, bounded pipelining with ordered replies, an asyncio server and an async `Client`. |
 | **Codecs** | Typed `CompositeCodec`s for payload transforms, wire serialization and validation. Stored values remain opaque bytes. |
-| **Config** | Frozen, validated `Config` loaded from `VELIS_*` environment variables. |
+| **Configuration** | CLI environment loading and frozen limits owned by each component. |
 
 ---
 
@@ -55,7 +50,7 @@ cd velis
 uv sync
 ```
 
-Python **3.15.2 or newer** is required, as specified in `pyproject.toml`. Velis has no runtime dependencies. `uv sync` installs Ruff and ty for development.
+Python **3.15.2 or newer** is required, as specified in `pyproject.toml`. Velis has no runtime dependencies. `uv sync` installs Ruff, ty, Pyright and Hypothesis for development.
 
 ---
 
@@ -135,7 +130,7 @@ flowchart TB
 
     subgraph core ["velis.core: no sockets or wire format"]
         engine["Engine<br/>execute command and return reply"]
-        store["Store<br/>opaque bytes and TTL heap"]
+        store["Store<br/>opaque bytes and expiry index"]
         broker["Broker<br/>channel membership"]
     end
 
@@ -171,11 +166,13 @@ Commands and replies are plain frozen dataclasses (`velis.core.messages`). `net/
 
 ### Request lifecycle
 
-Cache mutations only change memory. The store validates the TTL range and raises `CommandError` for invalid TTLs without changing existing values or deadlines. The engine lets command errors reach the transport, which replies with `ERR` and keeps the connection open. The store owns its monotonic clock and delegates timer scheduling, cancellation and bounded sweeps to `IndexedBinaryHeap`. System wall-clock adjustments do not change TTL duration.
+Cache mutations only change memory. The store validates the TTL range and raises `CommandError` for invalid TTLs without changing existing values or deadlines. The engine lets command errors reach the transport, which replies with `ERR` and keeps the connection open. The store owns its monotonic clock and delegates timer scheduling, cancellation and sweeps to `ExpiryIndex`. System wall-clock adjustments do not change TTL duration.
 
 `SET` clears any previous TTL. `EXPIRE` returns `NIL` for a missing or already expired key, so it cannot revive expired data. A zero TTL expires a live key immediately. Accepted TTLs are between `0` and `2**62` milliseconds, inclusive.
 
 `await client.delete(key)` returns `True` when a live key was deleted, freeing its key and byte capacity; missing or expired keys return `False`. `await client.ttl(key)` returns remaining milliseconds, `-1` for a live key without expiry, or `-2` for a missing or expired key. TTL reads remove expired values without refreshing their deadlines. `await client.persist(key)` removes a live key's TTL while keeping its value and returns whether a deadline was removed. It returns `False` for missing, expired or already persistent keys. On the wire, `TTL` uses `TTL_VALUE` for remaining milliseconds, `PERSISTENT` for no expiry and `NIL` for missing keys; the client maps these to the integer API above. These commands use the same key validation as `GET`.
+
+Direct core callers use `Store.ttl(key)`, which returns remaining milliseconds, `TtlStatus.PERSISTENT` or `TtlStatus.MISSING`. Import `TtlStatus` from `velis.core.store`. The `Engine` translates these enum values into wire replies; the client's `-1` and `-2` sentinels remain unchanged.
 
 
 ```mermaid
@@ -216,13 +213,15 @@ sequenceDiagram
 
 The server explicitly yields to the event loop after every 64 completed commands, allowing other connections and maintenance to run even when reads and drains complete immediately. Each individual command and publication remains synchronous.
 
-The diagram shows a successful `SET` followed by `GET` on the same key. `TCPSession` keeps an ordered queue of futures for in-flight requests; its reader routes `Message` frames into a separate bounded queue. `Connection` owns server-side wire decoding, reply encoding and socket I/O; `TCPServer` dispatches decoded commands to the engine and writes replies in the same order. Payload bytes stay encoded in the store.
+The diagram shows a successful `SET` followed by `GET` on the same key. `TCPSession` keeps an ordered queue of futures for in-flight requests; its reader routes `Message` frames into a separate bounded queue. `Connection` owns server-side wire decoding, reply encoding and socket I/O; its async `write_reply()` pairs `StreamWriter.write()` with `drain()` so callers await flow control in one operation. `TCPServer` dispatches decoded commands to the engine and writes replies in the same order. Payload bytes stay encoded in the store.
 
 ### Pub-sub
 
-The `Broker` only knows the `Subscriber` protocol (`send(publication: Publication) -> bool`). Delivery callbacks must return promptly; adapters own encoding, buffering and expected transport failures. A `Connection` implements this contract and returns `False` when disconnected, when a write fails with a connection error, or when its buffer limit is exceeded. The broker then removes that subscriber from every channel and continues delivering to healthy subscribers. Acceptance does not acknowledge application processing; unexpected adapter errors propagate.
+The `Broker` only knows the `Subscriber` protocol (`send(message: Message) -> bool`). Delivery callbacks must return promptly; adapters own encoding, buffering and expected transport failures. A `Connection` implements this contract and returns `False` when disconnected, when a write fails with a connection error, or when its buffer limit is exceeded. The broker then removes that subscriber from every channel and continues delivering to healthy subscribers. Acceptance does not acknowledge application processing; unexpected adapter errors propagate.
 
-Each `Broker.publish()` call creates one `Publication(channel, payload)` and passes it to every subscriber. Its `encoded_by(wire, encode)` method caches bytes by wire identity, so connections sharing a `WireProtocol` instance encode a push once per publication. Distinct wire instances keep separate encodings. The cache belongs to the publication and is released with it; no ambient context is required. Custom subscribers can read `publication.channel` and `publication.payload` directly.
+Each `Broker.publish()` call creates one `Message(channel, payload)` and passes that same object to every subscriber. The broker owns no encoding cache. Connections sharing a `WireProtocol` instance use its cached `PushEncoder` through `wire.push_encoder(message)`. Consecutive deliveries of the same message reuse its encoded bytes; a new message replaces the single cached result, even when its contents are equal. Different wire instances keep separate encoders.
+
+Each encoder retains only its last message and encoded frame until another push replaces them or the wire is released. A nested publication can replace the slot and cause an outer message to be encoded again. Custom subscribers read `message.channel` and `message.payload` directly.
 
 ```mermaid
 sequenceDiagram
@@ -242,8 +241,8 @@ sequenceDiagram
     P->>S: PUBLISH news payload frame
     S->>E: execute(Publish, publisher connection)
     E->>B: publish(news, payload)
-    B->>N: send(Publication(news, payload))
-    N->>N: wire.framed_messages.encode(Message(news, payload))
+    B->>N: send(Message(news, payload))
+    N->>N: wire.push_encoder(message)
     N-->>A: MESSAGE news payload frame
     N-->>B: True when accepted for delivery
     B-->>E: accepted count
@@ -281,7 +280,7 @@ The key-state diagram assumes valid commands. Invalid TTL values return an error
 
 ```mermaid
 flowchart TD
-    start(["CLI starts"]) --> load["Load Config and configure logging"]
+    start(["CLI starts"]) --> load["Load environment settings and configure logging"]
     load --> signals["Install SIGINT and SIGTERM handlers"]
     signals --> engine["serve: create Store, Broker and Engine"]
     engine --> server["Start TCPServer with DEFAULT_PROTOCOL"]
@@ -292,28 +291,29 @@ flowchart TD
     close --> restore["Restore signal handlers"]
 ```
 
-The `serve(config)` async context manager in `velis.app` owns the server and maintenance task, including cleanup after startup or caller failures. It yields the running `TCPServer`. `TCPServer` also supports `async with` directly for applications that own maintenance separately; each `Connection` closes and awaits its stream on scope exit. Pass `engine=existing_engine` to reuse application state or a store with an injected clock; the default creates a fresh engine. Pass `wire=custom_wire` to configure the server's codec chains; the CLI uses `DEFAULT_PROTOCOL`. Shutdown releases runtime resources while an injected engine remains available to its owner. The CLI separately configures logging and installs signal handlers; embedded callers control the runtime scope themselves:
+The `serve(server_limits, ...)` async context manager in `velis.app` owns the server and maintenance task, including cleanup after startup or caller failures. It yields the running `TCPServer`. `TCPServer` also supports `async with` directly for applications that own maintenance separately; each `Connection` closes and awaits its stream on scope exit. Pass `engine=existing_engine` to reuse application state or a store with an injected clock; the default creates a fresh engine. Pass `wire=custom_wire` to configure the server's codec chains; the CLI uses `DEFAULT_PROTOCOL`. Shutdown releases runtime resources while an injected engine remains available to its owner. The CLI separately configures logging and installs signal handlers; embedded callers control the runtime scope themselves:
 
 ```python
 from velis.app import serve
-from velis.config import Config, ServerConfig
+from velis.net.server import ServerLimits
 
 
 async def embedded() -> None:
-    config = Config(log_level="INFO", server=ServerConfig("127.0.0.1", 0))
-    async with serve(config) as server:
+    async with serve(ServerLimits("127.0.0.1", 0)) as server:
         print(server.port)
 ```
 
 ### Background maintenance
 
-Maintenance runs in a task group owned by `serve()`. An unexpected sweep failure interrupts the active runtime scope and closes the server. Worker and caller failures are reported in an `ExceptionGroup` after cleanup; external cancellation remains `CancelledError`. Normal shutdown cancels and awaits maintenance before closing the server. Client disconnections remain local to their connections.
+Maintenance runs in a task group owned by `serve()`. An unexpected sweep failure interrupts the active runtime scope and closes the server. Worker and caller failures are reported in an `ExceptionGroup` after cleanup; external cancellation remains `CancelledError`. Normal shutdown uses Python 3.15's `TaskGroup.cancel()` and awaits the group before closing the server. Incoming command and message generators use `contextlib.aclosing()` for deterministic cleanup. Client disconnections remain local to their connections.
 
-One task starts sweeping expired keys every `VELIS_SWEEP_MS`. Each round removes at most 1,000 due keys. While due deadlines remain, maintenance yields to the event loop and runs another round without waiting for the next interval.
+One task starts sweeping expired keys every `VELIS_SWEEP_MS`. Each round spends at most 1,000 units on expired keys or stale time ticks. A round can remove no keys while still making cleanup progress. While due ticks remain, maintenance yields to the event loop and runs another round without waiting for the next interval.
 
-`IndexedBinaryHeap` is the sole expiration scheduler. A min-heap orders exact millisecond deadlines, and a dictionary maps each key to its heap entry and position. Deadline lookup and readiness checks take expected constant time; insertion, rescheduling and cancellation repair at most one logarithmic heap path. A sweep removing up to `limit` keys costs O(limit × log n). Equal deadlines have no guaranteed key order. Reads also check exact deadlines independently of maintenance.
+`ExpiryIndex` is the sole expiration scheduler. It maps each key to its exact deadline and groups keys by `deadline // tick_ms`; Python's `heapq` orders tick IDs. The store uses the default `tick_ms=1`, so keys become sweepable at their exact deadline. With larger ticks, a bucket becomes due after every deadline in it has passed: physical cleanup can be delayed by less than one tick, while reads and TTL queries still use exact deadlines.
 
-Each key owns one timer. Replacing a TTL updates its entry in place; `SET`, `PERSIST`, deletion and eviction cancel the old timer immediately. There are no stale timers, bucket cascades or full-index compactions. Clock jumps require no traversal of elapsed time. The indexed heap replaces the timing wheel because it handles arbitrary deadlines without depending on clustering and stores one entry per live timer. Python containers can retain allocated capacity after mass cancellation. Allocation, dictionary resizing, garbage collection and OS scheduling still affect operation duration; sweep limits do not impose a hard wall-clock bound.
+Replacing or cancelling a timer removes its key from the old bucket immediately. `SET`, `PERSIST`, deletion and eviction therefore leave no stale per-key records. Empty buckets are deleted, although their tick IDs can remain in the heap until cleanup or compaction. Recreated tick IDs are harmless: keys are returned once, and leftover IDs consume sweep budget without expiring anything.
+
+Deadline lookup takes expected constant time. Creating or removing the earliest tick costs O(log h), where h includes stale tick IDs. Cancelling a key normally updates dictionary and set membership. When the heap exceeds twice the occupied bucket count plus 64 IDs, compaction rebuilds it from occupied buckets. Compaction takes O(b) time for b occupied buckets, so the sweep limit bounds due-key and stale-tick work, **not compaction work or wall-clock duration**. Up to 64 stale IDs may remain after the last timer is cancelled. Clock jumps require no traversal of elapsed milliseconds.
 
 ---
 
@@ -384,19 +384,23 @@ In Velis, queue targets use **key counts**: the small target is `max(1, max_keys
 
 Eviction may remove several entries to fit the byte budget. Every victim's timer, cached size and resident policy metadata are removed together; S3-FIFO retains only its bounded ghost history. Explicit deletion and TTL expiry remove resident policy metadata without adding ghost entries. Under capacity pressure, every policy performs one bounded expiry sweep before evicting live entries. Remaining expired entries are reclaimed by later reads or maintenance. `GET` hits and successful `SET` operations count as accesses; a new S3-FIFO entry starts with zero reuse credit, while a replacement increments it. TTL inspection and expiry changes do not count as accesses. LFU uses linked frequency buckets for constant-time access, deletion and victim selection, including after deletions leave gaps between frequencies. Store owns values, capacity, byte accounting and TTL removal.
 
-Running `uv run velis` uses S3-FIFO by default. Choose LRU with `VELIS_EVICTION_POLICY=lru uv run velis`, or use `lfu`. The former `fifo`, `random`, `reject`, `sieve` and `rr` settings are unsupported. S3-FIFO can resist scan pollution, but our synthetic comparisons also showed workloads where LRU had a higher hit rate; the default is not a claim that one policy wins every workload.
+`store.stats()` returns a frozen `StoreStats(hits, misses, evictions, expirations)` snapshot. Hits and misses count `GET` results only. Evictions count capacity victims; expirations count keys physically removed by lazy access, sweeps or write-time cleanup. Deleting or overwriting live keys does not increment either removal counter. Counters accumulate from construction, and taking a snapshot does not purge keys or reset them.
+
+Eviction policies expose resident key counts and membership through `len(policy)` and `key in policy`; S3-FIFO ghosts are excluded.
+
+Running `uv run velis` uses S3-FIFO by default. Choose LRU with `VELIS_EVICTION_POLICY=lru uv run velis`, or use `lfu`. Policy performance depends on the workload; use `Store.stats()` to compare hit and eviction rates.
 
 Each connection can subscribe to at most 1,024 channels by default. Repeating an existing subscription uses no extra capacity; unsubscribing frees a slot. The listener admits at most 1,024 active connections by default. Excess connections receive a best-effort `ERR` and are closed, leaving admitted clients usable.
 
 Pub-sub provides at-most-once delivery to connected subscribers on the same server. Messages are not persisted, retried or replayed, and no server-to-server replication is implemented. Slow subscribers are disconnected when server write buffers or client unread-message queues overflow. A subscriber whose custom wire cannot encode a push is disconnected and removed from every channel; delivery continues to healthy subscribers and the publisher remains usable. Messages may be lost on disconnect; `PUBLISH` counts accepted deliveries, without acknowledging application processing. Future replication should carry pub-sub messages, not cache state.
 
-The former `VELIS_WAL_PATH`, `VELIS_FSYNC` and `VELIS_COMPACT_BYTES` settings are no longer used. Existing WAL files are left untouched and are not loaded.
-
 ---
 
 ## Configuration
 
-The entry point loads a frozen `Config` from environment variables. `Config.server` holds listener, write-buffer and subscription limits; `Config.store` holds core-owned `StoreLimits` for retained key and byte limits and the eviction policy. Environment parsing stays in `config.py`, while `StoreLimits` owns store validation. `Config.sweep_interval_ms` holds the expiry sweep interval.
+> **`max_bytes` is a data budget, not a RAM limit.** It counts UTF-8 keys and stored values only. Python objects, dictionaries, eviction queues and expiry metadata use additional memory; with many small keys, process memory can be several times the budget. Use `max_keys` as well.
+
+The CLI reads `VELIS_*` environment variables and constructs `ServerLimits` from `velis.net.server`, `StoreLimits` from `velis.core.store`, and `BrokerLimits` from `velis.core.broker`. Each component validates its own limits. Environment parsing and logging setup belong to `__main__.py`; `velis.app` owns the sweep interval and validates it before opening runtime resources. Embedded callers pass limits directly to `serve()` or `build_engine()` and control their own logging.
 
 Unknown log levels, ports outside `0–65535`, nonpositive limits or sweep intervals, and non-integer numeric settings raise `ValueError` at startup. Integer parsing errors include the environment variable name.
 
@@ -413,7 +417,7 @@ Unknown log levels, ports outside `0–65535`, nonpositive limits or sweep inter
 | `VELIS_MAX_SUBSCRIPTIONS` | `1024` | Maximum distinct channels per subscriber connection. |
 | `VELIS_SWEEP_MS` | `100` | Milliseconds between expiry sweeps; must be positive. |
 
-`serve(config)` applies all limits to the engine it builds. When supplying your own engine, configure its store and broker explicitly with `Store(limits=config.store)` and `Broker(max_subscriptions=config.server.max_subscriptions)`; the server still applies its connection and write-buffer limits.
+`serve(server_limits, store_limits=..., broker_limits=..., sweep_interval_ms=...)` applies the supplied store and broker limits when building its default engine. All arguments have defaults. When supplying `engine=...`, configure its store and broker directly; the runtime uses that engine without applying the store or broker limits. Listener and write-buffer limits still apply. `build_engine(store_limits=..., broker_limits=...)` constructs a standalone engine without networking or environment loading.
 
 ---
 
@@ -421,7 +425,7 @@ Unknown log levels, ports outside `0–65535`, nonpositive limits or sweep inter
 
 Codecs describe reversible representations through the shared `Codec[T, Encoded]` interface. Individual codecs such as `UTF8` and `UInt` serve as leaves, while `CompositeCodec` aggregates children that may themselves be individual codecs or composites. The same components serve client payload transforms, protocol field encoders, complete commands/replies and validation rules. Client payload codecs still operate on `bytes`; the store retains their output as opaque bytes.
 
-The codec components in `velis.codec` have no dependencies on `velis.core` or `velis.net`. Applications compose their own model codecs and validation rules directly in Python. This is the boundary for extracting the codec layer into a separate framework package later.
+The codec components in `velis.codec` share errors and argument validation with the rest of Velis and have no dependencies on `velis.core` or `velis.net`. Applications compose their own model codecs and validation rules directly in Python.
 
 A codec is any object satisfying this structural interface:
 
@@ -434,7 +438,11 @@ class Codec[T, Encoded](Protocol):
     def decode(self, data: Encoded, /) -> T: ...
 ```
 
-Encoding runs children left to right, and decoding runs them right to left, recursively. Direct construction, such as `CompositeCodec((group, field))`, preserves nested groups. The typed shorthand `CompositeCodec.of(first) | next` concatenates top-level steps. Adjacent stages must have compatible types; the type checker checks the shorthand, while direct construction does not check representation types at runtime. `Identity()` returns bytes unchanged; an empty composite preserves any input. Codec exceptions propagate and stop processing.
+Encoding runs children left to right, and decoding runs them right to left. Direct construction, such as `CompositeCodec((group, field))`, preserves nested groups and executes each group in order. The typed shorthand `CompositeCodec.of(first) | next` concatenates top-level steps. Adjacent stages must have compatible types; the type checker checks the shorthand, while direct construction does not check representation types at runtime. `Identity()` returns bytes unchanged; an empty composite preserves any input. Codec exceptions propagate and stop processing.
+
+Every codec uses the same `encode()` and `decode()` interface. A record encodes each field and joins its bytes, a choice adds its tag, and a length-prefixed field adds the encoded body's length. `WireProtocol` uses ordinary `CompositeCodec` composition to apply outer framing. Custom codecs and subclasses run through their regular methods.
+
+`Cursor` delegates byte reads and position tracking to `io.BytesIO`, and integers use `int.from_bytes()` for every width. Tags are decoded as UTF-8 strings before lookup. Length limits, truncation errors and full-record consumption remain enforced.
 
 ```python
 import base64
@@ -493,9 +501,13 @@ assert text.decode(text.encode("hello")) == "hello"
 
 ### Composing the wire protocol
 
-`COMMANDS` encodes and decodes `Command` values; `SERVER_MESSAGES` handles the `ServerMessage` union (`Reply | Message`). Both use `Choice`, whose table maps each text tag to a `Record`, such as `Choice("command", {"GET": Record(Get, KEY)})`. `Record` follows the class's constructor signature, one field codec per positional parameter, independently of pattern-matching metadata. Each parameter must correspond to a readable attribute of the same name. Keyword-only and variadic parameters are rejected during setup. Dataclass fields with `init=False` are treated as derived state: they are not encoded and must be reconstructed by the class when decoding.
+`COMMANDS` encodes and decodes `Command` values; `SERVER_MESSAGES` handles the `ServerFrame` union (`Reply | Message`). Both use `Choice`, whose table maps each text tag to a `Record`, such as `Choice("command", {"GET": Record(Get, KEY)})`. `Record` follows the class's constructor signature, one field codec per positional parameter, independently of pattern-matching metadata. Each parameter must correspond to a readable attribute of the same name. Keyword-only and variadic parameters are rejected during setup. Dataclass fields with `init=False` are treated as derived state: they are not encoded and must be reconstructed by the class when decoding.
 
-`Field` extends `Codec` with `read(cursor)` to consume one complete field. `FixedLengthField(codec, length)` consumes exactly that many bytes; `LengthPrefixedField(codec, max_length, prefix=UInt(n))` checks the configured byte length against the upper bound before consuming its body. The inner codec performs only value transformations, so `FixedLengthField(CompositeCodec.of(UInt(8)), 8)` has the same layout as `FixedLengthField(UInt(8), 8)`. `Cursor` and `CursorCodec` are exported from `velis.codec` for custom fields. `LengthPrefixedField`, `Record` and `Choice` inherit `CursorCodec`, whose `decode()` calls their `read()` inside `with Cursor(data) as cursor`: a successful read requires complete consumption on context exit, while a failed read keeps its original exception. `Cursor` consumes exact byte counts and reports how many bytes a truncated read needed. Tags and constructor signatures are checked when records and choices are built. `UInt(length)` takes a positive byte length, such as `UInt(4)` for a u32.
+Field codecs define the wire layout explicitly. `Record` requests string annotations through `inspect.signature(..., annotation_format=annotationlib.Format.STRING)`, so constructor annotations can reference types imported only under `TYPE_CHECKING` without requiring those imports at runtime.
+
+`Field` extends `Codec` with `read(cursor)` to consume one complete field. `UInt(length)` is already a field, so use `U32`, `U64` or another `UInt` directly in records. It is a final class defining big-endian unsigned integers; length prefixes use that same representation. `FixedLengthField(codec, length)` supplies a boundary for other value codecs, including custom integer formats. `LengthPrefixedField(codec, max_length, prefix=UInt(n))` checks the configured byte length against the upper bound before consuming its body.
+
+`Cursor` and `CursorCodec` are exported from `velis.codec` for custom fields. `LengthPrefixedField`, `Record` and `Choice` inherit `CursorCodec`, whose `decode()` calls their `read()` inside `with Cursor(data) as cursor`: a successful read requires complete consumption on context exit, while a failed read keeps its original exception. `Cursor` consumes exact byte counts and reports how many bytes a truncated read needed. Tags and constructor signatures are checked when records and choices are built. `UInt(length)` takes a positive byte length, such as `UInt(4)` for a u32.
 
 The same `LengthPrefixedField` handles a value inside a record or the outer frame: choose `Identity()` for a byte body, or another codec to interpret it. Velis explicitly chooses `UInt(4)` for its default wire format. `WireProtocol` decodes the configured prefix, calls the field's public `check_length(length)`, reads exactly that many body bytes and applies the framing field's value codec. Encoding and record reads use the same length check. `StreamReader` owns buffering for fragmented or consecutive frames.
 
@@ -519,7 +531,7 @@ wire = WireProtocol(
 )
 ```
 
-Pass `wire=wire` to `serve(config, ...)` or `TCPServer(engine, config.server, ...)`, and to `Client.connect(...)`, `TCPSession.connect(...)` or `TCPSession(reader, writer, ...)`. `WireProtocol.framed_commands` and `.framed_messages` are cached complete chains including outer framing. You can round-trip commands, replies and pushes synchronously with those chains. The asynchronous readers use `StreamReader.readexactly()` for each prefix and body, decode complete bodies, finish normally at clean EOF, and raise `asyncio.IncompleteReadError` if EOF interrupts a header or body.
+Pass `wire=wire` to `serve(server_limits, ...)` or `TCPServer(engine, server_limits, ...)`, and to `Client.connect(...)`, `TCPSession.connect(...)` or `TCPSession(reader, writer, ...)`. `WireProtocol.framed_commands` and `.framed_messages` are cached codecs including outer framing. You can round-trip commands, replies and pushes synchronously with those codecs. The asynchronous readers use `StreamReader.readexactly()` for each prefix and body, decode complete bodies, finish normally at clean EOF, and raise `asyncio.IncompleteReadError` if EOF interrupts a header or body.
 
 The full command chain has the following shape; `SERVER_MESSAGES` uses the same framing for replies and pushes:
 
@@ -538,13 +550,12 @@ To use the rule above on both peers within an application:
 
 ```python
 from velis.app import serve
-from velis.config import Config, ServerConfig
+from velis.net.server import ServerLimits
 from velis.net.client import Client
 
 
 async def with_custom_wire() -> None:
-    config = Config("INFO", ServerConfig("127.0.0.1", 0))
-    async with serve(config, wire=wire) as server:
+    async with serve(ServerLimits("127.0.0.1", 0), wire=wire) as server:
         async with await Client.connect("127.0.0.1", server.port, wire=wire) as client:
             await client.set("greeting", b"hello")
             assert await client.get("greeting") == b"hello"
@@ -556,12 +567,6 @@ Append custom byte transforms to the body codecs with `CompositeCodec.of(COMMAND
 
 Wire rules validate representations and decoded commands. Stateful command semantics and access policies belong in the engine or a command validation layer, where they also apply to non-TCP sessions. Payload codecs configured with `codec=` remain independent from wire codecs configured with `wire=`.
 
-Migration from the earlier API: replace `CommandCodec()` and `FrameCodec()` with `COMMANDS` and `SERVER_MESSAGES`. Encode commands and replies directly; `Request` and `Response` envelopes have been removed. Replace one-message reads with a persistent `read_commands(reader)` or `read_messages(reader)` async generator. Pass store settings through `Store(limits=StoreLimits(...))` and use `Config.store`. Pass client queue settings through `limits=SessionLimits(...)`. Import `MISSING` and `NO_EXPIRY` from `velis.core.messages`. Codecs require only `encode` and `decode`; `name` has been removed, and `Validate(rule)` takes a rule returning `str | None`. Tagged-union tables now require explicit `FixedLengthField` or `LengthPrefixedField` fields, and `Cursor.take(size)` replaces layout guessing. The high-level `Client` and custom `Session` interfaces retain their command/reply API.
-
-Recent renames: `Frame` → `ServerMessage`, `FRAMES` → `SERVER_MESSAGES`, `frame_codec` → `message_codec`, `commands` → `framed_commands`, `frames` → `framed_messages`, `read_frames` → `read_messages`, and `config.Server` → `ServerConfig`. The defaults are now `DEFAULT_STORE_LIMITS` in `velis.core.store` and `DEFAULT_SESSION_LIMITS` in `velis.net.session`. Custom subscribers implement `send(publication)` instead of accepting channel and payload separately.
-
-Naming follows [PEP 8](https://peps.python.org/pep-0008/#descriptive-naming-styles): modules use lowercase names with underscores, and class names preserve uppercase acronyms. Use `TCPServer`, `TCPSession`, `UTF8`, `LRU`, `FIFO`, `LFU`, `TTL` and `TTLValue` in place of their earlier mixed-case spellings. `MonotonicClock` replaces `SystemClock` to name the time source it actually reads. Import commands, replies and pushes from `velis.core.messages` (formerly `velis.core.commands`). The codec for all server messages is `WireProtocol.framed_messages` (formerly `framed_replies`). `MAX_FIELD_BYTES` and `MAX_FRAME_BODY_BYTES` name the encoded byte limits explicitly.
-
 `Record`, `Field` and `Choice` describe the binary layout: ordered fields form a record, and a tag selects one alternative. `Choice` follows established [ASN.1 terminology](https://www.itu.int/ITU-T/studygroups/com10/languages/X.680_1297.pdf). A frame is the length-prefix envelope around an encoded application message; TCP itself carries a byte stream and does not preserve application message boundaries ([RFC 9293](https://www.rfc-editor.org/rfc/rfc9293.html#section-3.7)).
 
 ---
@@ -570,23 +575,23 @@ Naming follows [PEP 8](https://peps.python.org/pep-0008/#descriptive-naming-styl
 
 ```
 src/velis/
-  __main__.py — CLI: configuration, logging, signals and runtime startup
+  __main__.py — CLI: VELIS_* environment loading, logging, signals and startup
   app.py — composition root: serve() owns networking and maintenance
-  config.py — Config / ServerConfig, loaded from VELIS_* env vars
   errors.py — VelisError, ProtocolError, CommandError, CapacityError
-  validation.py — shared positive-limit validation
+  validation.py — shared positive-limit and exact byte-length checks
   core/ — no sockets, no wire format
     messages.py — Command / Reply / Message dataclasses and TTL sentinels
     engine.py — command dispatch and replies
-    store.py — StoreLimits, capacity and centralized removal bookkeeping
+    store.py — StoreLimits, StoreStats, TtlStatus, capacity and removal bookkeeping
     eviction.py — EvictionPolicy and S3-FIFO (default), LRU and LFU policies
-    indexed_heap.py — indexed binary heap with exact deadlines and eager cancellation
-    broker.py — membership, Publication caching and the Subscriber protocol
+    expiry_index.py — exact deadlines, tick buckets and stale-tick compaction
+    broker.py — BrokerLimits, shared Message delivery and the Subscriber protocol
+    membership.py — ManyToMany relation with mirrored membership indexes
     clock.py — structural Clock protocol and MonotonicClock implementation
   net/
-    protocol.py — tagged command/message tables and streaming TCP readers
+    protocol.py — tagged codecs, shared PushEncoder and streaming TCP readers
     connection.py — server-side wire I/O and Subscriber push buffering
-    server.py — TCPServer
+    server.py — ServerLimits and TCPServer
     client.py — command API, codecs, error translation and scoped cleanup
     session.py — Session interface and TCP request/message lifecycle
   codec/
@@ -607,7 +612,7 @@ tests/
 
 ## Development
 
-Tests use the standard library's `unittest`.
+Tests use the standard library's `unittest` and Hypothesis state machines for shrinking cache operation sequences across all eviction policies.
 
 ```bash
 make check
@@ -616,78 +621,16 @@ make lint
 make fmt
 ```
 
-`make check` runs lint, formatting, type checks and tests; it is also the default `make` target. `make fmt` applies supported lint fixes and formatting.
+`make check` runs Ruff lint and formatting checks, ty, Pyright in strict mode for `src`, and tests with `python -X dev -W error`; it is also the default `make` target. `make fmt` applies supported lint fixes and formatting.
 
 `unittest discover` only descends into directories that contain an `__init__.py`, so every `tests/` subdirectory needs one.
 
 The core is deliberately easy to test without sockets or real time: the `Store` accepts any object implementing the `Clock` protocol's `now_ms()` method, without requiring inheritance. The `ManualClock` in `tests/helpers.py` makes TTLs deterministic. Decoder tests exercise seeded random bytes and mutations of every command and frame type. Network tests bind to localhost on an automatically selected port, so the test environment must allow local sockets.
 
----
-
-## Benchmarks
-
-### Expiration index selection
-
-A comparison on 2026-11-09 used CPython 3.15.2 on an AMD Ryzen 5 7535HS, pinned to logical CPU 0. Inputs used seed 47, one warm-up and three measured trials per configuration; garbage collection remained enabled. The following are median scheduling rates at 100,000 timers. Memory is separately traced index metadata, excluding preallocated input keys and deadlines, not process RSS.
-
-| Deadline distribution | Index | Million schedules/s | Metadata, MiB |
-| --- | --- | ---: | ---: |
-| Scattered | Indexed binary heap | 1.147 | 12.79 |
-| Scattered | Grouped-deadline heap | 0.785 | 35.32 |
-| 64 shared timestamps | Indexed binary heap | 1.257 | 12.79 |
-| 64 shared timestamps | Grouped-deadline heap | 3.022 | 6.85 |
-
-The indexed heap is the general-purpose choice: its performance and memory do not rely on shared deadlines. Grouping can win when exact deadlines cluster, but equal TTL durations alone do not guarantee shared timestamps. These synthetic measurements do not establish the distribution of application TTLs. The comparison implementations, runner and raw artifacts were removed after selection; correctness coverage for the retained heap lives in `tests/core/test_indexed_heap.py`.
-
-### Historical store and network measurements
-
-Measured on 2026-11-08 with CPython 3.15.2, Linux x86-64 and an AMD Ryzen 5 7535HS with Radeon Graphics. The process could use 12 logical CPUs and was not pinned. TCP clients, subscribers and server shared one `_UnixSelectorEventLoop` event loop in one process; asyncio debug mode was disabled.
-
-These are historical measurements from before the current refactors. The benchmark runner and raw results have since been removed; these rows describe the earlier LRU implementation.
-
-Each measured workload ran once for warm-up and five times for measurement. Setup, prefill and teardown were outside the timers. Full garbage collection ran before each trial and stayed enabled during measurement. Rates below are medians; ranges are the observed minimum and maximum trial rates. These ranges are not confidence intervals. Latency percentiles use nearest ranks within each trial, then the median percentile across the five trials.
-
-### In-process operations
-
-Store trials each performed 100,000 operations. Store workloads used 4,096 resident keys and 256-byte values: GET was a 100% hit workload, while SET inserted new keys into a full store, forcing eviction. Input keys and the shared value buffer were prepared before timing. These rates include the Python benchmark loops.
-
-The wire case encoded and decoded a complete 256-byte SET frame 100,000 times.
-
-| Workload | Median operations/s | Observed trial range |
-| --- | ---: | ---: |
-| LRU GET hit | 4,601,404 | 3,132,609–4,620,892 |
-| LRU SET with eviction | 730,182 | 670,524–759,129 |
-| Wire SET encode + decode | 212,825 | 208,167–220,904 |
-
-One codec round-trip counts as one operation, including both encoding and decoding. This workload does not measure cache hit quality or compare the current eviction policies.
-
-### Local TCP GET
-
-Each trial read 5,000 values from 1,024 prefilled keys over one client connection. Depth is the maximum number of concurrent GETs in each fixed batch; the next batch starts after all replies in the previous batch arrive. Throughput includes task/batch overhead. Each request latency is measured from entry into its client coroutine until the decoded reply is returned, rather than dividing batch time by the number of requests. Replies were verified against the expected payload.
-
-| Policy | Value | Depth | Median GET/s | Observed GET/s range | P50 µs | P95 µs | P99 µs |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| LRU | 64 B | 1 | 15,450 | 15,252–15,935 | 60.0 | 83.5 | 95.8 |
-| LRU | 64 B | 32 | 31,271 | 30,994–32,073 | 772.1 | 984.6 | 1,205.0 |
-| LRU | 64 B | 128 | 35,465 | 35,316–35,663 | 2,750.0 | 3,243.7 | 3,344.8 |
-| LRU | 1 KiB | 1 | 14,606 | 14,485–14,768 | 63.1 | 89.9 | 110.3 |
-| LRU | 1 KiB | 32 | 29,297 | 28,821–30,523 | 839.7 | 1,028.1 | 1,275.4 |
-| LRU | 1 KiB | 128 | 31,816 | 27,752–31,929 | 3,155.1 | 3,659.3 | 3,851.8 |
-
-### Local TCP pub-sub
-
-Each trial sent 1,000 sequential acknowledged publications while one or eight subscriber clients drained and verified every message. The throughput timer ended after all subscriber deliveries completed. Latencies below measure publisher acknowledgments; they do not measure subscriber processing latency. A publication to eight subscribers counts as one publication and eight deliveries.
-
-| Value | Subscribers | Median publications/s | Observed publications/s range | Median deliveries/s | Ack P50 µs | Ack P95 µs |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 64 B | 1 | 10,150 | 9,538–10,428 | 10,150 | 94.7 | 115.2 |
-| 64 B | 8 | 4,262 | 4,241–4,292 | 34,097 | 228.8 | 258.3 |
-| 1 KiB | 1 | 9,694 | 9,622–9,791 | 9,694 | 98.8 | 121.2 |
-| 1 KiB | 8 | 4,047 | 3,946–4,073 | 32,373 | 241.4 | 271.7 |
-
-These are local measurements of this implementation and harness, with CPU frequency and other host activity uncontrolled. TCP trials used the default wire and payload codecs, without TLS or authentication. No other server was benchmarked. The results do not establish remote-network capacity, multi-process scaling, memory overhead, or the performance of every workload.
+Prefer direct stdlib APIs and clear ownership over custom infrastructure or small performance gains.
 
 ---
+
 ## Design notes and limitations
 
 * **Single-threaded by design.** The event-loop thread owns the `Engine`, `Store` and `Broker`, which is why none of them take locks. Don't call them from other threads.

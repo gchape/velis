@@ -1,7 +1,7 @@
 [project]
 name = "velis"
 version = "0.1.0"
-description = "Lightweight in-memory store with pub-sub, TTL expiry and pluggable codecs"
+description = "Lightweight in-memory store with pub-sub, TTL expiry and a fixed binary protocol"
 readme = "README.md"
 authors = [
     { name = "Giorgi Chapidze", email = "chapidze.giorgi@proton.me" }

@@ -2,10 +2,11 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
+from velis.config import ServerLimits
 from velis.core.engine import Engine
 from velis.errors import ProtocolError
 from velis.net import protocol
-from velis.net.server import ServerLimits, TCPServer
+from velis.net.server import TCPServer
 
 
 class ServerErrorTests(unittest.IsolatedAsyncioTestCase):

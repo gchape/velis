@@ -7,6 +7,7 @@ from velis.core.messages import Err, Get, Message, Ok, Subscribed, Unsubscribed,
 from velis.errors import CommandError, ProtocolError
 from velis.net import protocol
 from velis.net.client import Client
+from velis.net.limits import MAX_FIELD_BYTES
 from velis.net.session import SessionLimits, TCPSession
 
 
@@ -140,7 +141,7 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_invalid_outgoing_data_leaves_connection_usable(self) -> None:
         with self.assertRaises(ProtocolError):
-            await self.client.set("key", b"x" * (protocol.MAX_FIELD_BYTES + 1))
+            await self.client.set("key", b"x" * (MAX_FIELD_BYTES + 1))
         self.writer.write.assert_not_called()
         pending = asyncio.create_task(self.client.get("key"))
         async with asyncio.timeout(1):
@@ -148,7 +149,9 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
             self.reader.feed_data(protocol.encode_message(Value(b"ok")))
             self.assertEqual(await pending, b"ok")
 
-    async def test_waiting_requests_do_not_encode_before_admission(self) -> None:
+    async def test_waiting_requests_encode_before_admission_but_do_not_send(
+        self,
+    ) -> None:
         codec = self.enterContext(
             patch.object(protocol, "COMMANDS", Mock(wraps=protocol.COMMANDS))
         )
@@ -163,15 +166,20 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
         waiting = asyncio.create_task(session.request(Get("waiting")))
         async with asyncio.timeout(1):
             await asyncio.sleep(0)
-            codec.encode.assert_called_once_with(Get("active"))
+            self.assertEqual(
+                [call.args[0] for call in codec.encode.call_args_list],
+                [Get("active"), Get("waiting")],
+            )
+            self.writer.write.assert_called_once()
             waiting.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await waiting
             reader.feed_data(protocol.encode_message(Ok()))
             self.assertEqual(await active, Ok())
-            codec.encode.assert_called_once()
+            self.assertEqual(codec.encode.call_count, 2)
+            self.writer.write.assert_called_once()
 
-    async def test_encoding_failure_releases_an_admitted_slot(self) -> None:
+    async def test_encoding_failure_does_not_take_a_pending_slot(self) -> None:
         codec = self.enterContext(
             patch.object(protocol, "COMMANDS", Mock(wraps=protocol.COMMANDS))
         )
@@ -191,21 +199,22 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0)
             reader.feed_data(protocol.encode_message(Ok()))
             self.assertEqual(await active, Ok())
-        self.assertFalse(session._pending)
+        self.assertTrue(session._pending.empty())
         self.writer.write.assert_called_once()
 
-    async def test_invalid_request_waits_for_capacity_then_leaves_fifo_usable(
+    async def test_invalid_request_fails_immediately_when_pending_queue_is_full(
         self,
     ) -> None:
         active = [asyncio.create_task(self.client.get(str(i))) for i in range(2)]
         invalid = asyncio.create_task(self.client.get(""))
         async with asyncio.timeout(1):
             await asyncio.sleep(0)
-            self.assertFalse(invalid.done())
-            self.reader.feed_data(protocol.encode_message(Value(b"first")))
-            self.assertEqual(await active[0], b"first")
+            self.assertTrue(invalid.done())
             with self.assertRaisesRegex(ProtocolError, "must not be empty"):
                 await invalid
+            self.assertEqual(self.writer.write.call_count, 2)
+            self.reader.feed_data(protocol.encode_message(Value(b"first")))
+            self.assertEqual(await active[0], b"first")
             next_request = asyncio.create_task(self.client.get("next"))
             await asyncio.sleep(0)
             self.reader.feed_data(
@@ -351,7 +360,7 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
         async with asyncio.timeout(1):
             with self.assertRaises(ConnectionError):
                 await pending
-        self.assertFalse(self.session._pending)
+        self.assertTrue(self.session._pending.empty())
         self.writer.close.assert_called_once()
 
     async def test_pending_limit_releases_a_slot_for_the_next_request(self) -> None:
@@ -391,7 +400,7 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 + protocol.encode_message(Value(b"ok"))
             )
             self.assertEqual(await waiting, b"ok")
-        self.assertFalse(self.session._pending)
+        self.assertTrue(self.session._pending.empty())
         self.writer.close.assert_not_called()
 
     async def test_cancellation_before_a_slot_is_available_does_not_send(self) -> None:
@@ -444,6 +453,22 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
         async with asyncio.timeout(1):
             results = await asyncio.gather(*requests, return_exceptions=True)
         self.assertTrue(all(isinstance(result, ConnectionError) for result in results))
+        self.assertEqual(self.writer.write.call_count, 2)
+
+    async def test_close_after_reply_wakes_capacity_waiters_without_sending(
+        self,
+    ) -> None:
+        requests = [asyncio.create_task(self.client.get(str(i))) for i in range(4)]
+        await asyncio.sleep(0)
+        self.assertEqual(self.writer.write.call_count, 2)
+        self.session._resolve_reply(Value(b"first"))
+        await self.client.close()
+        async with asyncio.timeout(1):
+            results = await asyncio.gather(*requests, return_exceptions=True)
+        self.assertEqual(results[0], b"first")
+        self.assertTrue(
+            all(isinstance(result, ConnectionError) for result in results[1:])
+        )
         self.assertEqual(self.writer.write.call_count, 2)
 
     async def test_eof_fails_every_pending_request(

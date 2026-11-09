@@ -8,6 +8,7 @@ from velis.core.broker import Broker, Subscriber
 from velis.core.messages import Message
 from velis.errors import ProtocolError
 from velis.net import protocol
+from velis.net.limits import MAX_FIELD_BYTES
 
 
 class PushEncoderTests(unittest.TestCase):
@@ -122,7 +123,7 @@ class ConnectionDeliveryTests(unittest.TestCase):
         for channel in ("news", "other"):
             broker.subscribe(channel, self.connection)
             broker.subscribe(channel, healthy)
-        payload = b"x" * (protocol.MAX_FIELD_BYTES + 1)
+        payload = b"x" * (MAX_FIELD_BYTES + 1)
         for _ in range(2):
             broker.subscribe("news", self.connection)
             self.assertEqual(broker.publish("news", payload), 1)

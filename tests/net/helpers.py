@@ -34,3 +34,10 @@ def decode_message_frame(data: bytes) -> ServerFrame:
     if int.from_bytes(data[:4]) != len(data) - 4:
         raise AssertionError("expected one complete server frame")
     return protocol.SERVER_MESSAGES.decode(data[4:])
+
+
+async def read_message(reader: asyncio.StreamReader) -> ServerFrame:
+    body = await protocol.read_frame(reader)
+    if body is None:
+        raise AssertionError("expected a server message before EOF")
+    return protocol.SERVER_MESSAGES.decode(body)

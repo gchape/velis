@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import patch
 
 from velis.app import build_engine
+from velis.config import ServerLimits
 from velis.core.messages import (
     Command,
     Delivered,
@@ -23,8 +24,9 @@ from velis.core.messages import (
 from velis.errors import ProtocolError
 from velis.net import protocol
 from velis.net.connection import COMMANDS_PER_TURN, Connection
-from velis.net.protocol import MAX_FRAME_BODY_BYTES, ServerFrame
-from velis.net.server import ServerLimits, TCPServer
+from velis.net.limits import MAX_FRAME_BODY_BYTES
+from velis.net.protocol import ServerFrame
+from velis.net.server import TCPServer
 
 
 def frame(command: Command) -> bytes:

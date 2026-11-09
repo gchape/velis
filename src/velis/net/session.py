@@ -2,7 +2,6 @@
 
 import asyncio
 import contextlib
-from collections import deque
 from typing import Protocol, Self
 
 from velis.config import DEFAULT_SESSION_LIMITS, SessionLimits
@@ -86,8 +85,9 @@ class TCPSession:
     ) -> None:
         self._reader = reader
         self._writer = writer
-        self._slots = asyncio.BoundedSemaphore(limits.max_pending_requests)
-        self._pending: deque[asyncio.Future[Reply]] = deque()
+        self._pending: asyncio.Queue[asyncio.Future[Reply]] = asyncio.Queue(
+            limits.max_pending_requests
+        )
         self._messages = _MessageBuffer(
             limits.max_pending_messages, limits.max_pending_bytes
         )
@@ -113,13 +113,11 @@ class TCPSession:
         Unexpected reader failures remain available to close() after cleanup.
         """
         try:
-            async with contextlib.aclosing(
-                protocol.read_messages(self._reader)
-            ) as messages:
-                async for message in messages:
-                    self._route(message)
-                    if self._close_reason is not None:
-                        break
+            while self._close_reason is None:
+                body = await protocol.read_frame(self._reader)
+                if body is None:
+                    break
+                self._route(protocol.SERVER_MESSAGES.decode(body))
         except ProtocolError as exc:
             self._begin_close(str(exc))
         except asyncio.IncompleteReadError, OSError:
@@ -139,20 +137,15 @@ class TCPSession:
 
         An unsolicited Err closes the session with the server's rejection reason.
         """
-        if not self._pending:
+        try:
+            waiter = self._pending.get_nowait()
+        except asyncio.QueueEmpty:
             if isinstance(reply, Err):
                 self._begin_close(reply.message)
                 return
-            raise ProtocolError("reply received without a pending request")
-        waiter = self._pop_pending()
+            raise ProtocolError("reply received without a pending request") from None
         if not waiter.done():
             waiter.set_result(reply)
-
-    def _pop_pending(self) -> asyncio.Future[Reply]:
-        """Remove the oldest request and return its reserved capacity."""
-        waiter = self._pending.popleft()
-        self._slots.release()
-        return waiter
 
     def _begin_close(self, reason: str = _CLOSED) -> None:
         """Close and wake callers, preserving queued messages for draining.
@@ -164,65 +157,36 @@ class TCPSession:
             return
         self._close_reason = reason
         self._writer.close()
-        while self._pending:
-            waiter = self._pop_pending()
+        while not self._pending.empty():
+            waiter = self._pending.get_nowait()
             if not waiter.done():
                 waiter.set_exception(ConnectionError(reason))
                 waiter.exception()
+        self._pending.shutdown()
         self._messages.close()
-
-    def _check_open(self) -> None:
-        if self._close_reason is not None:
-            raise ConnectionError(self._close_reason)
-
-    def _submit(self, command: Command) -> asyncio.Future[Reply]:
-        """Encode, write and queue one command without yielding to the loop.
-
-        Staying synchronous keeps FIFO order equal to wire order. Once queued,
-        the caller's slot belongs to the future: a reply or closure releases it.
-        """
-        self._check_open()
-        encoded = protocol.encode_command(command)
-        waiter = asyncio.get_running_loop().create_future()
-        self._writer.write(encoded)
-        self._pending.append(waiter)
-        return waiter
-
-    async def _reserve_and_submit(self, command: Command) -> asyncio.Future[Reply]:
-        """Reserve a slot and transfer ownership to the submitted request.
-
-        Submission failures release capacity here; successful requests retain
-        their slots until a reply or session closure removes them from the FIFO.
-        """
-        self._check_open()
-        await self._slots.acquire()
-        try:
-            return self._submit(command)
-        except BaseException:
-            self._slots.release()
-            raise
 
     async def request(self, command: Command) -> Reply:
         """Send a command and await the reply that answers it.
 
-        Cancellation abandons the reply without closing the stream. A sent
-        request keeps its slot until its reply arrives, which bounds the
-        bookkeeping for cancelled requests even if the peer stops responding.
-        Capacity is acquired before wire encoding, and a failed submit returns
-        it. Cancellation during drain also retains the future's position while
-        discarding its eventual result.
+        Encoding happens first, so an invalid command never takes a slot. A sent
+        request keeps its slot until its reply arrives or the session closes,
+        bounding bookkeeping for cancelled requests if the peer stops replying.
+        Cancellation abandons the reply without closing the stream.
         """
-        waiter: asyncio.Future[Reply] | None = None
+        frame = protocol.encode_command(command)
+        waiter: asyncio.Future[Reply] = asyncio.get_running_loop().create_future()
         try:
-            waiter = await self._reserve_and_submit(command)
+            await self._pending.put(waiter)
+            self._writer.write(frame)
             await self._writer.drain()
             return await waiter
+        except asyncio.QueueShutDown as exc:
+            raise ConnectionError(self._close_reason) from exc
         except OSError:
             await self.close()
             raise
         finally:
-            if waiter is not None:
-                waiter.cancel()
+            waiter.cancel()
 
     async def next_message(self) -> Message:
         """Wait for the next Message with its original payload bytes.

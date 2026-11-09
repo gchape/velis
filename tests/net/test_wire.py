@@ -27,13 +27,15 @@ from velis.core.messages import (
     Value,
 )
 from velis.errors import ProtocolError
-from velis.net.fast import CommandCodec, ServerFrame, ServerMessageCodec
 from velis.net.limits import (
     MAX_CHANNEL_CHARS,
     MAX_FIELD_BYTES,
     MAX_KEY_CHARS,
     MAX_TAG_BYTES,
 )
+from velis.net.protocol import COMMANDS, SERVER_MESSAGES, ServerFrame
+from velis.net.wire import Codec
+from velis.net.wire import text as text_field
 
 COMMAND_CASES: tuple[tuple[Command, bytes], ...] = (
     (Get("k"), b"\x00\x00\x00\x03GET\x00\x00\x00\x01k"),
@@ -85,11 +87,20 @@ def members(alias: TypeAliasType) -> set[type]:
     return result
 
 
-COMMANDS = CommandCodec()
-SERVER_MESSAGES = ServerMessageCodec()
+class WireTests(unittest.TestCase):
+    def test_duplicate_tags_and_mismatched_field_counts_fail_at_declaration(
+        self,
+    ) -> None:
+        key = text_field("key", MAX_KEY_CHARS)
+        with self.assertRaisesRegex(ValueError, "duplicate command tag"):
+            Codec[Command]("command", {Get: (b"DUP", key), Delete: (b"DUP", key)})
+        for schema in ((b"GET",), (b"GET", key, key)):
+            with (
+                self.subTest(schema=schema),
+                self.assertRaisesRegex(TypeError, "Get has 1 attributes"),
+            ):
+                Codec[Command]("command", {Get: schema})
 
-
-class FastWireTests(unittest.TestCase):
     def test_unregistered_subclasses_are_rejected(self) -> None:
         class DerivedGet(Get):
             pass

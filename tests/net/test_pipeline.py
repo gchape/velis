@@ -1,7 +1,8 @@
 import asyncio
-import contextlib
 import unittest
 
+from tests.net.helpers import read_message
+from velis.config import ServerLimits
 from velis.core.broker import Broker
 from velis.core.engine import Engine
 from velis.core.messages import (
@@ -18,7 +19,7 @@ from velis.core.messages import (
 from velis.core.store import MAX_TTL_MS, Store
 from velis.net import protocol
 from velis.net.client import Client
-from velis.net.server import ServerLimits, TCPServer
+from velis.net.server import TCPServer
 from velis.net.session import SessionLimits
 
 
@@ -43,9 +44,7 @@ class PipelineIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 b"".join(protocol.encode_command(request) for request in requests)
             )
             async with asyncio.timeout(1):
-                frames = protocol.read_messages(reader)
-                await self.enterAsyncContext(contextlib.aclosing(frames))
-                responses = [await anext(frames) for _ in requests]
+                responses = [await read_message(reader) for _ in requests]
             self.assertEqual(
                 responses,
                 [

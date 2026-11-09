@@ -97,7 +97,7 @@ Use `asyncio.gather(client.get("a"), client.get("b"))` to pipeline independent c
 
 Use `asyncio.timeout(seconds)` around commands or `next_message()` to bound the wait. Cancelling or timing out a command leaves the connection usable and discards its eventual reply. A sent command may still execute on the server, including a write; cancellation does not undo it or guarantee that it was never applied. No request is sent when cancellation happens while waiting for an in-flight slot.
 
-Wire encoding starts after a request acquires capacity. Invalid outgoing commands may therefore wait for a slot before raising; encoding failure releases the reservation without sending. Use bounded application submission for bulk work as well.
+Commands are encoded before waiting for pending-queue capacity, so invalid outgoing commands fail immediately even when the queue is full. Waiting calls retain their encoded frames; use bounded application submission for bulk work as well.
 
 Clients allow at most 128 in-flight requests by default. Pass `limits=SessionLimits(max_pending_requests=...)` to `Client.connect()`, `TCPSession.connect()` or `TCPSession` to change this limit; import `SessionLimits` from `velis.config`. Additional calls wait for a slot. A cancelled sent request retains its slot until its reply arrives, keeping cancellation bookkeeping bounded. If a peer stops replying, slots remain occupied until the connection closes; waiting calls can still be cancelled or timed out.
 
@@ -136,7 +136,7 @@ flowchart TB
 
 `TCPServer` creates a `Connection` protocol for each socket. The connection buffers partial input, executes complete commands synchronously on the owning event loop and writes each batch's replies together. Expected command errors produce `ERR` without closing; malformed wire data closes the connection after a best-effort error reply.
 
-Commands, replies and publication pushes are frozen dataclasses in `velis.core.messages`. `net.fast` implements their fixed binary layouts directly. `net.protocol` frames encoded bodies and exposes `encode_command()`, `encode_message()`, `iter_frames()` and the client's `read_messages()` generator.
+Commands, replies and publication pushes are frozen dataclasses in `velis.core.messages`. `net.wire` provides reusable field codecs and a table-driven message codec. `net.protocol` declares each tag and its fields once, frames encoded bodies, and exposes `encode_command()`, `encode_message()`, `iter_frames()` and `read_frame()`.
 
 Clients support async context management, including cleanup after caller failures:
 
@@ -174,7 +174,7 @@ sequenceDiagram
     E-->>S: Ok()
     S->>S: encode reply and flush batch
     S-->>T: Length-prefixed OK frame
-    T->>T: protocol.read_messages(reader), resolve oldest request
+    T->>T: protocol.read_frame(reader), decode and resolve oldest request
     T-->>C: Ok()
 
     C->>T: request(Get(key))
@@ -187,7 +187,7 @@ sequenceDiagram
     E-->>S: Value(value)
     S->>S: encode reply and flush batch
     S-->>T: Length-prefixed VALUE frame
-    T->>T: protocol.read_messages(reader), resolve oldest request
+    T->>T: protocol.read_frame(reader), decode and resolve oldest request
     T-->>C: Value(value)
 ```
 
@@ -284,7 +284,7 @@ async def embedded() -> None:
 
 ### Background maintenance
 
-Maintenance runs in a task group owned by `serve()`. An unexpected sweep failure interrupts the active runtime scope and closes the server. Worker and caller failures are reported in an `ExceptionGroup` after cleanup; external cancellation remains `CancelledError`. Normal shutdown uses Python 3.15's `TaskGroup.cancel()` and awaits the group before closing the server. Incoming command and message generators use `contextlib.aclosing()` for deterministic cleanup. Client disconnections remain local to their connections.
+Maintenance runs in a task group owned by `serve()`. An unexpected sweep failure interrupts the active runtime scope and closes the server. Worker and caller failures are reported in an `ExceptionGroup` after cleanup; external cancellation remains `CancelledError`. Normal shutdown uses Python 3.15's `TaskGroup.cancel()` and awaits the group before closing the server. Client disconnections remain local to their connections.
 
 One task starts sweeping expired keys every `VELIS_SWEEP_MS`. Each round removes at most 1,000 expired keys. While due keys remain, maintenance yields to the event loop and runs another round without waiting for the next interval.
 
@@ -437,9 +437,9 @@ Client environment settings take effect when passing `config.session_limits` to 
 
 Stored values and publication payloads are opaque bytes from end to end. Applications serialize, compress or encrypt before calling `set()` or `publish()` and reverse that transformation after `get()` or `next_message()`. The client performs no application payload transforms.
 
-`velis.net.fast.CommandCodec` and `ServerMessageCodec` encode and decode the command, reply and push bodies using byte offsets and precompiled integer structs. Both directions enforce UTF-8, text and byte limits, integer ranges, truncation and complete record consumption. `velis.net.limits` owns all wire limits.
+`velis.net.wire.Codec` derives encoding, decoding and validation from the command and server-message tables in `net.protocol`. Reusable fields read by byte offset and use precompiled integer structs. Duplicate tags and field-count mismatches fail when a codec is declared. Both directions enforce UTF-8, text and byte limits, integer ranges, truncation and complete record consumption. `velis.net.limits` owns all wire limits.
 
-`protocol.COMMANDS` and `protocol.SERVER_MESSAGES` expose body encoding and decoding. `protocol.encode_command()` and `encode_message()` add the fixed u32 body length. `iter_frames(bytearray)` yields complete bodies and end offsets, leaving partial data unconsumed; callers discard consumed bytes only after iteration ends. The client uses `read_messages(reader)`, which reads and validates the length before waiting for the body.
+`protocol.COMMANDS` and `protocol.SERVER_MESSAGES` expose body encoding and decoding. `protocol.encode_command()` and `encode_message()` add the fixed u32 body length. `iter_frames(bytearray)` yields complete bodies and end offsets, leaving partial data unconsumed; callers discard consumed bytes only after iteration ends. The client loops over `read_frame(reader)`, which reads and validates the length before waiting for the body, then decodes each body with `SERVER_MESSAGES`. Clean EOF at a frame boundary returns `None`; partial headers and bodies raise `IncompleteReadError`.
 
 ```python
 from velis.core.messages import Get
@@ -477,11 +477,11 @@ src/velis/
     membership.py — Memberships with join/leave operations and mirrored indexes
     clock.py — structural Clock protocol and MonotonicClock implementation
   net/
-    protocol.py — fixed u32 framing, shared PushEncoder and client message reader
-    fast.py — offset-based command, reply and push body codecs
+    protocol.py — message tables, fixed u32 framing and shared PushEncoder
+    wire.py — reusable field codecs and table-driven tagged message codec
     limits.py — fixed wire field, frame and text limits
     connection.py — asyncio.Protocol callbacks, ordered batches and push buffering
-    server.py — ServerLimits and TCPServer
+    server.py — TCPServer listener lifecycle and connection admission
     client.py — opaque-byte command API, error translation and scoped cleanup
     session.py — Session interface and TCP request/message lifecycle
 tests/

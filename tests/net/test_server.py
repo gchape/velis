@@ -4,8 +4,9 @@ import unittest
 from unittest.mock import Mock, patch
 
 from tests.helpers import ManualClock
-from tests.net.helpers import make_connection
+from tests.net.helpers import make_connection, read_message
 from velis.app import serve
+from velis.config import ServerLimits
 from velis.core.broker import Broker
 from velis.core.engine import Engine
 from velis.core.eviction import EvictionPolicy
@@ -14,7 +15,8 @@ from velis.core.store import Store, StoreLimits
 from velis.errors import CommandError, ProtocolError
 from velis.net import protocol
 from velis.net.client import Client
-from velis.net.server import ServerLimits, TCPServer
+from velis.net.limits import MAX_FIELD_BYTES
+from velis.net.server import TCPServer
 
 
 class ServerTests(unittest.IsolatedAsyncioTestCase):
@@ -72,7 +74,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         try:
             async with asyncio.timeout(1):
                 self.assertEqual(
-                    await anext(protocol.read_messages(reader)),
+                    await read_message(reader),
                     Err("connection limit exceeded"),
                 )
                 self.assertEqual(await reader.read(), b"")
@@ -128,7 +130,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             writer.write(protocol.encode_frame(body))
             async with asyncio.timeout(1):
                 self.assertEqual(
-                    await anext(protocol.read_messages(reader)),
+                    await read_message(reader),
                     Err("key must not be empty"),
                 )
                 self.assertEqual(await reader.read(), b"")
@@ -156,7 +158,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
     async def test_max_size_message_does_not_drop_subscriber(self) -> None:
         sub, pub = await self.client(), await self.client()
         await sub.subscribe("ch")
-        big = b"x" * protocol.MAX_FIELD_BYTES
+        big = b"x" * MAX_FIELD_BYTES
         self.assertEqual(await pub.publish("ch", big), 1)
         async with asyncio.timeout(5):
             self.assertEqual((await sub.next_message()).payload, big)
@@ -172,7 +174,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
     async def test_unknown_command_gets_err_then_close(self) -> None:
         reader, writer = await asyncio.open_connection("127.0.0.1", self.server.port)
         writer.write(protocol.encode_frame(struct.pack(">I", 4) + b"NOPE"))
-        frame = await asyncio.wait_for(anext(protocol.read_messages(reader)), 1)
+        frame = await asyncio.wait_for(read_message(reader), 1)
         self.assertEqual(frame, Err("unknown command: 'NOPE'"))
         self.assertEqual(await asyncio.wait_for(reader.read(), 1), b"")
         writer.close()

@@ -3,7 +3,7 @@ import struct
 import unittest
 from collections.abc import Callable
 
-from tests.net.test_fast import COMMAND_CASES, MESSAGE_CASES
+from tests.net.test_wire import COMMAND_CASES, MESSAGE_CASES
 from velis.core.messages import Err, Message, Publish, Set, Value
 from velis.errors import ProtocolError
 from velis.net import protocol
@@ -68,18 +68,19 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ProtocolError, "field too long"):
             protocol.encode_message(Message("x" * MAX_FIELD_BYTES, data))
 
-    async def test_message_reader_roundtrips_all_server_frames(self) -> None:
+    async def test_frame_reader_roundtrips_all_server_frames(self) -> None:
         encoded = b"".join(protocol.encode_message(value) for value, _ in MESSAGE_CASES)
-        self.assertEqual(
-            [value async for value in protocol.read_messages(stream(encoded))],
-            [value for value, _ in MESSAGE_CASES],
-        )
-        self.assertEqual(
-            [value async for value in protocol.read_messages(stream(b""))], []
-        )
+        reader = stream(encoded)
+        actual = []
+        while (body := await protocol.read_frame(reader)) is not None:
+            actual.append(protocol.SERVER_MESSAGES.decode(body))
+        self.assertEqual(actual, [value for value, _ in MESSAGE_CASES])
+        self.assertIsNone(await protocol.read_frame(stream(b"")))
         for partial in (encoded[:1], encoded[:3], encoded[:-1]):
             with (
                 self.subTest(partial=partial),
                 self.assertRaises(asyncio.IncompleteReadError),
             ):
-                [value async for value in protocol.read_messages(stream(partial))]
+                reader = stream(partial)
+                while await protocol.read_frame(reader) is not None:
+                    pass

@@ -27,8 +27,8 @@ class StreamFramingTests(unittest.IsolatedAsyncioTestCase):
                 async with asyncio.TaskGroup() as tasks:
                     tasks.create_task(feed_chunks(reader, encoded, chunk_size))
                     for body in bodies:
-                        self.assertEqual(await protocol._read_body(reader), body)
-                    self.assertIsNone(await protocol._read_body(reader))
+                        self.assertEqual(await protocol.read_frame(reader), body)
+                    self.assertIsNone(await protocol.read_frame(reader))
 
     async def test_oversized_header_fails_before_body_is_requested(self) -> None:
         reader = Mock(spec=asyncio.StreamReader)
@@ -36,7 +36,7 @@ class StreamFramingTests(unittest.IsolatedAsyncioTestCase):
             return_value=struct.pack(">I", MAX_FRAME_BODY_BYTES + 1)
         )
         with self.assertRaisesRegex(ProtocolError, "field too long"):
-            await protocol._read_body(reader)
+            await protocol.read_frame(reader)
         reader.readexactly.assert_awaited_once_with(4)
         with self.assertRaisesRegex(ProtocolError, "field too long"):
             list(
@@ -53,16 +53,16 @@ class StreamFramingTests(unittest.IsolatedAsyncioTestCase):
             reader.feed_data(b"".join(protocol.encode_frame(body) for body in values))
             reader.feed_eof()
             for body in values:
-                self.assertEqual(await protocol._read_body(reader), body)
-            self.assertIsNone(await protocol._read_body(reader))
+                self.assertEqual(await protocol.read_frame(reader), body)
+            self.assertIsNone(await protocol.read_frame(reader))
         for end in range(1, len(second)):
             with self.subTest(end=end):
                 reader = asyncio.StreamReader()
                 reader.feed_data(first + second[:end])
                 reader.feed_eof()
-                self.assertEqual(await protocol._read_body(reader), b"first")
+                self.assertEqual(await protocol.read_frame(reader), b"first")
                 with self.assertRaises(asyncio.IncompleteReadError) as raised:
-                    await protocol._read_body(reader)
+                    await protocol.read_frame(reader)
                 if end < 4:
                     self.assertEqual(raised.exception.expected, 4)
                     self.assertEqual(raised.exception.partial, second[:end])

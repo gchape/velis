@@ -2,26 +2,42 @@
 
 Commands and server messages use tagged bodies with fixed field layouts. Values
 and publication payloads are opaque bytes; framing is not configurable.
+Reply and push channels obey the field-byte limit without request-channel
+character restrictions.
 """
 
 import asyncio
-from collections.abc import AsyncGenerator, Callable, Iterator
+from collections.abc import Callable, Iterator
 
-from velis.core.messages import Command, Message
-from velis.errors import ProtocolError
-from velis.net.fast import (
-    CommandCodec,
-    ServerFrame,
-    ServerMessageCodec,
-    pack_u32,
-    unpack_u32,
+from velis.core.messages import (
+    TTL,
+    Command,
+    Delete,
+    Delivered,
+    Err,
+    Expire,
+    Get,
+    Message,
+    Nil,
+    Ok,
+    Persist,
+    Persistent,
+    Publish,
+    Reply,
+    Set,
+    Subscribe,
+    Subscribed,
+    TTLValue,
+    Unsubscribe,
+    Unsubscribed,
+    Value,
 )
-from velis.net.limits import MAX_FIELD_BYTES, MAX_FRAME_BODY_BYTES
+from velis.errors import ProtocolError
+from velis.net.limits import MAX_CHANNEL_CHARS, MAX_FRAME_BODY_BYTES, MAX_KEY_CHARS
+from velis.net.wire import BLOB, FREE_TEXT, U32, U64, Codec, pack_u32, text, unpack_u32
 
 __all__ = [
     "COMMANDS",
-    "MAX_FIELD_BYTES",
-    "MAX_FRAME_BODY_BYTES",
     "SERVER_MESSAGES",
     "PushEncoder",
     "ServerFrame",
@@ -30,11 +46,44 @@ __all__ = [
     "encode_message",
     "encode_push",
     "iter_frames",
-    "read_messages",
+    "read_frame",
 ]
 
-COMMANDS = CommandCodec()
-SERVER_MESSAGES = ServerMessageCodec()
+type ServerFrame = Reply | Message
+
+KEY = text("key", MAX_KEY_CHARS)
+CHANNEL = text("channel", MAX_CHANNEL_CHARS)
+
+COMMANDS = Codec[Command](
+    "command",
+    {
+        Get: (b"GET", KEY),
+        Set: (b"SET", KEY, BLOB),
+        Expire: (b"EXPIRE", KEY, U64),
+        Delete: (b"DEL", KEY),
+        TTL: (b"TTL", KEY),
+        Persist: (b"PERSIST", KEY),
+        Subscribe: (b"SUBSCRIBE", CHANNEL),
+        Unsubscribe: (b"UNSUBSCRIBE", CHANNEL),
+        Publish: (b"PUBLISH", CHANNEL, BLOB),
+    },
+)
+
+SERVER_MESSAGES = Codec[ServerFrame](
+    "server message",
+    {
+        Ok: (b"OK",),
+        Nil: (b"NIL",),
+        Persistent: (b"PERSISTENT",),
+        Value: (b"VALUE", BLOB),
+        Err: (b"ERR", FREE_TEXT),
+        Subscribed: (b"SUBSCRIBED", FREE_TEXT),
+        Unsubscribed: (b"UNSUBSCRIBED", FREE_TEXT),
+        Delivered: (b"DELIVERED", U32),
+        TTLValue: (b"TTL_VALUE", U64),
+        Message: (b"MESSAGE", FREE_TEXT, BLOB),
+    },
+)
 
 
 def _check_frame_length(length: int) -> None:
@@ -98,7 +147,7 @@ def iter_frames(buf: bytearray) -> Iterator[tuple[bytes, int]]:
         pos = end
 
 
-async def _read_body(reader: asyncio.StreamReader) -> bytes | None:
+async def read_frame(reader: asyncio.StreamReader) -> bytes | None:
     """Read a body, returning None only for clean EOF at a frame boundary.
 
     Partial headers and bodies raise IncompleteReadError. Check the body limit
@@ -113,9 +162,3 @@ async def _read_body(reader: asyncio.StreamReader) -> bytes | None:
     (length,) = unpack_u32(header)
     _check_frame_length(length)
     return await reader.readexactly(length)
-
-
-async def read_messages(reader: asyncio.StreamReader) -> AsyncGenerator[ServerFrame]:
-    """Yield fixed-format replies and pushes until a clean server disconnect."""
-    while (body := await _read_body(reader)) is not None:
-        yield SERVER_MESSAGES.decode(body)

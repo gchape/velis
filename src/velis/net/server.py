@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from types import TracebackType
 from typing import Self
 
 from velis.config import ServerLimits
@@ -28,7 +29,12 @@ class TCPServer:
         await self.start()
         return self
 
-    async def __aexit__(self, exc_type: object, *_: object) -> None:
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
         await self.close()
 
     @property
@@ -42,10 +48,10 @@ class TCPServer:
         """Start accepting connections; an active listener cannot be restarted."""
         if self._listener is not None:
             raise RuntimeError("server already started")
+        self._listener = await asyncio.get_running_loop().create_server(
+            self._new_connection, self._limits.host, self._limits.port
+        )
         try:
-            self._listener = await asyncio.get_running_loop().create_server(
-                self._new_connection, self._limits.host, self._limits.port
-            )
             log.info("listening on %s:%d", self._limits.host, self.port)
         except BaseException:
             await self.close()

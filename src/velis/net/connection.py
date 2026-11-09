@@ -73,7 +73,7 @@ class Connection(asyncio.Protocol):
         self._peer = transport.get_extra_info("peername")
         if not self._admit():
             self._write_now(Err("connection limit exceeded"))
-            self._close()
+            self._shutdown()
             return
         self._admitted = True
         log.info("connected: %s", self._peer)
@@ -105,7 +105,7 @@ class Connection(asyncio.Protocol):
 
     def pause_writing(self) -> None:
         self._flow.write_blocked = True
-        self._pause_reading()
+        self._set_reading(False)
 
     def resume_writing(self) -> None:
         self._flow.write_blocked = False
@@ -159,7 +159,7 @@ class Connection(asyncio.Protocol):
         """Abort failures, logging unexpected errors and keeping OSError quiet."""
         if not isinstance(exc, OSError):
             log.exception("unexpected error serving %s", self._peer)
-        self._abort()
+        self._shutdown(abort=True)
 
     def _schedule_next(self, batch: _Batch) -> None:
         if batch.error is not None:
@@ -167,40 +167,33 @@ class Connection(asyncio.Protocol):
         elif batch.handled == COMMANDS_PER_TURN and self._buf:
             self._yield_to_loop()
         elif self._flow.eof:
-            self._close()
+            self._shutdown()
         elif not self._flow.write_blocked:
-            self._resume_reading()
+            self._set_reading(True)
 
     def _fail_protocol(self, error: ProtocolError) -> None:
         log.warning("protocol error from %s: %s", self._peer, error)
         self._write_now(Err(str(error)))
-        self._close()
+        self._shutdown()
 
     def _yield_to_loop(self) -> None:
-        self._pause_reading()
+        self._set_reading(False)
         self._pump_handle = asyncio.get_running_loop().call_soon(self._pump)
 
-    def _pause_reading(self) -> None:
+    def _set_reading(self, reading: bool) -> None:
         transport = self._transport
         if (
-            transport is not None
-            and self._flow.reading
-            and not transport.is_closing()
-            and not self._flow.eof
+            transport is None
+            or self._flow.reading == reading
+            or self._flow.eof
+            or transport.is_closing()
         ):
-            transport.pause_reading()
-            self._flow.reading = False
-
-    def _resume_reading(self) -> None:
-        transport = self._transport
-        if (
-            transport is not None
-            and not self._flow.reading
-            and not transport.is_closing()
-            and not self._flow.eof
-        ):
+            return
+        if reading:
             transport.resume_reading()
-            self._flow.reading = True
+        else:
+            transport.pause_reading()
+        self._flow.reading = reading
 
     def _write_now(self, reply: Reply) -> None:
         transport = self._transport
@@ -213,19 +206,15 @@ class Connection(asyncio.Protocol):
             self._pump_handle.cancel()
             self._pump_handle = None
 
-    def _begin_close(self) -> asyncio.Transport | None:
+    def _shutdown(self, *, abort: bool = False) -> None:
         self._closing = True
         self._cancel_pump()
         self._buf.clear()
-        return self._transport
-
-    def _close(self) -> None:
-        if (transport := self._begin_close()) is not None:
-            transport.close()
-
-    def _abort(self) -> None:
-        if (transport := self._begin_close()) is not None:
-            transport.abort()
+        if (transport := self._transport) is not None:
+            if abort:
+                transport.abort()
+            else:
+                transport.close()
 
     def send(self, message: Message) -> bool:
         """Queue a push and return whether the transport accepted it.

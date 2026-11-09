@@ -104,12 +104,12 @@ class TCPSession:
         try:
             async with contextlib.aclosing(
                 self._wire.read_messages(self._reader)
-            ) as frames:
-                async for frame in frames:
-                    if isinstance(frame, Message):
-                        self._enqueue_message(frame)
+            ) as messages:
+                async for message in messages:
+                    if isinstance(message, Message):
+                        self._enqueue_message(message)
                     else:
-                        self._resolve_reply(frame)
+                        self._resolve_reply(message)
                     if self._closed:
                         break
         except ProtocolError as exc:
@@ -138,10 +138,15 @@ class TCPSession:
                 self._begin_close(reply.message)
                 return
             raise ProtocolError("reply received without a pending request")
-        waiter = self._pending.popleft()
-        self._slots.release()
+        waiter = self._pop_pending()
         if not waiter.done():
             waiter.set_result(reply)
+
+    def _pop_pending(self) -> asyncio.Future[Reply]:
+        """Remove the oldest request and return its reserved capacity."""
+        waiter = self._pending.popleft()
+        self._slots.release()
+        return waiter
 
     def _begin_close(self, reason: str = _CLOSED) -> None:
         """Close and wake callers, preserving queued messages for draining.
@@ -154,8 +159,7 @@ class TCPSession:
         self._close_reason = reason
         self._writer.close()
         while self._pending:
-            waiter = self._pending.popleft()
-            self._slots.release()
+            waiter = self._pop_pending()
             if not waiter.done():
                 waiter.set_exception(ConnectionError(reason))
                 waiter.exception()
@@ -190,13 +194,17 @@ class TCPSession:
         await self._slots.acquire()
         try:
             waiter = self._submit(command)
+        except OSError:
+            self._slots.release()
+            await self.close()
+            raise
         except BaseException:
             self._slots.release()
             raise
         try:
             await self._writer.drain()
             return await waiter
-        except ConnectionError:
+        except OSError:
             await self.close()
             raise
         finally:

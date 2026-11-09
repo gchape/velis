@@ -55,17 +55,15 @@ async def serve(
     """
     if engine is None:
         engine = build_engine(config)
-    server = TCPServer(engine, config.server, wire=wire)
-    try:
-        await server.start()
-        async with asyncio.TaskGroup() as workers:
-            maintenance = workers.create_task(
-                _maintain(engine, config.sweep_interval_ms / 1000)
-            )
-            try:
-                yield server
-            finally:
-                maintenance.cancel()
-                log.info("shutting down")
-    finally:
-        await server.close()
+    async with (
+        TCPServer(engine, config.server, wire=wire) as server,
+        asyncio.TaskGroup() as workers,
+    ):
+        maintenance = workers.create_task(
+            _maintain(engine, config.sweep_interval_ms / 1000)
+        )
+        try:
+            yield server
+        finally:
+            maintenance.cancel()
+            log.info("shutting down")

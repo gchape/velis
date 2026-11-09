@@ -1,3 +1,6 @@
+from velis.core.broker import Publication
+
+
 class ManualClock:
     """Test clock that advances without waiting for real time."""
 
@@ -18,8 +21,8 @@ class RecordingSubscriber:
         self.alive = True
         self.messages: list[tuple[str, bytes]] = []
 
-    def send(self, channel: str, payload: bytes) -> bool:
+    def send(self, publication: Publication) -> bool:
         if not self.alive:
             return False
-        self.messages.append((channel, payload))
+        self.messages.append((publication.channel, publication.payload))
         return True

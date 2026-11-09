@@ -13,7 +13,7 @@ class SchedulingTests(unittest.IsolatedAsyncioTestCase):
     async def test_ready_pipeline_yields_between_command_batches(self) -> None:
         total = COMMANDS_PER_TURN * 3 + 1
 
-        async def framed_commands():
+        async def commands():
             for _ in range(total):
                 yield Get("key")
 

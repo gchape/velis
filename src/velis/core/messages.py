@@ -1,4 +1,4 @@
-"""Requests and replies as plain data.
+"""Commands, replies and publication pushes as plain message data.
 
 The network layer translates bytes into these values. The engine receives
 commands and returns replies. TTL queries use MISSING (-2) and NO_EXPIRY (-1)

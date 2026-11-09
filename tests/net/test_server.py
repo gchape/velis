@@ -17,11 +17,12 @@ from velis.codec import (
 from velis.config import Config, ServerConfig
 from velis.core.broker import Broker
 from velis.core.engine import Engine
+from velis.core.eviction import EvictionPolicy
 from velis.core.messages import Command, Err, Get, Message, Subscribe
-from velis.core.store import EvictionPolicy, Store, StoreLimits
+from velis.core.store import Store, StoreLimits
 from velis.errors import CommandError, ProtocolError
 from velis.net import protocol
-from velis.net.client import Client
+from velis.net.client import DEFAULT_CODEC, Client
 from velis.net.connection import Connection
 from velis.net.server import TCPServer
 
@@ -51,6 +52,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         writer = Mock(spec=asyncio.StreamWriter)
         writer.is_closing.return_value = False
         writer.transport = Mock(spec=asyncio.Transport)
+        writer.transport.is_closing.return_value = False
         writer.transport.get_write_buffer_size.return_value = 17
         writer.drain = AsyncMock(
             side_effect=AssertionError("must not drain subscriber")
@@ -148,7 +150,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         await self.server.start()
         self.addAsyncCleanup(self.server.close)
 
-    async def client(self, codec: Codec[bytes, bytes] | None = None) -> Client:
+    async def client(self, codec: Codec[bytes, bytes] = DEFAULT_CODEC) -> Client:
         c = await Client.connect("127.0.0.1", self.server.port, codec)
         self.addAsyncCleanup(c.close)
         return c
@@ -276,9 +278,10 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             await client.unsubscribe("news")
 
     async def test_command_rule_rejects_locally_without_writing(self) -> None:
-        def allow(command: Command) -> None:
+        def allow(command: Command) -> str | None:
             if isinstance(command, Get) and command.key == "blocked":
-                raise ProtocolError("blocked key")
+                return "blocked key"
+            return None
 
         wire = protocol.WireProtocol(
             command_codec=CompositeCodec.of(Validate(allow)) | protocol.COMMANDS,
@@ -292,9 +295,10 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await client.get("key"), b"value")
 
     async def test_command_rule_runs_on_server_decode(self) -> None:
-        def allow(command: Command) -> None:
+        def allow(command: Command) -> str | None:
             if isinstance(command, Get) and command.key == "blocked":
-                raise ProtocolError("blocked key")
+                return "blocked key"
+            return None
 
         wire = protocol.WireProtocol(
             command_codec=CompositeCodec.of(Validate(allow)) | protocol.COMMANDS,
@@ -411,7 +415,7 @@ class RuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
         config = Config(
             "INFO",
             ServerConfig("127.0.0.1", 0),
-            store=StoreLimits(max_keys=2, eviction_policy=EvictionPolicy.SIEVE),
+            store=StoreLimits(max_keys=2, eviction_policy=EvictionPolicy.LFU),
         )
         async with (
             serve(config) as server,

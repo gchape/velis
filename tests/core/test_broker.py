@@ -1,8 +1,67 @@
+import random
 import unittest
+from unittest.mock import Mock
 
 from tests.helpers import RecordingSubscriber
-from velis.core.broker import Broker
-from velis.errors import CapacityError
+from velis.core.broker import Broker, Publication, _Membership
+from velis.errors import CapacityError, ProtocolError
+
+
+class PublicationTests(unittest.TestCase):
+    def test_cache_uses_identity_and_retains_empty_encodings(self) -> None:
+        first: list[str] = []
+        second: list[str] = []
+        encode = Mock(side_effect=[b"", b"second"])
+        publication = Publication("news", b"hello")
+        for _ in range(2):
+            self.assertEqual(publication.encoded_by(first, encode), b"")
+        for _ in range(2):
+            self.assertEqual(publication.encoded_by(second, encode), b"second")
+        self.assertEqual(encode.call_count, 2)
+        encode.assert_called_with("news", b"hello")
+
+    def test_failed_encoding_does_not_poison_the_cache(self) -> None:
+        wire = object()
+        encode = Mock(side_effect=[ProtocolError("invalid"), b"ok"])
+        publication = Publication("news", b"hello")
+        with self.assertRaises(ProtocolError):
+            publication.encoded_by(wire, encode)
+        self.assertEqual(publication.encoded_by(wire, encode), b"ok")
+        self.assertEqual(publication.encoded_by(wire, encode), b"ok")
+        self.assertEqual(encode.call_count, 2)
+
+
+class MembershipTests(unittest.TestCase):
+    def test_mirrored_indexes_match_a_set_of_pairs_and_prune_empty_entries(
+        self,
+    ) -> None:
+        rng = random.Random(47)
+        membership: _Membership[int, int] = _Membership()
+        pairs: set[tuple[int, int]] = set()
+        for step in range(1000):
+            key, item = rng.randrange(8), rng.randrange(8)
+            match rng.randrange(3):
+                case 0:
+                    membership.add(key, item)
+                    pairs.add((key, item))
+                case 1:
+                    membership.discard(key, item)
+                    pairs.discard((key, item))
+                case 2:
+                    membership.discard_item(item)
+                    pairs = {(k, v) for k, v in pairs if v != item}
+            with self.subTest(step=step):
+                self.assertEqual(set(membership._by_key), {k for k, _ in pairs})
+                self.assertEqual(set(membership._by_item), {v for _, v in pairs})
+                for candidate in range(8):
+                    self.assertEqual(
+                        set(membership.items_for(candidate)),
+                        {v for k, v in pairs if k == candidate},
+                    )
+                    self.assertEqual(
+                        membership.item_count(candidate),
+                        sum(v == candidate for _, v in pairs),
+                    )
 
 
 class BrokerTests(unittest.TestCase):

@@ -1,6 +1,6 @@
 import asyncio
 import unittest
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 from tests.helpers import ManualClock
 from velis import __main__ as cli
@@ -8,7 +8,8 @@ from velis.app import _maintain, serve
 from velis.config import Config, ServerConfig
 from velis.core.broker import Broker
 from velis.core.engine import Engine
-from velis.core.store import EvictionPolicy, Store, StoreLimits
+from velis.core.eviction import EvictionPolicy
+from velis.core.store import Store, StoreLimits
 from velis.net.server import TCPServer
 
 
@@ -80,9 +81,18 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     def setUp(self) -> None:
         self.config = Config("INFO", ServerConfig("127.0.0.1", 0))
-        self.server = Mock(spec=TCPServer)
+        self.server = MagicMock(spec=TCPServer)
         self.server.start = AsyncMock()
         self.server.close = AsyncMock()
+
+        async def enter():
+            return await TCPServer.__aenter__(self.server)
+
+        async def leave(*args):
+            await TCPServer.__aexit__(self.server, *args)
+
+        self.server.__aenter__.side_effect = enter
+        self.server.__aexit__.side_effect = leave
         self.patch_server = patch("velis.app.TCPServer", return_value=self.server)
         self.patch_server.start()
         self.addCleanup(self.patch_server.stop)
@@ -109,14 +119,14 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
                     self.server.start.assert_awaited_once()
             self.server.close.assert_awaited_once()
 
-    async def test_startup_failure_still_closes_server(self) -> None:
+    async def test_startup_failure_does_not_start_maintenance(self) -> None:
         self.server.start.side_effect = OSError("bind failed")
         with patch("velis.app._maintain") as maintain:
             with self.assertRaisesRegex(OSError, "bind failed"):
                 async with serve(self.config):
                     self.fail("runtime should not start")
             maintain.assert_not_called()
-        self.server.close.assert_awaited_once()
+        self.server.close.assert_not_awaited()
 
     async def test_caller_failure_still_closes_server(self) -> None:
         failure = RuntimeError("caller failed")

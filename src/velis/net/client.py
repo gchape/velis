@@ -1,3 +1,5 @@
+"""Typed client commands, payload transforms and reply validation."""
+
 from types import TracebackType
 from typing import Self, final
 
@@ -86,30 +88,25 @@ class Client:
 
     async def _flag(self, command: Command) -> bool:
         """Interpret the common mutation acknowledgment: Ok is True, Nil False."""
-        match await self._request(command):
-            case Ok():
-                return True
-            case Nil():
-                return False
-            case other:
-                raise _unexpected(command, other)
+        return isinstance(await self._call(command, Ok, Nil), Ok)
+
+    async def _call[R: Reply](self, command: Command, *accepted: type[R]) -> R:
+        """Validate the reply type once at the command boundary."""
+        reply = await self._request(command)
+        if not isinstance(reply, accepted):
+            raise _unexpected(command, reply)
+        return reply
 
     async def _expect_reply(self, command: Command, expected: Reply) -> None:
         """Validate acknowledgments, including the channel for subscriptions."""
-        reply = await self._request(command)
+        reply = await self._call(command, type(expected))
         if reply != expected:
             raise _unexpected(command, reply)
 
     async def get(self, key: str) -> bytes | None:
         """Return the decoded value, or None for a missing or expired key."""
-        command = Get(key)
-        match await self._request(command):
-            case Value(value):
-                return self._codec.decode(value)
-            case Nil():
-                return None
-            case other:
-                raise _unexpected(command, other)
+        reply = await self._call(Get(key), Value, Nil)
+        return None if isinstance(reply, Nil) else self._codec.decode(reply.value)
 
     async def set(self, key: str, value: bytes) -> None:
         """Encode and store a value, clearing any previous TTL."""
@@ -129,16 +126,13 @@ class Client:
 
     async def ttl(self, key: str) -> int:
         """Remaining milliseconds; MISSING (-2) or NO_EXPIRY (-1) otherwise."""
-        command = TTL(key)
-        match await self._request(command):
+        match await self._call(TTL(key), TTLValue, Persistent, Nil):
             case TTLValue(ms):
                 return ms
             case Persistent():
                 return NO_EXPIRY
-            case Nil():
+            case _:
                 return MISSING
-            case other:
-                raise _unexpected(command, other)
 
     async def subscribe(self, channel: str) -> None:
         """Join a channel to receive server pushes."""
@@ -150,12 +144,10 @@ class Client:
 
     async def publish(self, channel: str, payload: bytes) -> int:
         """Encode a message and return the number of accepting subscribers."""
-        command = Publish(channel, self._codec.encode(payload))
-        match await self._request(command):
-            case Delivered(count):
-                return count
-            case other:
-                raise _unexpected(command, other)
+        reply = await self._call(
+            Publish(channel, self._codec.encode(payload)), Delivered
+        )
+        return reply.count
 
     async def next_message(self) -> Message:
         """Receive a publication and decode its payload with the client codec.

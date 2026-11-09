@@ -1,62 +1,41 @@
 import asyncio
 import struct
 import unittest
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import Mock, patch
 
-from tests.codec.helpers import Reverse
 from tests.helpers import ManualClock
+from tests.net.helpers import make_connection
 from velis.app import serve
-from velis.codec import (
-    Codec,
-    CompositeCodec,
-    Identity,
-    LengthPrefixedField,
-    UInt,
-    Validate,
-)
 from velis.core.broker import Broker, BrokerLimits
 from velis.core.engine import Engine
 from velis.core.eviction import EvictionPolicy
-from velis.core.messages import Command, Err, Get, Message, Subscribe
+from velis.core.messages import Err, Message, Subscribe
 from velis.core.store import Store, StoreLimits
 from velis.errors import CommandError, ProtocolError
 from velis.net import protocol
-from velis.net.client import DEFAULT_CODEC, Client
-from velis.net.connection import Connection
+from velis.net.client import Client
 from velis.net.server import ServerLimits, TCPServer
 
 
 class ServerTests(unittest.IsolatedAsyncioTestCase):
-    async def test_payload_codec_for_values_and_publications(self) -> None:
-        codec = LengthPrefixedField(Identity(), 1024, prefix=UInt(4))
-        coded = await self.client(codec)
-        raw = await self.client()
-        payload = b"encoded value" * 10
-        await coded.set("coded", payload)
-        encoded = await raw.get("coded")
-        self.assertIsNotNone(encoded)
-        assert encoded is not None
-        self.assertEqual(encoded, codec.encode(payload))
-        self.assertEqual(codec.decode(encoded), payload)
-        self.assertEqual(await coded.get("coded"), payload)
-        await coded.subscribe("coded")
-        self.assertEqual(await coded.publish("coded", payload), 1)
-        async with asyncio.timeout(1):
-            self.assertEqual(await coded.next_message(), Message("coded", payload))
-        with self.assertRaises(ProtocolError):
-            await coded.set("oversized", b"x" * (codec.max_length + 1))
-        self.assertEqual(await coded.get("coded"), payload)
+    async def test_binary_values_and_publications_remain_opaque(self) -> None:
+        client = await self.client()
+        await client.subscribe("binary")
+        for payload in (b"", bytes(range(256))):
+            with self.subTest(size=len(payload)):
+                await client.set("key", payload)
+                self.assertEqual(await client.get("key"), payload)
+                self.assertEqual(await client.publish("binary", payload), 1)
+                async with asyncio.timeout(1):
+                    self.assertEqual(
+                        await client.next_message(), Message("binary", payload)
+                    )
 
     async def test_slow_subscriber_is_aborted_without_blocking_publisher(self) -> None:
-        writer = Mock(spec=asyncio.StreamWriter)
-        writer.is_closing.return_value = False
-        writer.transport = Mock(spec=asyncio.Transport)
-        writer.transport.is_closing.return_value = False
-        writer.transport.get_write_buffer_size.return_value = 17
-        writer.drain = AsyncMock(
-            side_effect=AssertionError("must not drain subscriber")
-        )
-        slow = Connection(Mock(spec=asyncio.StreamReader), writer, max_buffer=16)
+        transport = Mock(spec=asyncio.Transport)
+        transport.is_closing.return_value = False
+        transport.get_write_buffer_size.return_value = 17
+        slow = make_connection(transport, max_buffer=16)
         self.engine.execute(Subscribe("news"), slow)
         healthy, publisher = await self.client(), await self.client()
         await healthy.subscribe("news")
@@ -64,34 +43,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await publisher.publish("news", b"hello"), 1)
             self.assertEqual(await healthy.next_message(), Message("news", b"hello"))
             self.assertEqual(await publisher.publish("news", b"again"), 1)
-        writer.transport.abort.assert_called_once()
-        writer.drain.assert_not_awaited()
-
-    async def test_subscriber_wire_failure_keeps_publisher_and_healthy_peer_usable(
-        self,
-    ) -> None:
-        wire = protocol.WireProtocol(
-            message_codec=CompositeCodec.of(protocol.SERVER_MESSAGES)
-            | LengthPrefixedField(Identity(), 64, prefix=UInt(4))
-        )
-        server = TCPServer(self.engine, ServerLimits("127.0.0.1", 0), wire=wire)
-        await server.start()
-        self.addAsyncCleanup(server.close)
-        limited = await Client.connect("127.0.0.1", server.port, wire=wire)
-        self.addAsyncCleanup(limited.close)
-        healthy, publisher = await self.client(), await self.client()
-        await limited.subscribe("news")
-        await healthy.subscribe("news")
-        payload = b"x" * 128
-        async with asyncio.timeout(1):
-            self.assertEqual(await publisher.publish("news", payload), 1)
-            self.assertEqual(await healthy.next_message(), Message("news", payload))
-            with self.assertRaises(ConnectionError):
-                await limited.next_message()
-            await publisher.set("key", b"usable")
-            self.assertEqual(await publisher.get("key"), b"usable")
-            self.assertEqual(await publisher.publish("news", b"again"), 1)
-            self.assertEqual(await healthy.next_message(), Message("news", b"again"))
+        transport.abort.assert_called_once()
 
     async def test_connection_limit_reason_reaches_idle_client(self) -> None:
         server = TCPServer(self.engine, ServerLimits("127.0.0.1", 0, max_connections=1))
@@ -120,7 +72,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         try:
             async with asyncio.timeout(1):
                 self.assertEqual(
-                    await anext(protocol.DEFAULT_PROTOCOL.read_messages(reader)),
+                    await anext(protocol.read_messages(reader)),
                     Err("connection limit exceeded"),
                 )
                 self.assertEqual(await reader.read(), b"")
@@ -149,8 +101,8 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
         await self.server.start()
         self.addAsyncCleanup(self.server.close)
 
-    async def client(self, codec: Codec[bytes, bytes] = DEFAULT_CODEC) -> Client:
-        c = await Client.connect("127.0.0.1", self.server.port, codec)
+    async def client(self) -> Client:
+        c = await Client.connect("127.0.0.1", self.server.port)
         self.addAsyncCleanup(c.close)
         return c
 
@@ -172,11 +124,11 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
     async def test_empty_key_from_raw_socket_gets_err_then_eof(self) -> None:
         reader, writer = await asyncio.open_connection("127.0.0.1", self.server.port)
         try:
-            body = protocol.TEXT.encode("GET") + struct.pack(">I", 0)
-            writer.write(protocol.DEFAULT_PROTOCOL.framing.encode(body))
+            body = b"\x00\x00\x00\x03GET" + struct.pack(">I", 0)
+            writer.write(protocol.encode_frame(body))
             async with asyncio.timeout(1):
                 self.assertEqual(
-                    await anext(protocol.DEFAULT_PROTOCOL.read_messages(reader)),
+                    await anext(protocol.read_messages(reader)),
                     Err("key must not be empty"),
                 )
                 self.assertEqual(await reader.read(), b"")
@@ -219,12 +171,8 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_unknown_command_gets_err_then_close(self) -> None:
         reader, writer = await asyncio.open_connection("127.0.0.1", self.server.port)
-        writer.write(
-            protocol.DEFAULT_PROTOCOL.framing.encode(struct.pack(">I", 4) + b"NOPE")
-        )
-        frame = await asyncio.wait_for(
-            anext(protocol.DEFAULT_PROTOCOL.read_messages(reader)), 1
-        )
+        writer.write(protocol.encode_frame(struct.pack(">I", 4) + b"NOPE"))
+        frame = await asyncio.wait_for(anext(protocol.read_messages(reader)), 1)
         self.assertEqual(frame, Err("unknown command: 'NOPE'"))
         self.assertEqual(await asyncio.wait_for(reader.read(), 1), b"")
         writer.close()
@@ -238,87 +186,6 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
                 return
             await asyncio.sleep(0.02)
         self.fail("subscriber was never cleaned up")
-
-    async def test_codec_lives_on_the_client(self) -> None:
-        """The server stores opaque bytes while the client applies its codec."""
-        coded = await self.client(Reverse())
-        raw = await self.client()
-        await coded.set("k", b"abc")
-        self.assertEqual(await raw.get("k"), b"cba")
-        self.assertEqual(await coded.get("k"), b"abc")
-
-    async def test_custom_wire_chains_cover_commands_replies_pushes_and_errors(
-        self,
-    ) -> None:
-        wire = protocol.WireProtocol(
-            command_codec=CompositeCodec.of(protocol.COMMANDS) | Reverse(),
-            message_codec=CompositeCodec.of(protocol.SERVER_MESSAGES) | Reverse(),
-            framing=LengthPrefixedField(Identity(), 65535, prefix=UInt(2)),
-        )
-        store = Store()
-        server = TCPServer(
-            Engine(store, Broker()), ServerLimits("127.0.0.1", 0), wire=wire
-        )
-        await server.start()
-        self.addAsyncCleanup(server.close)
-        async with await Client.connect(
-            "127.0.0.1", server.port, codec=Reverse(), wire=wire
-        ) as client:
-            await client.set("key", b"value")
-            self.assertEqual(store.get("key"), b"eulav")
-            self.assertEqual(await client.get("key"), b"value")
-            await client.subscribe("news")
-            self.assertEqual(await client.publish("news", b"hello"), 1)
-            async with asyncio.timeout(1):
-                self.assertEqual(await client.next_message(), Message("news", b"hello"))
-            with self.assertRaises(CommandError):
-                await client.expire("key", 1 << 63)
-            self.assertEqual(await client.get("key"), b"value")
-            await client.unsubscribe("news")
-
-    async def test_command_rule_rejects_locally_without_writing(self) -> None:
-        def allow(command: Command) -> str | None:
-            if isinstance(command, Get) and command.key == "blocked":
-                return "blocked key"
-            return None
-
-        wire = protocol.WireProtocol(
-            command_codec=CompositeCodec.of(Validate(allow)) | protocol.COMMANDS,
-        )
-        async with await Client.connect(
-            "127.0.0.1", self.server.port, wire=wire
-        ) as client:
-            with self.assertRaisesRegex(ProtocolError, "blocked key"):
-                await client.get("blocked")
-            await client.set("key", b"value")
-            self.assertEqual(await client.get("key"), b"value")
-
-    async def test_command_rule_runs_on_server_decode(self) -> None:
-        def allow(command: Command) -> str | None:
-            if isinstance(command, Get) and command.key == "blocked":
-                return "blocked key"
-            return None
-
-        wire = protocol.WireProtocol(
-            command_codec=CompositeCodec.of(Validate(allow)) | protocol.COMMANDS,
-            message_codec=CompositeCodec.of(protocol.SERVER_MESSAGES) | Reverse(),
-        )
-        server = TCPServer(self.engine, ServerLimits("127.0.0.1", 0), wire=wire)
-        await server.start()
-        self.addAsyncCleanup(server.close)
-        reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
-        try:
-            writer.write(
-                protocol.DEFAULT_PROTOCOL.framed_commands.encode(Get("blocked"))
-            )
-            async with asyncio.timeout(1):
-                self.assertEqual(
-                    await anext(wire.read_messages(reader)), Err("blocked key")
-                )
-                self.assertEqual(await reader.read(), b"")
-        finally:
-            writer.close()
-            await writer.wait_closed()
 
 
 class RuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
@@ -428,10 +295,13 @@ class RuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_server_encodes_one_push_per_publish_for_all_subscribers(
         self,
     ) -> None:
-        codec = Mock(wraps=protocol.SERVER_MESSAGES)
-        wire = protocol.WireProtocol(message_codec=codec)
+        codec = self.enterContext(
+            patch.object(
+                protocol, "SERVER_MESSAGES", Mock(wraps=protocol.SERVER_MESSAGES)
+            )
+        )
         async with (
-            serve(ServerLimits("127.0.0.1", 0), wire=wire) as server,
+            serve(ServerLimits("127.0.0.1", 0)) as server,
             await Client.connect("127.0.0.1", server.port) as first,
             await Client.connect("127.0.0.1", server.port) as second,
             await Client.connect("127.0.0.1", server.port) as publisher,
@@ -471,12 +341,8 @@ class RuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(store.get("retained"), b"data")
 
     async def test_runtime_scope_serves_and_closes_live_connections(self) -> None:
-        wire = protocol.WireProtocol(
-            command_codec=CompositeCodec.of(protocol.COMMANDS) | Reverse(),
-            message_codec=CompositeCodec.of(protocol.SERVER_MESSAGES) | Reverse(),
-        )
-        async with serve(ServerLimits("127.0.0.1", 0), wire=wire) as server:
-            client = await Client.connect("127.0.0.1", server.port, wire=wire)
+        async with serve(ServerLimits("127.0.0.1", 0)) as server:
+            client = await Client.connect("127.0.0.1", server.port)
             self.addAsyncCleanup(client.close)
             await client.set("key", b"value")
             self.assertEqual(await client.get("key"), b"value")

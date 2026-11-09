@@ -8,7 +8,6 @@ from contextlib import asynccontextmanager
 from velis.core.broker import DEFAULT_BROKER_LIMITS, Broker, BrokerLimits
 from velis.core.engine import Engine
 from velis.core.store import DEFAULT_STORE_LIMITS, Store, StoreLimits
-from velis.net.protocol import DEFAULT_PROTOCOL, WireProtocol
 from velis.net.server import DEFAULT_SERVER_LIMITS, ServerLimits, TCPServer
 from velis.validation import require_positive
 
@@ -46,12 +45,10 @@ async def serve(
     broker_limits: BrokerLimits = DEFAULT_BROKER_LIMITS,
     sweep_interval_ms: int = DEFAULT_SWEEP_INTERVAL_MS,
     engine: Engine | None = None,
-    wire: WireProtocol = DEFAULT_PROTOCOL,
 ) -> AsyncGenerator[TCPServer]:
     """Own server and maintenance resources across startup, serving and cleanup.
 
-    Supply an engine to reuse application state or an injected clock, and
-    a wire protocol to compose custom serialization and validation.
+    Supply an engine to reuse application state or an injected clock.
     Store and broker limits apply only when creating the default engine;
     supplied engines keep their existing limits. Nonpositive sweep intervals
     raise ValueError before any runtime resources are opened.
@@ -63,7 +60,7 @@ async def serve(
     if engine is None:
         engine = build_engine(store_limits=store_limits, broker_limits=broker_limits)
     async with (
-        TCPServer(engine, server_limits, wire=wire) as server,
+        TCPServer(engine, server_limits) as server,
         asyncio.TaskGroup() as workers,
     ):
         workers.create_task(_maintain(engine, sweep_interval_ms / 1000))

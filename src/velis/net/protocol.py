@@ -1,119 +1,61 @@
-"""Composable command/message codecs and bounded TCP message framing.
+"""Velis's fixed binary wire format and bounded u32-length framing.
 
-Default messages use a u32 body length followed by the encoded body. Bodies
-use a text tag and ordered fields; tagged tables map each tag to its dataclass
-variant and explicit field layouts. The server answers commands in order, so
-replies carry no request identifiers.
+Commands and server messages use tagged bodies with fixed field layouts. Values
+and publication payloads are opaque bytes; framing is not configurable.
 """
 
 import asyncio
-from collections.abc import AsyncGenerator, Callable
-from dataclasses import dataclass, field
-from functools import cached_property, partial
+from collections.abc import AsyncGenerator, Callable, Iterator
 
-from velis.codec import (
-    U32,
-    U64,
-    UTF8,
-    Choice,
-    Codec,
-    CompositeCodec,
-    Identity,
-    LengthPrefixedField,
-    Record,
-    Validate,
+from velis.core.messages import Command, Message
+from velis.errors import ProtocolError
+from velis.net.fast import (
+    CommandCodec,
+    ServerMessageCodec,
+    pack_u32,
+    unpack_u32,
 )
-from velis.core.messages import (
-    TTL,
-    Command,
-    Delete,
-    Delivered,
-    Err,
-    Expire,
-    Get,
-    Message,
-    Nil,
-    Ok,
-    Persist,
-    Persistent,
-    Publish,
-    Reply,
-    Set,
-    Subscribe,
-    Subscribed,
-    TTLValue,
-    Unsubscribe,
-    Unsubscribed,
-    Value,
+from velis.net.fast import (
+    ServerFrame as ServerFrame,
+)
+from velis.net.limits import (
+    MAX_FIELD_BYTES as MAX_FIELD_BYTES,
+)
+from velis.net.limits import (
+    MAX_FRAME_BODY_BYTES,
 )
 
-MAX_FIELD_BYTES = 1 << 20
-MAX_FRAME_BODY_BYTES = 2 * MAX_FIELD_BYTES
-
-type ServerFrame = Reply | Message
-
-BYTES = LengthPrefixedField(Identity(), MAX_FIELD_BYTES, prefix=U32)
-TEXT = LengthPrefixedField(UTF8(), MAX_FIELD_BYTES, prefix=U32)
+COMMANDS = CommandCodec()
+SERVER_MESSAGES = ServerMessageCodec()
 
 
-def _check_text(value: str, *, what: str, max_chars: int) -> str | None:
-    if not value:
-        return f"{what} must not be empty"
-    if len(value) > max_chars:
-        return f"{what} exceeds {max_chars} characters"
-    return None
+def _check_frame_length(length: int) -> None:
+    if length > MAX_FRAME_BODY_BYTES:
+        raise ProtocolError(f"field too long: {length}")
 
 
-def _text_field(what: str, max_chars: int) -> LengthPrefixedField[str]:
-    """Bound text by characters and allow up to four UTF-8 bytes per character."""
-    rule = Validate[str](partial(_check_text, what=what, max_chars=max_chars))
-    return LengthPrefixedField(
-        CompositeCodec.of(rule) | UTF8(),
-        max_chars * 4,
-        prefix=U32,
-    )
+def encode_frame(body: bytes) -> bytes:
+    """Frame one body with its u32 byte length, rejecting oversized bodies."""
+    _check_frame_length(len(body))
+    return pack_u32(len(body)) + body
 
 
-KEY = _text_field("key", 512)
-CHANNEL = _text_field("channel", 256)
+def encode_command(command: Command) -> bytes:
+    """Encode a command and its outer frame before any bytes are written."""
+    return encode_frame(COMMANDS.encode(command))
 
-COMMANDS: Choice[Command] = Choice(
-    "command",
-    {
-        "GET": Record(Get, KEY),
-        "SET": Record(Set, KEY, BYTES),
-        "EXPIRE": Record(Expire, KEY, U64),
-        "DEL": Record(Delete, KEY),
-        "TTL": Record(TTL, KEY),
-        "PERSIST": Record(Persist, KEY),
-        "SUBSCRIBE": Record(Subscribe, CHANNEL),
-        "UNSUBSCRIBE": Record(Unsubscribe, CHANNEL),
-        "PUBLISH": Record(Publish, CHANNEL, BYTES),
-    },
-)
 
-SERVER_MESSAGES: Choice[ServerFrame] = Choice(
-    "server message",
-    {
-        "OK": Record(Ok),
-        "NIL": Record(Nil),
-        "VALUE": Record(Value, BYTES),
-        "ERR": Record(Err, TEXT),
-        "SUBSCRIBED": Record(Subscribed, TEXT),
-        "UNSUBSCRIBED": Record(Unsubscribed, TEXT),
-        "DELIVERED": Record(Delivered, U32),
-        "TTL_VALUE": Record(TTLValue, U64),
-        "PERSISTENT": Record(Persistent),
-        "MESSAGE": Record(Message, TEXT, BYTES),
-    },
-)
+def encode_message(message: ServerFrame) -> bytes:
+    """Encode a reply or publication push and its complete outer frame."""
+    return encode_frame(SERVER_MESSAGES.encode(message))
 
 
 class PushEncoder:
-    """Encode a push once for consecutive deliveries of the same object.
+    """Cache one framed push for consecutive deliveries of the same object.
 
-    Retain only the latest push and its bytes. Equal but distinct pushes are
-    encoded separately; encoding failures propagate without replacing the cache.
+    Equal but distinct pushes encode separately. An encoding failure preserves
+    the previous cached result. Nested publications can replace the cache and
+    cause the outer push to encode again without changing its bytes.
     """
 
     def __init__(self, encode: Callable[[Message], bytes]) -> None:
@@ -127,68 +69,45 @@ class PushEncoder:
         return last[1]
 
 
-@dataclass(frozen=True)
-class WireProtocol:
-    """Use matching body codecs on both peers; framing is always outermost.
+encode_push = PushEncoder(encode_message)
 
-    Lengths are bounded before reading bodies. Codec and rule failures on
-    malformed input should raise ProtocolError. Codecs must be stateless or
-    safe to share across connections.
+
+def iter_frames(buf: bytearray) -> Iterator[tuple[bytes, int]]:
+    """Yield each complete frame's body and end offset without consuming buf.
+
+    Partial frames remain buffered. Oversized headers fail before their bodies
+    arrive. Do not mutate buf until iteration ends; discard only the consumed
+    prefix afterward. Bodies are bytes, suitable for the offset-based decoders.
     """
-
-    command_codec: Codec[Command, bytes] = COMMANDS
-    message_codec: Codec[ServerFrame, bytes] = SERVER_MESSAGES
-    framing: LengthPrefixedField[bytes] = field(
-        default_factory=lambda: LengthPrefixedField(
-            Identity(), MAX_FRAME_BODY_BYTES, prefix=U32
-        )
-    )
-
-    @cached_property
-    def framed_commands(self) -> CompositeCodec[Command, bytes]:
-        """Encode and decode whole framed commands."""
-        return CompositeCodec.of(self.command_codec) | self.framing
-
-    @cached_property
-    def framed_messages(self) -> CompositeCodec[ServerFrame, bytes]:
-        """Encode and decode complete server messages, including replies and pushes."""
-        return CompositeCodec.of(self.message_codec) | self.framing
-
-    @cached_property
-    def push_encoder(self) -> PushEncoder:
-        """Share the latest push encoding across connections using this instance."""
-        return PushEncoder(self.framed_messages.encode)
-
-    async def _read_body(self, reader: asyncio.StreamReader) -> bytes | None:
-        """Return one frame body, or None on EOF at a frame boundary.
-
-        Raise IncompleteReadError if EOF interrupts a frame.
-        """
-        try:
-            header = await reader.readexactly(self.framing.prefix.length)
-        except asyncio.IncompleteReadError as exc:
-            if exc.partial:
-                raise
-            return None
-        length = self.framing.prefix.decode(header)
-        self.framing.check_length(length)
-        return self.framing.codec.decode(await reader.readexactly(length))
-
-    async def _read[T](
-        self, reader: asyncio.StreamReader, codec: Codec[T, bytes]
-    ) -> AsyncGenerator[T]:
-        while (body := await self._read_body(reader)) is not None:
-            yield codec.decode(body)
-
-    def read_commands(self, reader: asyncio.StreamReader) -> AsyncGenerator[Command]:
-        """Yield decoded commands until the peer disconnects cleanly."""
-        return self._read(reader, self.command_codec)
-
-    def read_messages(
-        self, reader: asyncio.StreamReader
-    ) -> AsyncGenerator[ServerFrame]:
-        """Yield decoded replies and pushes until the server disconnects cleanly."""
-        return self._read(reader, self.message_codec)
+    pos = 0
+    while len(buf) - pos >= 4:
+        (length,) = unpack_u32(buf, pos)
+        _check_frame_length(length)
+        end = pos + 4 + length
+        if len(buf) < end:
+            return
+        yield bytes(buf[pos + 4 : end]), end
+        pos = end
 
 
-DEFAULT_PROTOCOL = WireProtocol()
+async def _read_body(reader: asyncio.StreamReader) -> bytes | None:
+    """Read a body, returning None only for clean EOF at a frame boundary.
+
+    Partial headers and bodies raise IncompleteReadError. Check the body limit
+    immediately after reading the header, before waiting for the body bytes.
+    """
+    try:
+        header = await reader.readexactly(4)
+    except asyncio.IncompleteReadError as exc:
+        if exc.partial:
+            raise
+        return None
+    (length,) = unpack_u32(header)
+    _check_frame_length(length)
+    return await reader.readexactly(length)
+
+
+async def read_messages(reader: asyncio.StreamReader) -> AsyncGenerator[ServerFrame]:
+    """Yield fixed-format replies and pushes until a clean server disconnect."""
+    while (body := await _read_body(reader)) is not None:
+        yield SERVER_MESSAGES.decode(body)

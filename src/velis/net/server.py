@@ -1,21 +1,15 @@
-"""TCP listener ownership, admission and command-error translation."""
+"""TCP listener ownership, admission and connection creation."""
 
 import asyncio
-import contextlib
 import logging
-from collections.abc import Generator
 from dataclasses import dataclass
 from typing import Self
 
 from velis.core.engine import Engine
-from velis.core.messages import Err
-from velis.errors import CommandError, ProtocolError
 from velis.net.connection import Connection
-from velis.net.protocol import DEFAULT_PROTOCOL, WireProtocol
 from velis.validation import require_positive
 
 log = logging.getLogger(__name__)
-COMMANDS_PER_TURN = 64
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 9000
 DEFAULT_MAX_BUFFER = 8 << 20
@@ -43,16 +37,13 @@ DEFAULT_SERVER_LIMITS = ServerLimits()
 
 
 class TCPServer:
-    """Own a listener and active client streams within a connection limit."""
+    """Own a listener and the admission count of active client transports."""
 
     def __init__(
         self,
         engine: Engine,
         limits: ServerLimits,
-        *,
-        wire: WireProtocol = DEFAULT_PROTOCOL,
     ) -> None:
-        self._wire = wire
         self._engine = engine
         self._limits = limits
         self._listener: asyncio.Server | None = None
@@ -77,8 +68,8 @@ class TCPServer:
         if self._listener is not None:
             raise RuntimeError("server already started")
         try:
-            self._listener = await asyncio.start_server(
-                self._handle_connection, self._limits.host, self._limits.port
+            self._listener = await asyncio.get_running_loop().create_server(
+                self._new_connection, self._limits.host, self._limits.port
             )
             log.info("listening on %s:%d", self._limits.host, self.port)
         except BaseException:
@@ -86,7 +77,7 @@ class TCPServer:
             raise
 
     async def close(self) -> None:
-        """Stop accepting clients and close their streams; safe to repeat."""
+        """Close listener and client transports, awaiting disconnect cleanup."""
         listener = self._listener
         if listener is None:
             return
@@ -95,55 +86,19 @@ class TCPServer:
         listener.close_clients()
         await listener.wait_closed()
 
-    @contextlib.contextmanager
-    def _admitted(self, connection: Connection, peer: object) -> Generator[None]:
-        """Own admission counting and broker cleanup for an accepted client."""
+    def _new_connection(self) -> Connection:
+        return Connection(
+            self._engine,
+            self._limits.max_buffer,
+            admit=self._admit,
+            release=self._release,
+        )
+
+    def _admit(self) -> bool:
+        if self._connection_count >= self._limits.max_connections:
+            return False
         self._connection_count += 1
-        try:
-            log.info("connected: %s", peer)
-            yield
-        finally:
-            self._connection_count -= 1
-            self._engine.disconnect(connection)
-            log.info("disconnected: %s", peer)
+        return True
 
-    async def _handle_connection(
-        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
-    ) -> None:
-        async with Connection(
-            reader, writer, self._limits.max_buffer, wire=self._wire
-        ) as connection:
-            if self._connection_count >= self._limits.max_connections:
-                with contextlib.suppress(ProtocolError, OSError):
-                    await connection.write_reply(Err("connection limit exceeded"))
-                return
-            peer = writer.get_extra_info("peername")
-            with self._admitted(connection, peer):
-                await self._serve_guarded(connection, peer)
-
-    async def _serve_guarded(self, connection: Connection, peer: object) -> None:
-        """Translate expected command/transport errors and log unexpected failures."""
-        try:
-            await self._serve_commands(connection)
-        except asyncio.IncompleteReadError, OSError:
-            pass
-        except ProtocolError as exc:
-            log.warning("protocol error from %s: %s", peer, exc)
-            with contextlib.suppress(ProtocolError, OSError):
-                await connection.write_reply(Err(str(exc)))
-        except Exception:
-            log.exception("unexpected error serving %s", peer)
-
-    async def _serve_commands(self, connection: Connection) -> None:
-        """Execute in order and yield between bounded batches of ready commands."""
-        processed = 0
-        async with contextlib.aclosing(connection.read_commands()) as commands:
-            async for command in commands:
-                try:
-                    reply = self._engine.execute(command, connection)
-                except CommandError as exc:
-                    reply = Err(str(exc))
-                await connection.write_reply(reply)
-                processed += 1
-                if processed % COMMANDS_PER_TURN == 0:
-                    await asyncio.sleep(0)
+    def _release(self) -> None:
+        self._connection_count -= 1

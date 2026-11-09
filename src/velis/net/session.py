@@ -8,7 +8,7 @@ from typing import Protocol, Self
 
 from velis.core.messages import Command, Err, Message, Reply
 from velis.errors import ProtocolError
-from velis.net.protocol import DEFAULT_PROTOCOL, WireProtocol
+from velis.net import protocol
 from velis.validation import require_positive
 
 _CLOSED = "connection closed"
@@ -102,10 +102,8 @@ class TCPSession:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
         *,
-        wire: WireProtocol = DEFAULT_PROTOCOL,
         limits: SessionLimits = DEFAULT_SESSION_LIMITS,
     ) -> None:
-        self._wire = wire
         self._reader = reader
         self._writer = writer
         self._slots = asyncio.BoundedSemaphore(limits.max_pending_requests)
@@ -122,12 +120,11 @@ class TCPSession:
         host: str,
         port: int,
         *,
-        wire: WireProtocol = DEFAULT_PROTOCOL,
         limits: SessionLimits = DEFAULT_SESSION_LIMITS,
     ) -> Self:
         """Open a TCP connection and start reading replies and server pushes."""
         reader, writer = await asyncio.open_connection(host, port)
-        return cls(reader, writer, wire=wire, limits=limits)
+        return cls(reader, writer, limits=limits)
 
     async def _receive_messages(self) -> None:
         """Route replies and pushes until closure or a transport/protocol error.
@@ -137,7 +134,7 @@ class TCPSession:
         """
         try:
             async with contextlib.aclosing(
-                self._wire.read_messages(self._reader)
+                protocol.read_messages(self._reader)
             ) as messages:
                 async for message in messages:
                     if not isinstance(message, Message):
@@ -201,7 +198,7 @@ class TCPSession:
         the caller's slot belongs to the future: a reply or closure releases it.
         """
         self._check_open()
-        encoded = self._wire.framed_commands.encode(command)
+        encoded = protocol.encode_command(command)
         waiter = asyncio.get_running_loop().create_future()
         self._writer.write(encoded)
         self._pending.append(waiter)

@@ -2,9 +2,9 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
-from velis.codec import Identity, LengthPrefixedField, UInt
 from velis.core.engine import Engine
-from velis.net.protocol import WireProtocol
+from velis.errors import ProtocolError
+from velis.net import protocol
 from velis.net.server import ServerLimits, TCPServer
 
 
@@ -24,7 +24,9 @@ class ServerErrorTests(unittest.IsolatedAsyncioTestCase):
         socket.getsockname.return_value = ("127.0.0.1", 9000)
         listener.sockets = (socket,)
         server = TCPServer(Mock(spec=Engine), ServerLimits(port=0))
-        with patch("velis.net.server.asyncio.start_server", return_value=listener):
+        with patch.object(
+            asyncio.get_running_loop(), "create_server", return_value=listener
+        ):
             async with server:
                 with self.assertRaisesRegex(RuntimeError, "already started"):
                     async with server:
@@ -41,7 +43,9 @@ class ServerErrorTests(unittest.IsolatedAsyncioTestCase):
         listener.sockets = ()
         server = TCPServer(Mock(spec=Engine), ServerLimits(port=0))
         with (
-            patch("velis.net.server.asyncio.start_server", return_value=listener),
+            patch.object(
+                asyncio.get_running_loop(), "create_server", return_value=listener
+            ),
             self.assertRaises(IndexError),
         ):
             async with server:
@@ -51,42 +55,40 @@ class ServerErrorTests(unittest.IsolatedAsyncioTestCase):
         listener.close_clients.assert_called_once()
         listener.wait_closed.assert_awaited_once()
 
-    async def test_cancelled_handler_releases_admission_and_closes_connection(
-        self,
-    ) -> None:
+    async def test_connection_lost_releases_admission_once(self) -> None:
         engine = Mock(spec=Engine)
         server = TCPServer(engine, ServerLimits(port=0))
-        writer = Mock(spec=asyncio.StreamWriter)
-        writer.wait_closed = AsyncMock()
-        task = asyncio.create_task(
-            server._handle_connection(asyncio.StreamReader(), writer)
-        )
-        await asyncio.sleep(0)
+        transport = Mock(spec=asyncio.Transport)
+        transport.is_closing.return_value = False
+        connection = server._new_connection()
+        connection.connection_made(transport)
         self.assertEqual(server._connection_count, 1)
-        task.cancel()
-        with self.assertRaises(asyncio.CancelledError):
-            await task
+        connection.connection_lost(None)
+        connection.connection_lost(None)
         self.assertEqual(server._connection_count, 0)
-        engine.disconnect.assert_called_once()
-        writer.close.assert_called_once()
-        writer.wait_closed.assert_awaited_once()
+        engine.disconnect.assert_called_once_with(connection)
 
     async def test_failed_error_reply_still_closes_and_disconnects(self) -> None:
-        for max_frame, write_error in ((0, None), (1024, ConnectionResetError("gone"))):
-            with self.subTest(max_frame=max_frame, write_error=write_error):
+        for encode_error, write_error in (
+            (ProtocolError("cannot encode"), None),
+            (None, ConnectionResetError("gone")),
+        ):
+            with self.subTest(encode_error=encode_error, write_error=write_error):
                 engine = Mock(spec=Engine)
-                wire = WireProtocol(
-                    framing=LengthPrefixedField(Identity(), max_frame, prefix=UInt(4))
-                )
-                server = TCPServer(engine, ServerLimits("127.0.0.1", 0), wire=wire)
-                reader = asyncio.StreamReader()
-                reader.feed_data(b"\x00\x00\x00\x00")
-                reader.feed_eof()
-                writer = Mock(spec=asyncio.StreamWriter)
-                writer.wait_closed = AsyncMock()
-                writer.write.side_effect = write_error
-                await server._handle_connection(reader, writer)
+                server = TCPServer(engine, ServerLimits("127.0.0.1", 0))
+                transport = Mock(spec=asyncio.Transport)
+                transport.is_closing.return_value = False
+                transport.write.side_effect = write_error
+                connection = server._new_connection()
+                connection.connection_made(transport)
+                with patch.object(
+                    protocol,
+                    "encode_message",
+                    side_effect=encode_error,
+                    wraps=protocol.encode_message,
+                ):
+                    connection.data_received(b"\x00\x00\x00\x00")
+                transport.close.assert_called_once()
+                connection.connection_lost(None)
                 self.assertEqual(server._connection_count, 0)
-                engine.disconnect.assert_called_once()
-                writer.close.assert_called_once()
-                writer.wait_closed.assert_awaited_once()
+                engine.disconnect.assert_called_once_with(connection)

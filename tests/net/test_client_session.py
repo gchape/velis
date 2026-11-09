@@ -1,8 +1,6 @@
 import unittest
 
-from tests.codec.helpers import Prefix, Reverse
 from tests.helpers import RecordingSubscriber
-from velis.codec import CompositeCodec
 from velis.core.broker import Broker
 from velis.core.engine import Engine
 from velis.core.messages import Command, Err, Message, Reply
@@ -35,31 +33,20 @@ class LocalSession:
         self.closed = True
 
 
-class ClientCompositionTests(unittest.IsolatedAsyncioTestCase):
-    async def test_composite_codec_handles_payloads_and_publications(self) -> None:
-        codec: CompositeCodec[bytes, bytes] = CompositeCodec(
-            (CompositeCodec((Prefix(),)), Reverse())
-        )
+class ClientSessionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_binary_values_and_publications_pass_through_an_independent_session(
+        self,
+    ) -> None:
         store = Store()
         session = LocalSession(Engine(store, Broker()))
-        async with Client(session, codec) as client:
-            await client.set("key", b"hello")
-            self.assertEqual(store.get("key"), codec.encode(b"hello"))
-            self.assertEqual(await client.get("key"), b"hello")
+        payload = bytes(range(256))
+        async with Client(session) as client:
+            await client.set("key", payload)
+            self.assertEqual(store.get("key"), payload)
+            self.assertEqual(await client.get("key"), payload)
             await client.subscribe("news")
-            self.assertEqual(await client.publish("news", b"hello"), 1)
-            self.assertEqual(await client.next_message(), Message("news", b"hello"))
-
-    async def test_commands_and_codecs_work_over_an_independent_session(self) -> None:
-        store = Store()
-        session = LocalSession(Engine(store, Broker()))
-        async with Client(session, Reverse()) as client:
-            await client.set("key", b"abc")
-            self.assertEqual(store.get("key"), b"cba")
-            self.assertEqual(await client.get("key"), b"abc")
-            await client.subscribe("news")
-            self.assertEqual(await client.publish("news", b"hello"), 1)
-            self.assertEqual(await client.next_message(), Message("news", b"hello"))
+            self.assertEqual(await client.publish("news", payload), 1)
+            self.assertEqual(await client.next_message(), Message("news", payload))
         self.assertTrue(session.closed)
 
     async def test_error_replies_are_translated_by_client(self) -> None:

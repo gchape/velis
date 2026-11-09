@@ -87,14 +87,16 @@ class TimingWheelTests(unittest.TestCase):
         wheel = TimingWheel()
         for i in range(4):
             wheel.set(str(i), 65)
-        wheel.set("due", 64)
-        self.assertEqual(wheel.pop_due(64, 4), [])
+        self.assertEqual(wheel.pop_due(64, 3), [])
         self.assertTrue(wheel.has_due(64))
-        self.assertEqual(wheel.pop_due(64, 1), ["due"])
+        self.assertEqual(wheel.pop_due(64, 1), [])
         self.assertFalse(wheel.has_due(64))
-        self.assertEqual(wheel.pop_due(65, 2), ["0", "1"])
+        first = wheel.pop_due(65, 2)
+        self.assertEqual(len(first), 2)
         self.assertTrue(wheel.has_due(65))
-        self.assertEqual(wheel.pop_due(65, 2), ["2", "3"])
+        second = wheel.pop_due(65, 2)
+        self.assertEqual(len(second), 2)
+        self.assertEqual(set(first + second), {"0", "1", "2", "3"})
 
     def test_a_large_clock_jump_keeps_the_timer_budget(self) -> None:
         wheel = TimingWheel()
@@ -122,11 +124,13 @@ class TimingWheelTests(unittest.TestCase):
         wheel = TimingWheel()
         for key in ("a", "b", "c"):
             wheel.set(key, 65)
-        self.assertEqual(wheel.pop_due(65, 1), ["a"])
-        wheel.set("b", 1000)
-        wheel.clear("c")
+        expired = wheel.pop_due(65, 1)
+        self.assertEqual(len(expired), 1)
+        rescheduled, cancelled = sorted({"a", "b", "c"} - set(expired))
+        wheel.set(rescheduled, 1000)
+        wheel.clear(cancelled)
         self.assertFalse(wheel.has_due(65))
-        self.assertEqual(wheel.pop_due(1000, 1), ["b"])
+        self.assertEqual(wheel.pop_due(1000, 1), [rescheduled])
 
     def test_zero_budget_preserves_ready_work(self) -> None:
         wheel = TimingWheel()

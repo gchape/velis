@@ -1,3 +1,5 @@
+"""Monotonic time sources for store expiry."""
+
 import time
 from typing import Protocol, final
 

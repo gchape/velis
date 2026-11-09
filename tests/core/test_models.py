@@ -4,49 +4,40 @@ import random
 import unittest
 
 from tests.helpers import ManualClock
-from velis.core.eviction import Sieve
-from velis.core.store import EvictionPolicy, Store, StoreLimits
+from velis.core.eviction import LFU, EvictionPolicy
+from velis.core.store import Store, StoreLimits
 from velis.errors import CapacityError
 
 
 class ModelTests(unittest.TestCase):
-    def test_sieve_matches_a_list_model_across_access_removal_and_eviction(
+    def test_lfu_matches_a_scanning_model_across_access_removal_and_eviction(
         self,
     ) -> None:
         for seed in range(5):
             rng = random.Random(seed)
-            actual = Sieve()
-            order: list[str] = []
-            visited: set[str] = set()
-            hand: str | None = None
+            actual = LFU()
+            counts: dict[str, int] = {}
+            accessed: dict[str, int] = {}
             for step in range(2000):
                 key = str(rng.randrange(12))
                 match rng.randrange(3):
                     case 0:
                         actual.access(key)
-                        if key in order:
-                            visited.add(key)
-                        else:
-                            order.append(key)
+                        counts[key] = counts.get(key, 0) + 1
+                        accessed[key] = step
                     case 1:
                         actual.discard(key)
-                        if key in order:
-                            if hand == key:
-                                index = order.index(key) + 1
-                                hand = order[index] if index < len(order) else None
-                            order.remove(key)
-                            visited.discard(key)
-                    case 2 if order:
-                        index = order.index(hand) if hand is not None else 0
-                        while order[index] in visited:
-                            visited.remove(order[index])
-                            index = (index + 1) % len(order)
-                        expected = order[index]
-                        hand = order[index + 1] if index + 1 < len(order) else None
+                        counts.pop(key, None)
+                        accessed.pop(key, None)
+                    case 2 if counts:
+                        expected = min(
+                            counts, key=lambda item: (counts[item], accessed[item])
+                        )
                         with self.subTest(seed=seed, step=step):
                             self.assertEqual(actual.victim(), expected)
                         actual.discard(expected)
-                        order.remove(expected)
+                        del counts[expected]
+                        del accessed[expected]
 
     def test_reject_store_matches_a_scanning_model_across_ttl_and_capacity_changes(
         self,
@@ -143,5 +134,7 @@ class ModelTests(unittest.TestCase):
                             else -1
                         )
                         self.assertEqual(store.ttl(key), expected)
-                self.assertEqual(store._values, values)
+                self.assertEqual(
+                    {key: entry.value for key, entry in store._entries.items()}, values
+                )
                 self.assertEqual(store.stored_bytes, size())

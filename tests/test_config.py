@@ -1,16 +1,45 @@
 import os
 import unittest
+from dataclasses import dataclass
 from unittest.mock import patch
 
 from tests.helpers import RecordingSubscriber
 from velis.app import build_engine
 from velis.config import Config, ServerConfig
+from velis.core.eviction import EvictionPolicy
 from velis.core.messages import Get, Nil, Set, Subscribe, Value
-from velis.core.store import EvictionPolicy, StoreLimits
+from velis.core.store import StoreLimits
 from velis.errors import CapacityError
 
 
 class ConfigTests(unittest.TestCase):
+    def test_unset_environment_preserves_dataclass_defaults(self) -> None:
+        @dataclass(frozen=True, slots=True)
+        class CustomServer(ServerConfig):
+            port: int = 12345
+            max_connections: int = 5
+
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(Config.from_env(), Config())
+            self.assertEqual(CustomServer.from_env(), CustomServer())
+        with patch.dict(os.environ, {"VELIS_PORT": "0"}, clear=True):
+            self.assertEqual(CustomServer.from_env(), CustomServer(port=0))
+
+    def test_log_level_normalizes_for_direct_and_environment_construction(self) -> None:
+        self.assertEqual(Config(log_level="info").log_level, "INFO")
+        with patch.dict(os.environ, {"VELIS_LOG_LEVEL": "debug"}, clear=True):
+            self.assertEqual(Config.from_env().log_level, "DEBUG")
+        with self.assertRaisesRegex(ValueError, "invalid log level"):
+            Config(log_level="unknown")
+
+    def test_invalid_environment_integer_keeps_variable_and_cause(self) -> None:
+        with (
+            patch.dict(os.environ, {"VELIS_MAX_KEYS": "invalid"}, clear=True),
+            self.assertRaisesRegex(ValueError, "VELIS_MAX_KEYS") as raised,
+        ):
+            Config.from_env()
+        self.assertIsInstance(raised.exception.__cause__, ValueError)
+
     def test_default_environment_policy_is_lru(self) -> None:
         with patch.dict(
             os.environ,
@@ -34,14 +63,14 @@ class ConfigTests(unittest.TestCase):
         ):
             Config.from_env()
 
-    def test_sieve_environment_policy_reaches_the_engine(self) -> None:
+    def test_lfu_environment_policy_reaches_the_engine(self) -> None:
         with patch.dict(
             os.environ,
-            {"VELIS_EVICTION_POLICY": "sieve", "VELIS_MAX_KEYS": "2"},
+            {"VELIS_EVICTION_POLICY": "lfu", "VELIS_MAX_KEYS": "2"},
             clear=True,
         ):
             config = Config.from_env()
-        self.assertIs(config.store.eviction_policy, EvictionPolicy.SIEVE)
+        self.assertIs(config.store.eviction_policy, EvictionPolicy.LFU)
         engine = build_engine(config)
         subscriber = RecordingSubscriber()
         for key in ("a", "b"):
@@ -51,7 +80,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(engine.execute(Get("b"), subscriber), Nil())
 
     def test_removed_policies_fail_with_the_environment_variable_name(self) -> None:
-        for policy in ("lfu", "fifo", "rr"):
+        for policy in ("sieve", "rr", "invalid"):
             with (
                 patch.dict(os.environ, {"VELIS_EVICTION_POLICY": policy}, clear=True),
                 self.assertRaisesRegex(ValueError, "VELIS_EVICTION_POLICY"),

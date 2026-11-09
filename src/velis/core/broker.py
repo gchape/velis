@@ -30,7 +30,7 @@ class Broker:
     """
 
     def __init__(self, *, max_subscriptions: int = DEFAULT_MAX_SUBSCRIPTIONS) -> None:
-        require_positive("max_subscriptions", max_subscriptions)
+        require_positive(max_subscriptions=max_subscriptions)
         self._max_subscriptions = max_subscriptions
         self._subscribers: dict[str, set[Subscriber]] = {}
         self._subscriptions: dict[Subscriber, set[str]] = {}

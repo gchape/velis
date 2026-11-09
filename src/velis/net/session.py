@@ -23,9 +23,11 @@ class SessionLimits:
     max_pending_bytes: int = 8 << 20
 
     def __post_init__(self) -> None:
-        require_positive("max_pending_requests", self.max_pending_requests)
-        require_positive("max_pending_messages", self.max_pending_messages)
-        require_positive("max_pending_bytes", self.max_pending_bytes)
+        require_positive(
+            max_pending_requests=self.max_pending_requests,
+            max_pending_messages=self.max_pending_messages,
+            max_pending_bytes=self.max_pending_bytes,
+        )
 
 
 DEFAULT_SESSION_LIMITS = SessionLimits()

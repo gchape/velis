@@ -1,7 +1,8 @@
 import unittest
 
 from tests.helpers import ManualClock
-from velis.core.store import MAX_TTL_MS, EvictionPolicy, Store, StoreLimits
+from velis.core.eviction import EvictionPolicy
+from velis.core.store import MAX_TTL_MS, Store, StoreLimits
 from velis.errors import CapacityError, CommandError
 
 

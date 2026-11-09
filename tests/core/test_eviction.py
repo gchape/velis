@@ -4,11 +4,31 @@ import unittest
 from typing import cast
 
 from tests.helpers import ManualClock
-from velis.core.store import EvictionPolicy, Store, StoreLimits
+from velis.core.eviction import LFU, EvictionPolicy
+from velis.core.store import Store, StoreLimits
 from velis.errors import CapacityError
 
 
 class EvictionTests(unittest.TestCase):
+    def test_lfu_handles_frequency_gaps_after_deletion_and_reinsertion(self) -> None:
+        policy = LFU()
+        for key, accesses in (("low", 1), ("middle", 10), ("high", 30)):
+            for _ in range(accesses):
+                policy.access(key)
+        self.assertEqual(policy.victim(), "low")
+        policy.discard("low")
+        self.assertEqual(policy.victim(), "middle")
+        policy.discard("middle")
+        self.assertEqual(policy.victim(), "high")
+        policy.access("new")
+        self.assertEqual(policy.victim(), "new")
+        policy.discard("high")
+        policy.discard("new")
+        with self.assertRaises(AssertionError):
+            policy.victim()
+        policy.access("again")
+        self.assertEqual(policy.victim(), "again")
+
     def test_standalone_store_defaults_to_lru(self) -> None:
         store = Store(limits=StoreLimits(max_keys=2))
         store.set("a", b"first")
@@ -19,8 +39,8 @@ class EvictionTests(unittest.TestCase):
         self.assertEqual(store.get("a"), b"first")
         self.assertEqual(store.get("c"), b"third")
 
-    def test_lru_and_sieve_keep_accessed_key(self) -> None:
-        for policy in (EvictionPolicy.LRU, EvictionPolicy.SIEVE):
+    def test_lru_and_lfu_keep_accessed_key(self) -> None:
+        for policy in (EvictionPolicy.LRU, EvictionPolicy.LFU):
             with self.subTest(policy=policy):
                 store = Store(limits=StoreLimits(max_keys=2, eviction_policy=policy))
                 store.set("a", b"a")
@@ -31,34 +51,30 @@ class EvictionTests(unittest.TestCase):
                 self.assertEqual(store.get("a"), b"a")
                 self.assertEqual(store.get("c"), b"c")
 
-    def test_sieve_hand_keeps_insertion_order_and_skips_visited_entries(self) -> None:
+    def test_fifo_reads_do_not_change_insertion_order(self) -> None:
         store = Store(
-            limits=StoreLimits(max_keys=3, eviction_policy=EvictionPolicy.SIEVE)
+            limits=StoreLimits(max_keys=2, eviction_policy=EvictionPolicy.FIFO)
         )
-        for key in ("a", "b", "c"):
-            store.set(key, key.encode())
-        self.assertEqual(store.get("a"), b"a")
-        store.set("d", b"d")
-        self.assertEqual(set(store._values), {"a", "c", "d"})
-        store.set("e", b"e")
-        self.assertEqual(set(store._values), {"a", "d", "e"})
-        store.set("f", b"f")
-        self.assertEqual(set(store._values), {"a", "e", "f"})
-
-    def test_sieve_wraps_when_every_key_was_visited(self) -> None:
-        store = Store(
-            limits=StoreLimits(max_keys=2, eviction_policy=EvictionPolicy.SIEVE)
-        )
-        for key in ("a", "b"):
-            store.set(key, key.encode())
-            store.get(key)
+        store.set("a", b"a")
+        store.set("b", b"b")
+        store.get("a")
         store.set("c", b"c")
-        store.set("d", b"d")
-        self.assertEqual(set(store._values), {"c", "d"})
+        self.assertEqual(set(store._entries), {"b", "c"})
 
-    def test_sieve_updates_count_as_accesses_without_reinserting(self) -> None:
+    def test_lfu_breaks_frequency_ties_by_least_recent_access(self) -> None:
         store = Store(
-            limits=StoreLimits(max_keys=2, eviction_policy=EvictionPolicy.SIEVE)
+            limits=StoreLimits(max_keys=2, eviction_policy=EvictionPolicy.LFU)
+        )
+        store.set("a", b"a")
+        store.set("b", b"b")
+        store.get("a")
+        store.get("b")
+        store.set("c", b"c")
+        self.assertEqual(set(store._entries), {"b", "c"})
+
+    def test_lfu_updates_count_as_accesses(self) -> None:
+        store = Store(
+            limits=StoreLimits(max_keys=2, eviction_policy=EvictionPolicy.LFU)
         )
         store.set("a", b"a")
         store.set("b", b"b")
@@ -68,7 +84,7 @@ class EvictionTests(unittest.TestCase):
         self.assertIsNone(store.get("b"))
 
     def test_ttl_operations_do_not_promote_eviction_candidates(self) -> None:
-        for policy in (EvictionPolicy.LRU, EvictionPolicy.SIEVE):
+        for policy in (EvictionPolicy.LRU, EvictionPolicy.FIFO, EvictionPolicy.LFU):
             with self.subTest(policy=policy):
                 store = Store(limits=StoreLimits(max_keys=2, eviction_policy=policy))
                 store.set("a", b"a")
@@ -79,15 +95,13 @@ class EvictionTests(unittest.TestCase):
                 store.set("c", b"c")
                 self.assertIsNone(store.get("a"))
 
-    def test_deleting_the_sieve_hand_and_all_entries_allows_reuse(self) -> None:
+    def test_deleting_eviction_candidate_and_all_entries_allows_reuse(self) -> None:
         for removal in ("delete", "expire"):
             with self.subTest(removal=removal):
                 clock = ManualClock()
                 store = Store(
                     clock,
-                    limits=StoreLimits(
-                        max_keys=3, eviction_policy=EvictionPolicy.SIEVE
-                    ),
+                    limits=StoreLimits(max_keys=3, eviction_policy=EvictionPolicy.LFU),
                 )
                 for key in ("a", "b", "c", "d"):
                     store.set(key, b"x")
@@ -98,8 +112,8 @@ class EvictionTests(unittest.TestCase):
                     store.sweep()
                 store.set("e", b"x")
                 store.set("f", b"x")
-                self.assertEqual(set(store._values), {"d", "e", "f"})
-                for key in tuple(store._values):
+                self.assertEqual(set(store._entries), {"d", "e", "f"})
+                for key in tuple(store._entries):
                     store.delete(key)
                 store.set("again", b"ok")
                 self.assertEqual(store.get("again"), b"ok")
@@ -198,10 +212,11 @@ class EvictionTests(unittest.TestCase):
                 self.assertLessEqual(len(store), 4)
                 self.assertLessEqual(store.stored_bytes, 24)
                 expected = sum(
-                    len(k.encode()) + len(v) for k, v in store._values.items()
+                    len(k.encode()) + len(entry.value)
+                    for k, entry in store._entries.items()
                 )
                 self.assertEqual(store.stored_bytes, expected)
 
     def test_unknown_policy_is_rejected(self) -> None:
-        with self.assertRaisesRegex(ValueError, "eviction_policy"):
+        with self.assertRaisesRegex(ValueError, "unknown"):
             Store(limits=StoreLimits(eviction_policy=cast(EvictionPolicy, "unknown")))

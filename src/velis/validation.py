@@ -1,7 +1,8 @@
 """Shared argument checks for configuration objects."""
 
 
-def require_positive(name: str, value: int) -> None:
-    """Raise ValueError naming the setting when value is not positive."""
-    if value <= 0:
-        raise ValueError(f"invalid {name}: {value}")
+def require_positive(**settings: int) -> None:
+    """Reject nonpositive settings, naming the argument that failed."""
+    for name, value in settings.items():
+        if value <= 0:
+            raise ValueError(f"invalid {name}: {value}")

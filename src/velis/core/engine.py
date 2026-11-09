@@ -1,3 +1,5 @@
+"""Execute typed commands against the store and pub-sub broker."""
+
 from typing import assert_never
 
 from velis.core.broker import Broker, Subscriber

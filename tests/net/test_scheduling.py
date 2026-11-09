@@ -4,7 +4,7 @@ from unittest.mock import Mock
 
 from tests.net.helpers import make_connection
 from velis.core.engine import Engine
-from velis.core.messages import Get, Ok
+from velis.core.messages import Err, Get, Ok
 from velis.net import protocol
 from velis.net.connection import COMMANDS_PER_TURN
 
@@ -98,3 +98,46 @@ class SchedulingTests(unittest.IsolatedAsyncioTestCase):
             for body, _ in protocol.iter_frames(bytearray(encoded))
         ]
         self.assertEqual(replies, [Ok()] * total)
+
+    async def test_protocol_failure_closes_after_replies_even_when_writes_pause(
+        self,
+    ) -> None:
+        self.transport.write.side_effect = lambda _: self.connection.pause_writing()
+        malformed = protocol.encode_frame(b"")
+        with self.assertLogs("velis.net.connection", level="WARNING"):
+            self.connection.data_received(self.frame + malformed + self.frame)
+        self.assertEqual(self.engine.execute.call_count, 1)
+        encoded = b"".join(call.args[0] for call in self.transport.write.call_args_list)
+        replies = [
+            protocol.SERVER_MESSAGES.decode(body)
+            for body, _ in protocol.iter_frames(bytearray(encoded))
+        ]
+        self.assertEqual(replies, [Ok(), Err("truncated record: need 4 bytes")])
+        self.transport.close.assert_called_once()
+        self.connection.resume_writing()
+        self.connection.data_received(self.frame)
+        await asyncio.sleep(0)
+        self.assertEqual(self.engine.execute.call_count, 1)
+        self.transport.resume_reading.assert_not_called()
+
+    async def test_eof_waits_for_blocked_queued_work_then_closes(self) -> None:
+        self.transport.write.side_effect = lambda _: self.connection.pause_writing()
+        self.connection.data_received(self.frame * (COMMANDS_PER_TURN + 1))
+        self.connection.eof_received()
+        await asyncio.sleep(0)
+        self.assertEqual(self.engine.execute.call_count, COMMANDS_PER_TURN)
+        self.transport.close.assert_not_called()
+        self.transport.write.side_effect = None
+        self.connection.resume_writing()
+        self.assertEqual(self.engine.execute.call_count, COMMANDS_PER_TURN + 1)
+        self.transport.close.assert_called_once()
+        self.transport.resume_reading.assert_not_called()
+
+    async def test_partial_tail_after_a_batch_resumes_reading(self) -> None:
+        self.connection.data_received(self.frame * COMMANDS_PER_TURN + self.frame[:-1])
+        await asyncio.sleep(0)
+        self.assertEqual(self.engine.execute.call_count, COMMANDS_PER_TURN)
+        self.transport.pause_reading.assert_called_once()
+        self.transport.resume_reading.assert_called_once()
+        self.connection.data_received(self.frame[-1:])
+        self.assertEqual(self.engine.execute.call_count, COMMANDS_PER_TURN + 1)

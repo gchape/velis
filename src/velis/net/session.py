@@ -68,7 +68,7 @@ class _MessageBuffer:
 
 
 class Session(Protocol):
-    """Exchange encoded application data independently of client codecs.
+    """Exchange typed commands, replies and publications over an owned transport.
 
     Implementations own request ordering, message delivery and shutdown.
     Replies include server errors; the client translates them for callers.
@@ -79,7 +79,7 @@ class Session(Protocol):
         ...
 
     async def next_message(self) -> Message:
-        """Receive an encoded publication."""
+        """Receive a Message containing its channel and opaque payload bytes."""
         ...
 
     async def close(self) -> None:
@@ -137,10 +137,7 @@ class TCPSession:
                 protocol.read_messages(self._reader)
             ) as messages:
                 async for message in messages:
-                    if not isinstance(message, Message):
-                        self._resolve_reply(message)
-                    elif not self._messages.offer(message):
-                        self._begin_close("pending message buffer limit exceeded")
+                    self._route(message)
                     if self._close_reason is not None:
                         break
         except ProtocolError as exc:
@@ -149,6 +146,13 @@ class TCPSession:
             pass
         finally:
             self._begin_close()
+
+    def _route(self, message: protocol.ServerFrame) -> None:
+        if isinstance(message, Message):
+            if not self._messages.offer(message):
+                self._begin_close("pending message buffer limit exceeded")
+        else:
+            self._resolve_reply(message)
 
     def _resolve_reply(self, reply: Reply) -> None:
         """Resolve the oldest request or discard its cancelled future's reply.
@@ -204,6 +208,20 @@ class TCPSession:
         self._pending.append(waiter)
         return waiter
 
+    async def _reserve_and_submit(self, command: Command) -> asyncio.Future[Reply]:
+        """Reserve a slot and transfer ownership to the submitted request.
+
+        Submission failures release capacity here; successful requests retain
+        their slots until a reply or session closure removes them from the FIFO.
+        """
+        self._check_open()
+        await self._slots.acquire()
+        try:
+            return self._submit(command)
+        except BaseException:
+            self._slots.release()
+            raise
+
     async def request(self, command: Command) -> Reply:
         """Send a command and await the reply that answers it.
 
@@ -214,28 +232,20 @@ class TCPSession:
         it. Cancellation during drain also retains the future's position while
         discarding its eventual result.
         """
-        self._check_open()
-        await self._slots.acquire()
+        waiter: asyncio.Future[Reply] | None = None
         try:
-            waiter = self._submit(command)
-        except OSError:
-            self._slots.release()
-            await self.close()
-            raise
-        except BaseException:
-            self._slots.release()
-            raise
-        try:
+            waiter = await self._reserve_and_submit(command)
             await self._writer.drain()
             return await waiter
         except OSError:
             await self.close()
             raise
         finally:
-            waiter.cancel()
+            if waiter is not None:
+                waiter.cancel()
 
     async def next_message(self) -> Message:
-        """Wait for the next encoded message.
+        """Wait for the next Message with its original payload bytes.
 
         Use asyncio.timeout to bound the wait. Cancelling this wait leaves
         the connection usable. Raise ConnectionError after queued messages

@@ -90,6 +90,20 @@ SERVER_MESSAGES = ServerMessageCodec()
 
 
 class FastWireTests(unittest.TestCase):
+    def test_unregistered_subclasses_are_rejected(self) -> None:
+        class DerivedGet(Get):
+            pass
+
+        class DerivedValue(Value):
+            pass
+
+        with self.assertRaisesRegex(ProtocolError, "unsupported command: DerivedGet"):
+            COMMANDS.encode(DerivedGet("key"))
+        with self.assertRaisesRegex(
+            ProtocolError, "unsupported server message: DerivedValue"
+        ):
+            SERVER_MESSAGES.encode(DerivedValue(b"value"))
+
     def _check_golden[T](
         self,
         encode: Callable[[T], bytes],

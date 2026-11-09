@@ -4,9 +4,8 @@ Decoders require bytes, reject trailing data and check field limits before
 reading or decoding their bodies. Tags and field order are fixed by the protocol.
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from struct import Struct
-from typing import Any
 
 from velis.core.messages import (
     NIL,
@@ -45,17 +44,29 @@ from velis.net.limits import (
 _U32 = Struct(">I")
 _U64 = Struct(">Q")
 unpack_u32, pack_u32 = _U32.unpack_from, _U32.pack
-_unpack64, _pack64 = _U64.unpack_from, _U64.pack
 _BAD_UTF8 = "invalid utf-8 in string field"
-_TRAILING = "trailing bytes after record"
 
 type ServerFrame = Reply | Message
 type _Decoder[T] = Callable[[bytes, int, int], T]
-type _Encoder = Callable[[Any], bytes]
+type _Reader[T] = Callable[[bytes, int, int], tuple[T, int]]
 
 
 def _truncated(need: int) -> ProtocolError:
     return ProtocolError(f"truncated record: need {need} bytes")
+
+
+def _decode_utf8(raw: bytes) -> str:
+    try:
+        return raw.decode()
+    except UnicodeError as exc:
+        raise ProtocolError(_BAD_UTF8) from exc
+
+
+def _encode_utf8(value: str) -> bytes:
+    try:
+        return value.encode()
+    except UnicodeError as exc:
+        raise ProtocolError(_BAD_UTF8) from exc
 
 
 def _span(data: bytes, pos: int, end: int, limit: int) -> tuple[int, int]:
@@ -76,10 +87,7 @@ def _text(
     data: bytes, pos: int, end: int, what: str, max_chars: int
 ) -> tuple[str, int]:
     start, stop = _span(data, pos, end, max_chars * 4)
-    try:
-        text = data[start:stop].decode()
-    except UnicodeError as exc:
-        raise ProtocolError(_BAD_UTF8) from exc
+    text = _decode_utf8(data[start:stop])
     if not text:
         raise ProtocolError(f"{what} must not be empty")
     if len(text) > max_chars:
@@ -89,100 +97,81 @@ def _text(
 
 def _free_text(data: bytes, pos: int, end: int) -> tuple[str, int]:
     start, stop = _span(data, pos, end, MAX_FIELD_BYTES)
-    try:
-        return data[start:stop].decode(), stop
-    except UnicodeError as exc:
-        raise ProtocolError(_BAD_UTF8) from exc
+    return _decode_utf8(data[start:stop]), stop
 
 
-def _text_only[T](cls: Callable[[str], T], what: str, max_chars: int) -> _Decoder[T]:
-    def decode(data: bytes, pos: int, end: int) -> T:
-        text, pos = _text(data, pos, end, what, max_chars)
-        if pos != end:
-            raise ProtocolError(_TRAILING)
-        return cls(text)
+def _bytes(data: bytes, pos: int, end: int) -> tuple[bytes, int]:
+    start, stop = _span(data, pos, end, MAX_FIELD_BYTES)
+    return data[start:stop], stop
+
+
+def _number(data: bytes, pos: int, end: int, integer: Struct) -> tuple[int, int]:
+    stop = pos + integer.size
+    if stop > end:
+        raise _truncated(integer.size)
+    (value,) = integer.unpack_from(data, pos)
+    return value, stop
+
+
+def _read_key(data: bytes, pos: int, end: int) -> tuple[str, int]:
+    return _text(data, pos, end, "key", MAX_KEY_CHARS)
+
+
+def _read_channel(data: bytes, pos: int, end: int) -> tuple[str, int]:
+    return _text(data, pos, end, "channel", MAX_CHANNEL_CHARS)
+
+
+def _read_u32(data: bytes, pos: int, end: int) -> tuple[int, int]:
+    return _number(data, pos, end, _U32)
+
+
+def _read_u64(data: bytes, pos: int, end: int) -> tuple[int, int]:
+    return _number(data, pos, end, _U64)
+
+
+def _finish(pos: int, end: int) -> None:
+    if pos != end:
+        raise ProtocolError("trailing bytes after record")
+
+
+def _one[T, R](cls: Callable[[T], R], read: _Reader[T]) -> _Decoder[R]:
+    def decode(data: bytes, pos: int, end: int) -> R:
+        value, pos = read(data, pos, end)
+        _finish(pos, end)
+        return cls(value)
 
     return decode
 
 
-def _text_bytes[T](
-    cls: Callable[[str, bytes], T], what: str, max_chars: int
-) -> _Decoder[T]:
-    def decode(data: bytes, pos: int, end: int) -> T:
-        text, pos = _text(data, pos, end, what, max_chars)
-        start, stop = _span(data, pos, end, MAX_FIELD_BYTES)
-        if stop != end:
-            raise ProtocolError(_TRAILING)
-        return cls(text, data[start:stop])
-
-    return decode
-
-
-def _text_u64[T](
-    cls: Callable[[str, int], T], what: str, max_chars: int
-) -> _Decoder[T]:
-    def decode(data: bytes, pos: int, end: int) -> T:
-        text, pos = _text(data, pos, end, what, max_chars)
-        if pos + 8 > end:
-            raise _truncated(8)
-        (number,) = _unpack64(data, pos)
-        if pos + 8 != end:
-            raise ProtocolError(_TRAILING)
-        return cls(text, number)
+def _pair[A, B, R](
+    cls: Callable[[A, B], R], first: _Reader[A], second: _Reader[B]
+) -> _Decoder[R]:
+    def decode(data: bytes, pos: int, end: int) -> R:
+        a, pos = first(data, pos, end)
+        b, pos = second(data, pos, end)
+        _finish(pos, end)
+        return cls(a, b)
 
     return decode
 
 
 def _empty[T](value: T) -> _Decoder[T]:
     def decode(data: bytes, pos: int, end: int) -> T:
-        if pos != end:
-            raise ProtocolError(_TRAILING)
+        _finish(pos, end)
         return value
 
     return decode
 
 
-def _free_text_only[T](cls: Callable[[str], T]) -> _Decoder[T]:
-    def decode(data: bytes, pos: int, end: int) -> T:
-        text, pos = _free_text(data, pos, end)
-        if pos != end:
-            raise ProtocolError(_TRAILING)
-        return cls(text)
-
-    return decode
-
-
-def _bytes_only[T](cls: Callable[[bytes], T]) -> _Decoder[T]:
-    def decode(data: bytes, pos: int, end: int) -> T:
-        start, stop = _span(data, pos, end, MAX_FIELD_BYTES)
-        if stop != end:
-            raise ProtocolError(_TRAILING)
-        return cls(data[start:stop])
-
-    return decode
-
-
-def _number_only[T](cls: Callable[[int], T], integer: Struct) -> _Decoder[T]:
-    size = integer.size
-    unpack = integer.unpack_from
-
-    def decode(data: bytes, pos: int, end: int) -> T:
-        if pos + size > end:
-            raise _truncated(size)
-        (number,) = unpack(data, pos)
-        if pos + size != end:
-            raise ProtocolError(_TRAILING)
-        return cls(number)
-
-    return decode
-
-
-def _message(data: bytes, pos: int, end: int) -> Message:
-    channel, pos = _free_text(data, pos, end)
-    start, stop = _span(data, pos, end, MAX_FIELD_BYTES)
-    if stop != end:
-        raise ProtocolError(_TRAILING)
-    return Message(channel, data[start:stop])
+def _dispatch[T](decoders: Mapping[bytes, _Decoder[T]], data: bytes, kind: str) -> T:
+    end = len(data)
+    start, stop = _span(data, 0, end, MAX_TAG_BYTES)
+    tag = data[start:stop]
+    decoder = decoders.get(tag)
+    if decoder is None:
+        name = _decode_utf8(tag)
+        raise ProtocolError(f"unknown {kind}: {name!r}")
+    return decoder(data, stop, end)
 
 
 _PREFIXES = {
@@ -216,25 +205,26 @@ def _enc_text(value: str, what: str, max_chars: int) -> bytes:
         raise ProtocolError(f"{what} must not be empty")
     if len(value) > max_chars:
         raise ProtocolError(f"{what} exceeds {max_chars} characters")
-    try:
-        raw = value.encode()
-    except UnicodeError as exc:
-        raise ProtocolError(_BAD_UTF8) from exc
+    raw = _encode_utf8(value)
     return pack_u32(len(raw)) + raw
 
 
-def _enc_free_text(value: str) -> bytes:
-    try:
-        raw = value.encode()
-    except UnicodeError as exc:
-        raise ProtocolError(_BAD_UTF8) from exc
-    return _enc_bytes(raw)
+def _enc_key(value: str) -> bytes:
+    return _enc_text(value, "key", MAX_KEY_CHARS)
+
+
+def _enc_channel(value: str) -> bytes:
+    return _enc_text(value, "channel", MAX_CHANNEL_CHARS)
 
 
 def _enc_bytes(value: bytes) -> bytes:
     if len(value) > MAX_FIELD_BYTES:
         raise ProtocolError(f"field too long: {len(value)}")
     return pack_u32(len(value)) + value
+
+
+def _enc_free_text(value: str) -> bytes:
+    return _enc_bytes(_encode_utf8(value))
 
 
 def _enc_u32(value: int) -> bytes:
@@ -246,67 +236,118 @@ def _enc_u32(value: int) -> bytes:
 def _enc_u64(value: int) -> bytes:
     if not 0 <= value <= 0xFFFFFFFFFFFFFFFF:
         raise ProtocolError(f"u64 integer out of range: {value}")
-    return _pack64(value)
+    return _U64.pack(value)
+
+
+def _encode_get(value: Get) -> bytes:
+    return _PREFIXES[b"GET"] + _enc_key(value.key)
+
+
+def _encode_set(value: Set) -> bytes:
+    return _PREFIXES[b"SET"] + _enc_key(value.key) + _enc_bytes(value.value)
+
+
+def _encode_expire(value: Expire) -> bytes:
+    return _PREFIXES[b"EXPIRE"] + _enc_key(value.key) + _enc_u64(value.ms)
+
+
+def _encode_delete(value: Delete) -> bytes:
+    return _PREFIXES[b"DEL"] + _enc_key(value.key)
+
+
+def _encode_ttl(value: TTL) -> bytes:
+    return _PREFIXES[b"TTL"] + _enc_key(value.key)
+
+
+def _encode_persist(value: Persist) -> bytes:
+    return _PREFIXES[b"PERSIST"] + _enc_key(value.key)
+
+
+def _encode_subscribe(value: Subscribe) -> bytes:
+    return _PREFIXES[b"SUBSCRIBE"] + _enc_channel(value.channel)
+
+
+def _encode_unsubscribe(value: Unsubscribe) -> bytes:
+    return _PREFIXES[b"UNSUBSCRIBE"] + _enc_channel(value.channel)
+
+
+def _encode_publish(value: Publish) -> bytes:
+    return (
+        _PREFIXES[b"PUBLISH"] + _enc_channel(value.channel) + _enc_bytes(value.payload)
+    )
+
+
+def _encode_value(value: Value) -> bytes:
+    return _PREFIXES[b"VALUE"] + _enc_bytes(value.value)
+
+
+def _encode_err(value: Err) -> bytes:
+    return _PREFIXES[b"ERR"] + _enc_free_text(value.message)
+
+
+def _encode_subscribed(value: Subscribed) -> bytes:
+    return _PREFIXES[b"SUBSCRIBED"] + _enc_free_text(value.channel)
+
+
+def _encode_unsubscribed(value: Unsubscribed) -> bytes:
+    return _PREFIXES[b"UNSUBSCRIBED"] + _enc_free_text(value.channel)
+
+
+def _encode_delivered(value: Delivered) -> bytes:
+    return _PREFIXES[b"DELIVERED"] + _enc_u32(value.count)
+
+
+def _encode_ttl_value(value: TTLValue) -> bytes:
+    return _PREFIXES[b"TTL_VALUE"] + _enc_u64(value.ms)
+
+
+def _encode_message(value: Message) -> bytes:
+    return (
+        _PREFIXES[b"MESSAGE"]
+        + _enc_free_text(value.channel)
+        + _enc_bytes(value.payload)
+    )
 
 
 class CommandCodec:
-    """Encode and decode every command in the fixed client-to-server format."""
+    """Encode and decode the fixed format, rejecting unregistered variant types."""
 
     def __init__(self) -> None:
-        key, channel = MAX_KEY_CHARS, MAX_CHANNEL_CHARS
         self._decoders: dict[bytes, _Decoder[Command]] = {
-            b"GET": _text_only(Get, "key", key),
-            b"SET": _text_bytes(Set, "key", key),
-            b"EXPIRE": _text_u64(Expire, "key", key),
-            b"DEL": _text_only(Delete, "key", key),
-            b"TTL": _text_only(TTL, "key", key),
-            b"PERSIST": _text_only(Persist, "key", key),
-            b"SUBSCRIBE": _text_only(Subscribe, "channel", channel),
-            b"UNSUBSCRIBE": _text_only(Unsubscribe, "channel", channel),
-            b"PUBLISH": _text_bytes(Publish, "channel", channel),
-        }
-        self._encoders: dict[type[Any], _Encoder] = {
-            Get: lambda c, p=_PREFIXES[b"GET"]: p + _enc_text(c.key, "key", key),
-            Set: lambda c, p=_PREFIXES[b"SET"]: (
-                p + _enc_text(c.key, "key", key) + _enc_bytes(c.value)
-            ),
-            Expire: lambda c, p=_PREFIXES[b"EXPIRE"]: (
-                p + _enc_text(c.key, "key", key) + _enc_u64(c.ms)
-            ),
-            Delete: lambda c, p=_PREFIXES[b"DEL"]: p + _enc_text(c.key, "key", key),
-            TTL: lambda c, p=_PREFIXES[b"TTL"]: p + _enc_text(c.key, "key", key),
-            Persist: lambda c, p=_PREFIXES[b"PERSIST"]: (
-                p + _enc_text(c.key, "key", key)
-            ),
-            Subscribe: lambda c, p=_PREFIXES[b"SUBSCRIBE"]: (
-                p + _enc_text(c.channel, "channel", channel)
-            ),
-            Unsubscribe: lambda c, p=_PREFIXES[b"UNSUBSCRIBE"]: (
-                p + _enc_text(c.channel, "channel", channel)
-            ),
-            Publish: lambda c, p=_PREFIXES[b"PUBLISH"]: (
-                p + _enc_text(c.channel, "channel", channel) + _enc_bytes(c.payload)
-            ),
+            b"GET": _one(Get, _read_key),
+            b"SET": _pair(Set, _read_key, _bytes),
+            b"EXPIRE": _pair(Expire, _read_key, _read_u64),
+            b"DEL": _one(Delete, _read_key),
+            b"TTL": _one(TTL, _read_key),
+            b"PERSIST": _one(Persist, _read_key),
+            b"SUBSCRIBE": _one(Subscribe, _read_channel),
+            b"UNSUBSCRIBE": _one(Unsubscribe, _read_channel),
+            b"PUBLISH": _pair(Publish, _read_channel, _bytes),
         }
 
     def decode(self, data: bytes) -> Command:
-        end = len(data)
-        start, stop = _span(data, 0, end, MAX_TAG_BYTES)
-        tag = data[start:stop]
-        decoder = self._decoders.get(tag)
-        if decoder is None:
-            try:
-                name = tag.decode()
-            except UnicodeError as exc:
-                raise ProtocolError(_BAD_UTF8) from exc
-            raise ProtocolError(f"unknown command: {name!r}")
-        return decoder(data, stop, end)
+        return _dispatch(self._decoders, data, "command")
 
     def encode(self, value: Command) -> bytes:
-        encoder = self._encoders.get(type(value))
-        if encoder is None:
-            raise ProtocolError(f"unsupported command: {type(value).__name__}")
-        return encoder(value)
+        if type(value) is Get:
+            return _encode_get(value)
+        if type(value) is Set:
+            return _encode_set(value)
+        if type(value) is Expire:
+            return _encode_expire(value)
+        if type(value) is Delete:
+            return _encode_delete(value)
+        if type(value) is TTL:
+            return _encode_ttl(value)
+        if type(value) is Persist:
+            return _encode_persist(value)
+        if type(value) is Subscribe:
+            return _encode_subscribe(value)
+        if type(value) is Unsubscribe:
+            return _encode_unsubscribe(value)
+        if type(value) is Publish:
+            return _encode_publish(value)
+        raise ProtocolError(f"unsupported command: {type(value).__name__}")
 
 
 class ServerMessageCodec:
@@ -321,53 +362,37 @@ class ServerMessageCodec:
             b"OK": _empty(OK),
             b"NIL": _empty(NIL),
             b"PERSISTENT": _empty(PERSISTENT),
-            b"VALUE": _bytes_only(Value),
-            b"ERR": _free_text_only(Err),
-            b"SUBSCRIBED": _free_text_only(Subscribed),
-            b"UNSUBSCRIBED": _free_text_only(Unsubscribed),
-            b"DELIVERED": _number_only(Delivered, _U32),
-            b"TTL_VALUE": _number_only(TTLValue, _U64),
-            b"MESSAGE": _message,
-        }
-        ok, nil, persistent = (
-            _PREFIXES[b"OK"],
-            _PREFIXES[b"NIL"],
-            _PREFIXES[b"PERSISTENT"],
-        )
-        self._encoders: dict[type[Any], _Encoder] = {
-            Ok: lambda m: ok,
-            Nil: lambda m: nil,
-            Persistent: lambda m: persistent,
-            Value: lambda m, p=_PREFIXES[b"VALUE"]: p + _enc_bytes(m.value),
-            Err: lambda m, p=_PREFIXES[b"ERR"]: p + _enc_free_text(m.message),
-            Subscribed: lambda m, p=_PREFIXES[b"SUBSCRIBED"]: (
-                p + _enc_free_text(m.channel)
-            ),
-            Unsubscribed: lambda m, p=_PREFIXES[b"UNSUBSCRIBED"]: (
-                p + _enc_free_text(m.channel)
-            ),
-            Delivered: lambda m, p=_PREFIXES[b"DELIVERED"]: p + _enc_u32(m.count),
-            TTLValue: lambda m, p=_PREFIXES[b"TTL_VALUE"]: p + _enc_u64(m.ms),
-            Message: lambda m, p=_PREFIXES[b"MESSAGE"]: (
-                p + _enc_free_text(m.channel) + _enc_bytes(m.payload)
-            ),
+            b"VALUE": _one(Value, _bytes),
+            b"ERR": _one(Err, _free_text),
+            b"SUBSCRIBED": _one(Subscribed, _free_text),
+            b"UNSUBSCRIBED": _one(Unsubscribed, _free_text),
+            b"DELIVERED": _one(Delivered, _read_u32),
+            b"TTL_VALUE": _one(TTLValue, _read_u64),
+            b"MESSAGE": _pair(Message, _free_text, _bytes),
         }
 
     def decode(self, data: bytes) -> ServerFrame:
-        end = len(data)
-        start, stop = _span(data, 0, end, MAX_TAG_BYTES)
-        tag = data[start:stop]
-        decoder = self._decoders.get(tag)
-        if decoder is None:
-            try:
-                name = tag.decode()
-            except UnicodeError as exc:
-                raise ProtocolError(_BAD_UTF8) from exc
-            raise ProtocolError(f"unknown server message: {name!r}")
-        return decoder(data, stop, end)
+        return _dispatch(self._decoders, data, "server message")
 
     def encode(self, value: ServerFrame) -> bytes:
-        encoder = self._encoders.get(type(value))
-        if encoder is None:
-            raise ProtocolError(f"unsupported server message: {type(value).__name__}")
-        return encoder(value)
+        if type(value) is Value:
+            return _encode_value(value)
+        if type(value) is Ok:
+            return _PREFIXES[b"OK"]
+        if type(value) is Nil:
+            return _PREFIXES[b"NIL"]
+        if type(value) is Persistent:
+            return _PREFIXES[b"PERSISTENT"]
+        if type(value) is Err:
+            return _encode_err(value)
+        if type(value) is Subscribed:
+            return _encode_subscribed(value)
+        if type(value) is Unsubscribed:
+            return _encode_unsubscribed(value)
+        if type(value) is Delivered:
+            return _encode_delivered(value)
+        if type(value) is TTLValue:
+            return _encode_ttl_value(value)
+        if type(value) is Message:
+            return _encode_message(value)
+        raise ProtocolError(f"unsupported server message: {type(value).__name__}")

@@ -1,5 +1,6 @@
 """Positional records and tagged choices composed from field codecs."""
 
+from annotationlib import Format
 from collections.abc import Mapping
 from inspect import Parameter, signature
 from typing import Any
@@ -19,10 +20,11 @@ class Record[T](CursorCodec[T]):
     Each parameter must correspond to a readable attribute of the same name.
     Keyword-only and variadic parameters are rejected during setup. Dataclass
     fields with init=False are derived state, so they are not encoded.
+    Explicit field codecs define the layout independently of type annotations.
     """
 
     def __init__(self, cls: type[T], *codecs: Field[Any]) -> None:
-        parameters = signature(cls).parameters.values()
+        parameters = signature(cls, annotation_format=Format.STRING).parameters.values()
         if any(p.kind not in _POSITIONAL for p in parameters):
             raise ValueError(f"{cls.__name__} fields must be positional init fields")
         names = tuple(p.name for p in parameters)

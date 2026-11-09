@@ -1,10 +1,23 @@
 import unittest
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from velis.codec import Choice, FixedLengthField, Record, UInt
 
+if TYPE_CHECKING:
+    from collections.abc import Hashable
+
 
 class RecordTests(unittest.TestCase):
+    def test_type_only_annotations_do_not_define_the_wire_layout(self) -> None:
+        class Value:
+            def __init__(self, count: Hashable) -> None:
+                self.count = count
+
+        codec = Record(Value, UInt(1))
+        self.assertEqual(codec.encode(Value(7)), b"\x07")
+        self.assertEqual(codec.decode(b"\x07").count, 7)
+
     def test_dataclass_without_match_metadata_roundtrips(self) -> None:
         @dataclass(match_args=False)
         class Value:

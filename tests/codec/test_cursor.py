@@ -14,6 +14,31 @@ from velis.errors import ProtocolError
 
 
 class CursorTests(unittest.TestCase):
+    def test_unsigned_integer_widths_and_boundaries(self) -> None:
+        for size in (1, 2, 3, 4, 8, 9):
+            maximum = 256**size - 1
+            for value in (0, 1, maximum):
+                with self.subTest(size=size, value=value):
+                    encoded = value.to_bytes(size)
+                    cursor = Cursor(encoded + b"tail")
+                    self.assertEqual(cursor.take_uint(size), value)
+                    self.assertEqual(cursor.take(4), b"tail")
+                    cursor.finish()
+                    for end in range(size):
+                        cursor = Cursor(encoded[:end])
+                        with self.assertRaisesRegex(
+                            ProtocolError, f"truncated record: need {size} bytes"
+                        ):
+                            cursor.take_uint(size)
+                        self.assertEqual(cursor.take(end), encoded[:end])
+
+    def test_invalid_integer_width_preserves_position(self) -> None:
+        cursor = Cursor(b"ab")
+        for size in (-1, 0):
+            with self.assertRaisesRegex(ValueError, "must be positive"):
+                cursor.take_uint(size)
+        self.assertEqual(cursor.take(2), b"ab")
+
     def test_custom_cursor_codec_requires_exact_consumption(self) -> None:
         class Pair(CursorCodec[bytes]):
             def read(self, cursor: Cursor) -> bytes:
@@ -51,6 +76,14 @@ class CursorTests(unittest.TestCase):
         with self.assertRaises(ValueError) as raised, Cursor(b"unread"):
             raise failure
         self.assertIs(raised.exception, failure)
+
+    def test_huge_read_reports_truncation_without_consuming_input(self) -> None:
+        cursor = Cursor(b"abc")
+        for size in (1 << 63, 1 << 80):
+            with self.subTest(size=size), self.assertRaises(ProtocolError):
+                cursor.take(size)
+        self.assertEqual(cursor.take(3), b"abc")
+        cursor.finish()
 
     def test_mixed_fields_and_end_of_record(self) -> None:
         cursor = Cursor(b"\x01\x00\x00\x00\x02hi\x00\x00\x00\x00")

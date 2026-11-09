@@ -1,9 +1,12 @@
-"""Reversible value representations and validation, independent of cursors."""
+"""Reversible value representations and validation."""
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import final
 
+from velis.codec.cursor import Cursor
 from velis.errors import ProtocolError
+from velis.validation import require_length
 
 _BAD_UTF8 = "invalid utf-8 in string field"
 
@@ -17,9 +20,13 @@ class Identity:
         return data
 
 
+@final
 @dataclass(frozen=True, slots=True)
 class UInt:
-    """Big-endian unsigned integer of a fixed length in bytes."""
+    """Big-endian unsigned integer of a fixed length in bytes.
+
+    It is also a record field: ``read`` consumes exactly ``length`` bytes.
+    """
 
     length: int
 
@@ -37,14 +44,14 @@ class UInt:
         return value.to_bytes(self.length)
 
     def decode(self, data: bytes) -> int:
-        if len(data) != self.length:
-            raise ProtocolError(f"expected {self.length} integer bytes")
+        require_length(data, self.length, what="integer")
         return int.from_bytes(data)
+
+    def read(self, cursor: Cursor) -> int:
+        return cursor.take_uint(self.length)
 
 
 U32 = UInt(4)
-
-
 U64 = UInt(8)
 
 

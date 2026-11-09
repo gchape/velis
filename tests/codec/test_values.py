@@ -1,6 +1,5 @@
 import unittest
 from typing import assert_type
-from unittest.mock import Mock
 
 from tests.codec.helpers import Reverse
 from velis.codec import (
@@ -15,8 +14,8 @@ from velis.errors import ProtocolError
 
 
 class ValueCodecTests(unittest.TestCase):
-    def test_boolean_validation_result_rejects_in_both_directions(self) -> None:
-        codec = Validate[str](Mock(return_value=False))
+    def test_empty_error_message_rejects_in_both_directions(self) -> None:
+        codec = Validate[str](lambda _: "")
         for transform in (codec.encode, codec.decode):
             with self.assertRaises(ProtocolError):
                 transform("hello")

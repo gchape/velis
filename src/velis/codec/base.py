@@ -13,7 +13,7 @@ class Codec[T, Encoded](Protocol):
 
 
 def _steps(codec: Codec[Any, Any]) -> tuple[Codec[Any, Any], ...]:
-    return codec.codecs if isinstance(codec, CompositeCodec) else (codec,)
+    return codec.codecs if type(codec) is CompositeCodec else (codec,)
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,6 +23,7 @@ class CompositeCodec[T, Encoded]:
     Children can be individual codecs or other composites. Direct construction
     preserves nested groups. The typed ``of(first) | next`` shorthand
     concatenates stages at the top level.
+    Subclasses remain opaque stages, preserving overridden encode/decode methods.
     Adjacent representations must agree; direct construction does not check
     those types at runtime. An empty composite returns its input unchanged.
     """

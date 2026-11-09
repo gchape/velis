@@ -1,12 +1,28 @@
 import unittest
 from unittest.mock import Mock
 
-from velis.codec import UTF8, Identity, LengthPrefixedField, UInt
+from velis.codec import UTF8, FixedLengthField, Identity, LengthPrefixedField, UInt
 from velis.codec.cursor import Cursor
 from velis.errors import ProtocolError
 
 
 class LengthPrefixedFieldTests(unittest.TestCase):
+    def test_fixed_fields_preserve_custom_value_codecs(self) -> None:
+        class LittleEndianUInt:
+            def encode(self, value: int) -> bytes:
+                return value.to_bytes(2, "little")
+
+            def decode(self, data: bytes) -> int:
+                return int.from_bytes(data, "little")
+
+        integer = LittleEndianUInt()
+        self.assertEqual(integer.encode(258), b"\x02\x01")
+        fixed = FixedLengthField(integer, 2)
+        cursor = Cursor(b"\x02\x01tail")
+        self.assertEqual(fixed.read(cursor), 258)
+        self.assertEqual(cursor.take(4), b"tail")
+        cursor.finish()
+
     def test_prefix_lengths_preserve_values_and_record_boundaries(self) -> None:
         for prefix_length in (1, 2, 3, 4, 8):
             field = LengthPrefixedField(Identity(), 255, prefix=UInt(prefix_length))

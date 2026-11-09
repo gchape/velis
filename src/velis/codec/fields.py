@@ -8,6 +8,7 @@ from velis.codec.base import Codec
 from velis.codec.cursor import Cursor
 from velis.codec.values import UInt
 from velis.errors import ProtocolError
+from velis.validation import require_length
 
 
 class Field[T](Codec[T, bytes], Protocol):
@@ -40,17 +41,13 @@ class FixedLengthField[T]:
         if self.length <= 0:
             raise ValueError("field length must be positive")
 
-    def _check(self, data: bytes) -> None:
-        if len(data) != self.length:
-            raise ProtocolError(f"expected {self.length} field bytes")
-
     def encode(self, value: T) -> bytes:
         data = self.codec.encode(value)
-        self._check(data)
+        require_length(data, self.length, what="field")
         return data
 
     def decode(self, data: bytes) -> T:
-        self._check(data)
+        require_length(data, self.length, what="field")
         return self.codec.decode(data)
 
     def read(self, cursor: Cursor) -> T:
@@ -85,6 +82,6 @@ class LengthPrefixedField[T](CursorCodec[T]):
         return self.prefix.encode(len(data)) + data
 
     def read(self, cursor: Cursor) -> T:
-        length = self.prefix.decode(cursor.take(self.prefix.length))
+        length = self.prefix.read(cursor)
         self.check_length(length)
         return self.codec.decode(cursor.take(length))

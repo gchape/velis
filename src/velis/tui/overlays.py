@@ -9,6 +9,8 @@ from .surface import Surface
 from .text import format_duration, wrap_cells
 from .workspace import Workspace
 
+_COMMAND_WIDTH = max(len(spec.usage) for spec in SPECS.values())
+
 HELP = (
     "Start here",
     "  :list                discover stored keys (b opens this action)",
@@ -28,7 +30,7 @@ HELP = (
     "Command line: Tab completes · Enter runs · Esc cancels · ↑ ↓ history",
     "Quote arguments that contain spaces.",
     *(
-        f"  {spec.usage:<20}{spec.summary}"
+        f"  {spec.usage:<{_COMMAND_WIDTH}}  {spec.summary}"
         for spec in SPECS.values()
         if spec.name not in {"help", "quit"}
     ),

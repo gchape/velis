@@ -3,18 +3,51 @@
 import asyncio
 import contextlib
 from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import Protocol, Self
 
 from velis.core.messages import Command, Err, Message, Reply
 from velis.errors import ProtocolError
 from velis.net import protocol
-from velis.net.pending import PendingReplies
-from velis.settings import (
+from velis.net.defaults import (
+    DEFAULT_CLOSE_TIMEOUT_SECONDS,
     DEFAULT_HOST,
     DEFAULT_PORT,
-    DEFAULT_SESSION_LIMITS,
-    SessionLimits,
 )
+from velis.net.pending import PendingReplies
+from velis.validation import require_positive, require_positive_int
+
+DEFAULT_MAX_PENDING_REQUESTS = 64
+DEFAULT_MAX_PENDING_MESSAGES = 1024
+DEFAULT_MAX_PENDING_BYTES = 8 << 20
+DEFAULT_MAX_BATCH_BYTES = 256 << 10
+
+
+@dataclass(frozen=True, slots=True)
+class SessionLimits:
+    """Bounds on in-flight requests, batch writes and unread client messages.
+
+    The batch byte target includes framing. One valid command may exceed it
+    and is then written alone, so reducing the target never rejects a command.
+    """
+
+    max_pending_requests: int = DEFAULT_MAX_PENDING_REQUESTS
+    max_pending_messages: int = DEFAULT_MAX_PENDING_MESSAGES
+    max_pending_bytes: int = DEFAULT_MAX_PENDING_BYTES
+    max_batch_bytes: int = DEFAULT_MAX_BATCH_BYTES
+    close_timeout_seconds: float = DEFAULT_CLOSE_TIMEOUT_SECONDS
+
+    def __post_init__(self) -> None:
+        require_positive_int(
+            max_pending_requests=self.max_pending_requests,
+            max_pending_messages=self.max_pending_messages,
+            max_pending_bytes=self.max_pending_bytes,
+            max_batch_bytes=self.max_batch_bytes,
+        )
+        require_positive(close_timeout_seconds=self.close_timeout_seconds)
+
+
+DEFAULT_SESSION_LIMITS = SessionLimits()
 
 _CLOSED = "connection closed"
 

@@ -4,19 +4,17 @@ from dataclasses import dataclass
 from enum import Enum, auto
 
 from velis.core.clock import Clock, MonotonicClock
+from velis.core.eviction import EvictionPolicy
 from velis.core.expiry_index import ExpiryIndex
 from velis.errors import CapacityError, CommandError
-from velis.settings import (
-    DEFAULT_MAX_BYTES,
-    DEFAULT_MAX_KEYS,
-    DEFAULT_STORE_LIMITS,
-    StoreLimits,
-)
+from velis.validation import require_positive_int
 
 __all__ = [
+    "DEFAULT_EVICTION_POLICY",
     "DEFAULT_MAX_BYTES",
     "DEFAULT_MAX_KEYS",
     "DEFAULT_STORE_LIMITS",
+    "DEFAULT_SWEEP_INTERVAL_MS",
     "MAX_TTL_MS",
     "SWEEP_LIMIT",
     "Store",
@@ -27,6 +25,32 @@ __all__ = [
 
 MAX_TTL_MS = 1 << 62
 SWEEP_LIMIT = 1000
+DEFAULT_SWEEP_INTERVAL_MS = 100
+DEFAULT_MAX_KEYS = 100_000
+DEFAULT_MAX_BYTES = 64 << 20
+DEFAULT_EVICTION_POLICY = EvictionPolicy.S3_FIFO
+
+
+@dataclass(frozen=True, slots=True)
+class StoreLimits:
+    """Bound retained keys and UTF-8 key plus value bytes.
+
+    Policy strings are normalized to EvictionPolicy during construction.
+    The byte budget excludes Python objects and policy/expiry metadata.
+    """
+
+    max_keys: int = DEFAULT_MAX_KEYS
+    max_bytes: int = DEFAULT_MAX_BYTES
+    eviction_policy: EvictionPolicy = DEFAULT_EVICTION_POLICY
+
+    def __post_init__(self) -> None:
+        require_positive_int(max_keys=self.max_keys, max_bytes=self.max_bytes)
+        object.__setattr__(
+            self, "eviction_policy", EvictionPolicy(self.eviction_policy)
+        )
+
+
+DEFAULT_STORE_LIMITS = StoreLimits()
 
 
 class TtlStatus(Enum):

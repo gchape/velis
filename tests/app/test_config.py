@@ -39,12 +39,13 @@ class ConfigTests(unittest.TestCase):
                     ):
                         cast(Callable[..., object], constructor)(**{name: value})
 
-    def test_config_reexports_the_pure_settings_types(self) -> None:
-        from velis import settings
+    def test_config_reexports_component_limits(self) -> None:
+        from velis.core import store
+        from velis.net import server, session
 
-        self.assertIs(StoreLimits, settings.StoreLimits)
-        self.assertIs(ServerLimits, settings.ServerLimits)
-        self.assertIs(SessionLimits, settings.SessionLimits)
+        self.assertIs(StoreLimits, store.StoreLimits)
+        self.assertIs(ServerLimits, server.ServerLimits)
+        self.assertIs(SessionLimits, session.SessionLimits)
 
     def test_empty_mapping_uses_defaults_without_reading_process_environment(
         self,

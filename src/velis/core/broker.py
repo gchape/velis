@@ -5,8 +5,9 @@ from typing import Protocol, final
 from velis.core.membership import Memberships
 from velis.core.messages import Message
 from velis.errors import CapacityError
-from velis.settings import DEFAULT_MAX_SUBSCRIPTIONS
 from velis.validation import require_positive_int
+
+DEFAULT_MAX_SUBSCRIPTIONS = 1024
 
 
 class Subscriber(Protocol):

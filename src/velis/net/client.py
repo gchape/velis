@@ -30,12 +30,12 @@ from velis.core.messages import (
     Value,
 )
 from velis.errors import CommandError, ProtocolError
-from velis.net.session import Session, TCPSession
-from velis.settings import (
-    DEFAULT_HOST,
-    DEFAULT_PORT,
+from velis.net.defaults import DEFAULT_HOST, DEFAULT_PORT
+from velis.net.session import (
     DEFAULT_SESSION_LIMITS,
+    Session,
     SessionLimits,
+    TCPSession,
 )
 
 

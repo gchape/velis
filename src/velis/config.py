@@ -6,29 +6,34 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Self
 
+from velis.core.broker import DEFAULT_MAX_SUBSCRIPTIONS
 from velis.core.eviction import EvictionPolicy
-from velis.settings import (
-    DEFAULT_CLOSE_TIMEOUT_SECONDS,
+from velis.core.store import (
     DEFAULT_EVICTION_POLICY,
-    DEFAULT_HOST,
-    DEFAULT_LOG_LEVEL,
-    DEFAULT_MAX_BATCH_BYTES,
-    DEFAULT_MAX_BUFFER,
     DEFAULT_MAX_BYTES,
-    DEFAULT_MAX_CONNECTIONS,
     DEFAULT_MAX_KEYS,
+    DEFAULT_STORE_LIMITS,
+    DEFAULT_SWEEP_INTERVAL_MS,
+    StoreLimits,
+)
+from velis.net.defaults import (
+    DEFAULT_CLOSE_TIMEOUT_SECONDS,
+    DEFAULT_HOST,
+    DEFAULT_PORT,
+)
+from velis.net.server import (
+    DEFAULT_MAX_BUFFER,
+    DEFAULT_MAX_CONNECTIONS,
+    DEFAULT_SERVER_LIMITS,
+    ServerLimits,
+)
+from velis.net.session import (
+    DEFAULT_MAX_BATCH_BYTES,
     DEFAULT_MAX_PENDING_BYTES,
     DEFAULT_MAX_PENDING_MESSAGES,
     DEFAULT_MAX_PENDING_REQUESTS,
-    DEFAULT_MAX_SUBSCRIPTIONS,
-    DEFAULT_PORT,
-    DEFAULT_SERVER_LIMITS,
     DEFAULT_SESSION_LIMITS,
-    DEFAULT_STORE_LIMITS,
-    DEFAULT_SWEEP_INTERVAL_MS,
-    ServerLimits,
     SessionLimits,
-    StoreLimits,
 )
 from velis.validation import require_positive_int
 
@@ -57,6 +62,8 @@ __all__ = [
     "StoreLimits",
     "normalize_log_level",
 ]
+
+DEFAULT_LOG_LEVEL = "INFO"
 
 
 def normalize_log_level(level: str) -> str:

@@ -423,7 +423,7 @@ Pub-sub provides at-most-once delivery to connected subscribers on the same serv
 
 > **`max_bytes` is a data budget, not a RAM limit.** It counts UTF-8 keys and stored values only. Python objects, dictionaries, eviction queues and expiry metadata use additional memory; with many small keys, process memory can be several times the budget. Use `max_keys` as well.
 
-`velis/settings.py` defines the defaults and validated `ServerLimits`, `StoreLimits`, `SessionLimits`. `velis/config.py` owns the immutable `Config` snapshot and environment loading, and re-exports settings for compatibility. `Config.from_env()` reads `VELIS_*` variables when called. The CLI loads it once before configuring logging or opening runtime resources. `Config()` uses explicit values and defaults; embedded callers can load environment settings themselves. Existing limit imports from the store, server and session modules remain available.
+Each component owns its validated limits: `StoreLimits` in `velis.core.store`, `ServerLimits` in `velis.net.server` and `SessionLimits` in `velis.net.session`. `velis/config.py` owns the immutable `Config` snapshot and environment loading, and re-exports them for convenience. `Config.from_env()` reads `VELIS_*` variables when called. The CLI loads it once before configuring logging or opening runtime resources. `Config()` uses explicit values and defaults; embedded callers can load environment settings themselves. Existing limit imports from the store, server and session modules remain available.
 
 Unknown log levels, ports outside `0–65535`, nonpositive limits or sweep intervals, and non-integer numeric settings raise `ValueError` before startup. Empty values are parsed and validated; only missing variables use defaults. Parsing errors include the environment variable name. Logging setup and signals belong to `__main__.py`; `velis.app` owns the runtime lifecycle.
 
@@ -508,8 +508,7 @@ Golden byte fixtures cover every command, reply and push. Truncation, malformed-
 ```
 src/velis/
   __main__.py — CLI: logging, signals and startup
-  settings.py — immutable component limits, defaults and validation
-  config.py — application configuration and VELIS_* loading
+  config.py — application configuration, VELIS_* loading and limit re-exports
   app.py — composition root: serve() owns networking and maintenance
   errors.py — VelisError, ProtocolError, CommandError, CapacityError
   validation.py — shared positive-limit validation
@@ -526,6 +525,7 @@ src/velis/
     protocol.py — message tables, fixed u32 framing and shared PushEncoder
     wire.py — reusable field codecs and table-driven tagged message codec
     limits.py — fixed wire field and text limits; codecs derive frame limits
+    defaults.py — default host, port and close timeout shared by client and server
     connection.py — asyncio.Protocol callbacks, ordered batches and push buffering
     server.py — TCPServer listener lifecycle and connection admission
     client.py — opaque-byte command API, error translation and scoped cleanup

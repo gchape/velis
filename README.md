@@ -5,7 +5,7 @@ Velis is a lightweight in-memory key-value store with TTL expiration, pub-sub an
 ## Table of contents
 
 - [Features](#features)
-- [Screenshots](#screenshots)
+- [Demo](#demo)
 - [Installation](#installation)
 - [Quick start](#quick-start)
 - [Architecture](#architecture)
@@ -38,11 +38,17 @@ Velis is a lightweight in-memory key-value store with TTL expiration, pub-sub an
 
 ---
 
-## Screenshots
+## Demo
 
-<img width="2723" height="1706" alt="Screenshot_20261110_125801" src="https://github.com/user-attachments/assets/2c1870bf-743e-4a7c-80fe-496366b50ce5" />
+### Promo image
 
-<img width="2723" height="1706" alt="Screenshot_20261110_125810" src="https://github.com/user-attachments/assets/5a7e2b46-a1f0-496d-8e0e-61119d473068" />
+<!-- Replace this line with the promo image Markdown after uploading it in GitHub's README editor. -->
+_Promo image coming soon._
+
+### Promo video
+
+<!-- Replace this line with the uploaded promo video's GitHub attachment URL on its own line. -->
+_Promo video coming soon._
 
 ---
 

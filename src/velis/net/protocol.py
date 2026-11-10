@@ -2,8 +2,11 @@
 
 Commands and server messages use tagged bodies with fixed field layouts. Values
 and publication payloads are opaque bytes; framing is not configurable.
-Reply and push channels obey the field-byte limit without request-channel
-character restrictions.
+Reply and push channels obey a byte limit, without the request-channel
+character and emptiness restrictions.
+
+Each direction's frame limit is derived from its codec table, so the largest
+frame a peer may send is exactly the largest message the table can describe.
 """
 
 import asyncio
@@ -33,11 +36,24 @@ from velis.core.messages import (
     Value,
 )
 from velis.errors import ProtocolError
-from velis.net.limits import MAX_CHANNEL_CHARS, MAX_FRAME_BODY_BYTES, MAX_KEY_CHARS
-from velis.net.wire import BLOB, FREE_TEXT, U32, U64, Codec, pack_u32, text, unpack_u32
+from velis.net.limits import MAX_CHANNEL_BYTES, MAX_CHANNEL_CHARS, MAX_KEY_CHARS
+from velis.net.wire import (
+    BLOB,
+    FREE_TEXT,
+    U32,
+    U64,
+    Codec,
+    free_text,
+    msg,
+    pack_u32,
+    text,
+    unpack_u32,
+)
 
 __all__ = [
     "COMMANDS",
+    "MAX_COMMAND_BODY_BYTES",
+    "MAX_SERVER_BODY_BYTES",
     "SERVER_MESSAGES",
     "PushEncoder",
     "ServerFrame",
@@ -45,6 +61,7 @@ __all__ = [
     "encode_frame",
     "encode_message",
     "encode_push",
+    "iter_frame_spans",
     "iter_frames",
     "read_frame",
 ]
@@ -53,58 +70,64 @@ type ServerFrame = Reply | Message
 
 KEY = text("key", MAX_KEY_CHARS)
 CHANNEL = text("channel", MAX_CHANNEL_CHARS)
+ECHOED_CHANNEL = free_text(MAX_CHANNEL_BYTES)
 
 COMMANDS = Codec[Command](
     "command",
     {
-        Get: (b"GET", KEY),
-        Set: (b"SET", KEY, BLOB),
-        Expire: (b"EXPIRE", KEY, U64),
-        Delete: (b"DEL", KEY),
-        TTL: (b"TTL", KEY),
-        Persist: (b"PERSIST", KEY),
-        Subscribe: (b"SUBSCRIBE", CHANNEL),
-        Unsubscribe: (b"UNSUBSCRIBE", CHANNEL),
-        Publish: (b"PUBLISH", CHANNEL, BLOB),
+        Get: msg(b"GET", key=KEY),
+        Set: msg(b"SET", key=KEY, value=BLOB),
+        Expire: msg(b"EXPIRE", key=KEY, ms=U64),
+        Delete: msg(b"DEL", key=KEY),
+        TTL: msg(b"TTL", key=KEY),
+        Persist: msg(b"PERSIST", key=KEY),
+        Subscribe: msg(b"SUBSCRIBE", channel=CHANNEL),
+        Unsubscribe: msg(b"UNSUBSCRIBE", channel=CHANNEL),
+        Publish: msg(b"PUBLISH", channel=CHANNEL, payload=BLOB),
     },
+    covers=Command,
 )
 
 SERVER_MESSAGES = Codec[ServerFrame](
     "server message",
     {
-        Ok: (b"OK",),
-        Nil: (b"NIL",),
-        Persistent: (b"PERSISTENT",),
-        Value: (b"VALUE", BLOB),
-        Err: (b"ERR", FREE_TEXT),
-        Subscribed: (b"SUBSCRIBED", FREE_TEXT),
-        Unsubscribed: (b"UNSUBSCRIBED", FREE_TEXT),
-        Delivered: (b"DELIVERED", U32),
-        TTLValue: (b"TTL_VALUE", U64),
-        Message: (b"MESSAGE", FREE_TEXT, BLOB),
+        Ok: msg(b"OK"),
+        Nil: msg(b"NIL"),
+        Persistent: msg(b"PERSISTENT"),
+        Value: msg(b"VALUE", value=BLOB),
+        Err: msg(b"ERR", message=FREE_TEXT),
+        Subscribed: msg(b"SUBSCRIBED", channel=ECHOED_CHANNEL),
+        Unsubscribed: msg(b"UNSUBSCRIBED", channel=ECHOED_CHANNEL),
+        Delivered: msg(b"DELIVERED", count=U32),
+        TTLValue: msg(b"TTL_VALUE", ms=U64),
+        Message: msg(b"MESSAGE", channel=ECHOED_CHANNEL, payload=BLOB),
     },
+    covers=ServerFrame,
 )
 
+MAX_COMMAND_BODY_BYTES = COMMANDS.max_body
+MAX_SERVER_BODY_BYTES = SERVER_MESSAGES.max_body
 
-def _check_frame_length(length: int) -> None:
-    if length > MAX_FRAME_BODY_BYTES:
+
+def _check_frame_length(length: int, limit: int) -> None:
+    if length > limit:
         raise ProtocolError(f"field too long: {length}")
 
 
-def encode_frame(body: bytes) -> bytes:
-    """Frame one body with its u32 byte length, rejecting oversized bodies."""
-    _check_frame_length(len(body))
+def encode_frame(body: bytes, limit: int) -> bytes:
+    """Frame one body with its u32 byte length, rejecting bodies above limit."""
+    _check_frame_length(len(body), limit)
     return pack_u32(len(body)) + body
 
 
 def encode_command(command: Command) -> bytes:
     """Encode a command and its outer frame before any bytes are written."""
-    return encode_frame(COMMANDS.encode(command))
+    return encode_frame(COMMANDS.encode(command), MAX_COMMAND_BODY_BYTES)
 
 
 def encode_message(message: ServerFrame) -> bytes:
     """Encode a reply or publication push and its complete outer frame."""
-    return encode_frame(SERVER_MESSAGES.encode(message))
+    return encode_frame(SERVER_MESSAGES.encode(message), MAX_SERVER_BODY_BYTES)
 
 
 class PushEncoder:
@@ -129,29 +152,46 @@ class PushEncoder:
 encode_push = PushEncoder(encode_message)
 
 
-def iter_frames(buf: bytearray) -> Iterator[tuple[bytes, int]]:
-    """Yield each complete frame's body and end offset without consuming buf.
+def iter_frame_spans(
+    buf: bytearray, limit: int = MAX_COMMAND_BODY_BYTES
+) -> Iterator[tuple[int, int]]:
+    """Yield each complete body's start and end offsets without copying it.
 
-    Partial frames remain buffered. Oversized headers fail before their bodies
-    arrive. Do not mutate buf until iteration ends; discard only the consumed
-    prefix afterward. Bodies are bytes, suitable for the offset-based decoders.
+    The default limit suits the server reading commands. Partial frames remain
+    buffered. Oversized headers fail before their bodies arrive. Do not mutate
+    buf until iteration ends; discard only the consumed prefix afterward.
+    Offsets can be passed directly to Codec.decode; no buffer views are retained.
     """
     pos = 0
     while len(buf) - pos >= 4:
         (length,) = unpack_u32(buf, pos)
-        _check_frame_length(length)
+        _check_frame_length(length, limit)
         end = pos + 4 + length
         if len(buf) < end:
             return
-        yield bytes(buf[pos + 4 : end]), end
+        yield pos + 4, end
         pos = end
 
 
-async def read_frame(reader: asyncio.StreamReader) -> bytes | None:
+def iter_frames(
+    buf: bytearray, limit: int = MAX_COMMAND_BODY_BYTES
+) -> Iterator[tuple[bytes, int]]:
+    """Yield owned body bytes and end offsets; leave buf untouched."""
+    for start, end in iter_frame_spans(buf, limit):
+        # Release the view before yielding so callers can safely resize later.
+        with memoryview(buf) as view:
+            body = bytes(view[start:end])
+        yield body, end
+
+
+async def read_frame(
+    reader: asyncio.StreamReader, limit: int = MAX_SERVER_BODY_BYTES
+) -> bytes | None:
     """Read a body, returning None only for clean EOF at a frame boundary.
 
-    Partial headers and bodies raise IncompleteReadError. Check the body limit
-    immediately after reading the header, before waiting for the body bytes.
+    The default limit suits the client reading server messages. Partial headers
+    and bodies raise IncompleteReadError. Check the body limit immediately
+    after reading the header, before waiting for the body bytes.
     """
     try:
         header = await reader.readexactly(4)
@@ -160,5 +200,5 @@ async def read_frame(reader: asyncio.StreamReader) -> bytes | None:
             raise
         return None
     (length,) = unpack_u32(header)
-    _check_frame_length(length)
+    _check_frame_length(length, limit)
     return await reader.readexactly(length)

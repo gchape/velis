@@ -2,11 +2,11 @@
 
 from typing import Protocol, final
 
-from velis.config import DEFAULT_MAX_SUBSCRIPTIONS
 from velis.core.membership import Memberships
 from velis.core.messages import Message
 from velis.errors import CapacityError
-from velis.validation import require_positive
+from velis.settings import DEFAULT_MAX_SUBSCRIPTIONS
+from velis.validation import require_positive_int
 
 
 class Subscriber(Protocol):
@@ -22,7 +22,7 @@ class Broker:
     """Deliver each published message to every subscriber of a channel."""
 
     def __init__(self, *, max_subscriptions: int = DEFAULT_MAX_SUBSCRIPTIONS) -> None:
-        require_positive(max_subscriptions=max_subscriptions)
+        require_positive_int(max_subscriptions=max_subscriptions)
         self._max_subscriptions = max_subscriptions
         self._memberships: Memberships[str, Subscriber] = Memberships()
 

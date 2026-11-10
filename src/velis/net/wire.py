@@ -1,39 +1,67 @@
 """Field and message codecs for Velis's tagged binary wire format.
 
 A message is a length-prefixed tag followed by its fields in declaration order.
-Decoders require bytes, reject trailing data and check field limits before
-reading or decoding their bodies.
+Decoders read bytes or bytearray spans, reject trailing data and check field
+limits before reading their bodies. Decoded values own their bytes.
+
+A codec is built from one table of ``msg(tag, name=field, ...)`` entries and is
+validated at import time: the table must cover exactly the message types of its
+union alias, and each entry's field names, order and Python types must match
+the dataclass it describes. Every field knows its largest encoded size, so the
+codec also knows the largest body it can ever produce or accept.
 """
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, fields, is_dataclass
 from struct import Struct
-from typing import Any
+from types import UnionType
+from typing import Any, TypeAliasType, Union, get_args, get_origin, get_type_hints
 
 from velis.errors import ProtocolError
-from velis.net.limits import MAX_FIELD_BYTES, MAX_TAG_BYTES
+from velis.net.limits import MAX_FIELD_BYTES, MAX_TAG_BYTES, MAX_UTF8_BYTES_PER_CHAR
 
 _U32 = Struct(">I")
 unpack_u32, pack_u32 = _U32.unpack_from, _U32.pack
+_PREFIX_BYTES = _U32.size
 _BAD_UTF8 = "invalid utf-8 in string field"
 
-type Reader[T] = Callable[[bytes, int, int], tuple[T, int]]
+type Buffer = bytes | bytearray
+type Reader[T] = Callable[[Buffer, int, int], tuple[T, int]]
 type Writer[T] = Callable[[T], bytes]
 
 
 @dataclass(frozen=True, slots=True)
 class Field[T]:
-    """How one value is read from and written to a message body."""
+    """How one value is read from and written to a message body.
 
+    ``py`` is the dataclass annotation the field serves; ``max_size`` is the
+    most bytes the field can occupy on the wire, length prefix included.
+    """
+
+    py: type[T]
+    max_size: int
     read: Reader[T]
     write: Writer[T]
+
+
+@dataclass(frozen=True, slots=True)
+class Entry:
+    """One message's tag and its named fields, in wire order."""
+
+    tag: bytes
+    schema: Mapping[str, Field[Any]]
+
+
+def msg(tag: bytes, **schema: Field[Any]) -> Entry:
+    """Declare a message: its tag, then one named field per dataclass attribute."""
+    return Entry(tag, schema)
 
 
 def _truncated(need: int) -> ProtocolError:
     return ProtocolError(f"truncated record: need {need} bytes")
 
 
-def _decode_utf8(raw: bytes) -> str:
+def _decode_utf8(raw: Buffer) -> str:
     try:
         return raw.decode()
     except UnicodeError as exc:
@@ -51,46 +79,56 @@ def _prefixed(raw: bytes) -> bytes:
     return pack_u32(len(raw)) + raw
 
 
-def _span(data: bytes, pos: int, end: int, limit: int) -> tuple[int, int]:
+def _span(data: Buffer, pos: int, end: int, limit: int) -> tuple[int, int]:
     """Locate a u32-length-prefixed field, checking its limit before its body."""
-    if pos + 4 > end:
-        raise _truncated(4)
+    if pos + _PREFIX_BYTES > end:
+        raise _truncated(_PREFIX_BYTES)
     (length,) = unpack_u32(data, pos)
     if length > limit:
         raise ProtocolError(f"field too long: {length}")
-    start = pos + 4
+    start = pos + _PREFIX_BYTES
     stop = start + length
     if stop > end:
         raise _truncated(length)
     return start, stop
 
 
-def _read_blob(data: bytes, pos: int, end: int) -> tuple[bytes, int]:
-    start, stop = _span(data, pos, end, MAX_FIELD_BYTES)
-    return data[start:stop], stop
+def blob(limit: int) -> Field[bytes]:
+    """Opaque bytes of at most ``limit`` bytes."""
+
+    def read(data: Buffer, pos: int, end: int) -> tuple[bytes, int]:
+        start, stop = _span(data, pos, end, limit)
+        if isinstance(data, bytes):
+            return data[start:stop], stop
+        # Copy only the retained field, without an intermediate bytearray slice.
+        with memoryview(data) as view:
+            return bytes(view[start:stop]), stop
+
+    def write(value: bytes) -> bytes:
+        if len(value) > limit:
+            raise ProtocolError(f"field too long: {len(value)}")
+        return _prefixed(value)
+
+    return Field(bytes, _PREFIX_BYTES + limit, read, write)
 
 
-def _write_blob(value: bytes) -> bytes:
-    if len(value) > MAX_FIELD_BYTES:
-        raise ProtocolError(f"field too long: {len(value)}")
-    return _prefixed(value)
+def free_text(limit: int) -> Field[str]:
+    """UTF-8 text of at most ``limit`` encoded bytes, with no other restriction."""
+    raw = blob(limit)
 
+    def read(data: Buffer, pos: int, end: int) -> tuple[str, int]:
+        value, stop = raw.read(data, pos, end)
+        return _decode_utf8(value), stop
 
-def _read_free_text(data: bytes, pos: int, end: int) -> tuple[str, int]:
-    raw, stop = _read_blob(data, pos, end)
-    return _decode_utf8(raw), stop
+    def write(value: str) -> bytes:
+        return raw.write(_encode_utf8(value))
 
-
-def _write_free_text(value: str) -> bytes:
-    return _write_blob(_encode_utf8(value))
-
-
-BLOB = Field(_read_blob, _write_blob)
-FREE_TEXT = Field(_read_free_text, _write_free_text)
+    return Field(str, raw.max_size, read, write)
 
 
 def text(what: str, max_chars: int) -> Field[str]:
     """Non-empty UTF-8 text of at most max_chars characters."""
+    limit = max_chars * MAX_UTF8_BYTES_PER_CHAR
 
     def check(value: str) -> str:
         if not value:
@@ -99,21 +137,21 @@ def text(what: str, max_chars: int) -> Field[str]:
             raise ProtocolError(f"{what} exceeds {max_chars} characters")
         return value
 
-    def read(data: bytes, pos: int, end: int) -> tuple[str, int]:
-        start, stop = _span(data, pos, end, max_chars * 4)
+    def read(data: Buffer, pos: int, end: int) -> tuple[str, int]:
+        start, stop = _span(data, pos, end, limit)
         return check(_decode_utf8(data[start:stop])), stop
 
     def write(value: str) -> bytes:
-        return _write_blob(_encode_utf8(check(value)))
+        return _prefixed(_encode_utf8(check(value)))
 
-    return Field(read, write)
+    return Field(str, _PREFIX_BYTES + limit, read, write)
 
 
 def uint(layout: Struct) -> Field[int]:
     """Big-endian unsigned integer of the layout's width."""
     bits = layout.size * 8
 
-    def read(data: bytes, pos: int, end: int) -> tuple[int, int]:
+    def read(data: Buffer, pos: int, end: int) -> tuple[int, int]:
         stop = pos + layout.size
         if stop > end:
             raise _truncated(layout.size)
@@ -121,63 +159,115 @@ def uint(layout: Struct) -> Field[int]:
         return value, stop
 
     def write(value: int) -> bytes:
-        if not 0 <= value < 1 << bits:
+        if type(value) is not int or not 0 <= value < 1 << bits:
             raise ProtocolError(f"u{bits} integer out of range: {value}")
         return layout.pack(value)
 
-    return Field(read, write)
+    return Field(int, layout.size, read, write)
 
 
+BLOB = blob(MAX_FIELD_BYTES)
+FREE_TEXT = free_text(MAX_FIELD_BYTES)
 U32 = uint(_U32)
 U64 = uint(Struct(">Q"))
+
+
+def _members(tp: object) -> set[object]:
+    """Flatten ``type X = A | B | Y`` (Y itself an alias) into concrete classes."""
+    if isinstance(tp, TypeAliasType):
+        return _members(tp.__value__)
+    if get_origin(tp) in (Union, UnionType):
+        return {member for arg in get_args(tp) for member in _members(arg)}
+    return {tp}
+
+
+def _names(types: set[Any]) -> list[str]:
+    return sorted(getattr(t, "__name__", repr(t)) for t in types)
 
 
 class Codec[M]:
     """Encode and decode tagged dataclasses from one declaration table.
 
-    Each entry maps a dataclass to its tag and one field per dataclass
-    attribute, in order. Unregistered types and unknown tags are rejected.
+    ``covers`` is the union alias the table must serve. Construction fails if a
+    member type is unregistered, an unknown type is registered, a tag is
+    duplicated or too long, or an entry disagrees with its dataclass about
+    field names, order or Python types. Unknown tags are rejected on decode.
+
+    ``max_body`` is the largest body any registered message can occupy.
     """
 
     def __init__(
         self,
         kind: str,
-        messages: Mapping[type[M], tuple[bytes, *tuple[Field[Any], ...]]],
+        messages: Mapping[type[M], Entry],
+        *,
+        covers: TypeAliasType,
     ) -> None:
+        declared = _members(covers)
+        registered: set[object] = set(messages)
+        if registered != declared:
+            raise TypeError(
+                f"{kind} table mismatch: unregistered {_names(declared - registered)}, "
+                f"unexpected {_names(registered - declared)}"
+            )
         self._kind = kind
         self._by_tag: dict[bytes, tuple[type[M], tuple[Field[Any], ...]]] = {}
         self._by_type: dict[
             type[M], tuple[bytes, tuple[tuple[str, Field[Any]], ...]]
         ] = {}
-        for cls, (tag, *schema) in messages.items():
-            if not is_dataclass(cls):
-                raise TypeError(f"{cls.__name__} is not a dataclass")
-            names = tuple(f.name for f in fields(cls))
-            if len(names) != len(schema):
-                raise TypeError(
-                    f"{cls.__name__} has {len(names)} attributes, {len(schema)} fields"
-                )
-            if tag in self._by_tag:
-                raise ValueError(f"duplicate {kind} tag: {tag!r}")
-            self._by_tag[tag] = (cls, tuple(schema))
-            self._by_type[cls] = (
-                _prefixed(tag),
-                tuple(zip(names, schema, strict=True)),
+        self.max_body = 0
+        for cls, entry in messages.items():
+            self._register(cls, entry)
+
+    def _register(self, cls: type[M], entry: Entry) -> None:
+        if not is_dataclass(cls):
+            raise TypeError(f"{cls.__name__} is not a dataclass")
+        if len(entry.tag) > MAX_TAG_BYTES:
+            raise ValueError(f"{cls.__name__}: tag longer than {MAX_TAG_BYTES} bytes")
+        if entry.tag in self._by_tag:
+            raise ValueError(f"duplicate {self._kind} tag: {entry.tag!r}")
+        names = tuple(f.name for f in fields(cls))
+        if tuple(entry.schema) != names:
+            raise TypeError(
+                f"{cls.__name__}: table declares {tuple(entry.schema)}, "
+                f"dataclass has {names}"
             )
+        hints = get_type_hints(cls)
+        for name, field in entry.schema.items():
+            if hints[name] is not field.py:
+                raise TypeError(
+                    f"{cls.__name__}.{name}: annotated {hints[name]!r}, "
+                    f"field serves {field.py!r}"
+                )
+        prefix = _prefixed(entry.tag)
+        self._by_tag[entry.tag] = (cls, tuple(entry.schema.values()))
+        self._by_type[cls] = (prefix, tuple(entry.schema.items()))
+        size = len(prefix) + sum(f.max_size for f in entry.schema.values())
+        self.max_body = max(self.max_body, size)
 
     def encode(self, value: M) -> bytes:
         entry = self._by_type.get(type(value))
         if entry is None:
             raise ProtocolError(f"unsupported {self._kind}: {type(value).__name__}")
         prefix, slots = entry
-        return prefix + b"".join(
-            field.write(getattr(value, name)) for name, field in slots
-        )
+        if not slots:
+            return prefix
+        parts = [prefix]
+        for name, field in slots:
+            parts.append(field.write(getattr(value, name)))
+        return b"".join(parts)
 
-    def decode(self, data: bytes) -> M:
-        end = len(data)
-        start, pos = _span(data, 0, end, MAX_TAG_BYTES)
-        tag = data[start:pos]
+    def decode(self, data: Buffer, start: int = 0, end: int | None = None) -> M:
+        """Decode one complete body, optionally inside a larger receive buffer.
+
+        Fields cannot cross end, and no view of mutable input escapes this call.
+        """
+        if end is None:
+            end = len(data)
+        if not 0 <= start <= end <= len(data):
+            raise ProtocolError("invalid record bounds")
+        start, pos = _span(data, start, end, MAX_TAG_BYTES)
+        tag = bytes(data[start:pos])
         entry = self._by_tag.get(tag)
         if entry is None:
             raise ProtocolError(f"unknown {self._kind}: {_decode_utf8(tag)!r}")

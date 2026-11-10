@@ -1,9 +1,9 @@
 """Typed client commands over opaque bytes, with reply validation."""
 
+from collections.abc import Iterable
 from types import TracebackType
 from typing import Self, final
 
-from velis.config import DEFAULT_SESSION_LIMITS, SessionLimits
 from velis.core.messages import (
     MISSING,
     NO_EXPIRY,
@@ -31,6 +31,12 @@ from velis.core.messages import (
 )
 from velis.errors import CommandError, ProtocolError
 from velis.net.session import Session, TCPSession
+from velis.settings import (
+    DEFAULT_HOST,
+    DEFAULT_PORT,
+    DEFAULT_SESSION_LIMITS,
+    SessionLimits,
+)
 
 
 def _unexpected(command: Command, reply: Reply) -> ProtocolError:
@@ -49,8 +55,8 @@ class Client:
     @classmethod
     async def connect(
         cls,
-        host: str,
-        port: int,
+        host: str = DEFAULT_HOST,
+        port: int = DEFAULT_PORT,
         *,
         limits: SessionLimits = DEFAULT_SESSION_LIMITS,
     ) -> Self:
@@ -133,6 +139,17 @@ class Client:
         """Publish opaque bytes and return the number of accepting subscribers."""
         reply = await self._call(Publish(channel, payload), Delivered)
         return reply.count
+
+    async def batch(self, commands: Iterable[Command]) -> list[Reply]:
+        """Send commands together and return typed replies in input order.
+
+        Unlike individual convenience methods, this returns reply objects,
+        including Err for failed commands, so every result remains available.
+        TCP sessions validate the whole batch before writing and split it into
+        bounded windows when necessary. Batches are not transactions; cancelling
+        a batch can leave an already-sent prefix applied on the server.
+        """
+        return await self._session.batch(commands)
 
     async def next_message(self) -> Message:
         """Receive a publication with its original payload bytes.

@@ -29,7 +29,18 @@ src = ["src", "tests"]
 target-version = "py315"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "SIM", "ASYNC", "RUF"]
+select = ["E", "F", "I", "UP", "B", "SIM", "ASYNC", "RUF", "C901", "PLR0912", "PLR0915"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.ruff.lint.pylint]
+max-branches = 12
+max-statements = 25
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["C901", "PLR0912", "PLR0915"]
+"benchmarks/**" = ["C901", "PLR0912", "PLR0915"]
 
 [tool.pyright]
 include = ["src"]

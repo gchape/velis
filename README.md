@@ -91,19 +91,45 @@ asyncio.run(main())
 
 The example prints `b"hello"`, `True`, `None`, `1`, and `Message(channel="news", payload=b"hi")`.
 
-`Client` raises `CommandError` when the server replies `ERR`, `ProtocolError` for invalid outgoing fields or integer ranges, and `ConnectionError` when the connection drops or an incoming wire frame is invalid. Invalid outgoing data is rejected before writing and leaves the connection usable. Closing a client wakes waiting requests and message readers.
+Individual `Client` methods raise `CommandError` when the server replies `ERR`, `ProtocolError` for invalid outgoing fields or integer ranges, and `ConnectionError` when the connection drops or an incoming wire frame is invalid. Invalid outgoing data is rejected before writing and leaves the connection usable. Closing a client wakes waiting requests and message readers.
 
 Use `asyncio.gather(client.get("a"), client.get("b"))` to pipeline independent commands on one connection. The server executes commands and sends replies in received order; the session matches each reply to the oldest unanswered request. Server pushes are routed separately. Await an earlier command when a later one depends on its result.
+
+Use `Client.batch()` to group commands into writes and collect their replies in input order:
+
+```python
+from velis.core.messages import TTL, Get, Set
+
+replies = await client.batch(
+    [Set("greeting", b"hello"), Get("greeting"), TTL("greeting")]
+)
+# [Ok(), Value(value=b"hello"), Persistent()]
+```
+
+Batch results are typed reply objects from `velis.core.messages`, including `Err` in the position of each command the server rejects. A command error does not stop later commands. All commands are encoded before anything is sent, so an invalid outgoing command rejects the whole batch without sending a prefix. Empty batches return `[]`.
+
+TCP batches use one write and drain per available in-flight window, with defaults of 64 pending requests and a 256 KiB encoded write target (`SessionLimits.max_batch_bytes`). A command larger than the byte target is written alone; the wire limits still apply. Each window's replies are collected before sending the next. Batches are not transactions: other calls may run between windows, and cancellation can leave a sent prefix applied. Late replies to a cancelled batch are discarded without shifting subsequent replies. The encoded batch and returned results occupy memory proportional to the batch size; submit bounded batches for large workloads.
 
 Use `asyncio.timeout(seconds)` around commands or `next_message()` to bound the wait. Cancelling or timing out a command leaves the connection usable and discards its eventual reply. A sent command may still execute on the server, including a write; cancellation does not undo it or guarantee that it was never applied. No request is sent when cancellation happens while waiting for an in-flight slot.
 
 Commands are encoded before waiting for pending-queue capacity, so invalid outgoing commands fail immediately even when the queue is full. Waiting calls retain their encoded frames; use bounded application submission for bulk work as well.
 
-Clients allow at most 128 in-flight requests by default. Pass `limits=SessionLimits(max_pending_requests=...)` to `Client.connect()`, `TCPSession.connect()` or `TCPSession` to change this limit; import `SessionLimits` from `velis.config`. Additional calls wait for a slot. A cancelled sent request retains its slot until its reply arrives, keeping cancellation bookkeeping bounded. If a peer stops replying, slots remain occupied until the connection closes; waiting calls can still be cancelled or timed out.
+Clients allow at most 64 in-flight requests by default, matching one server command turn. Pass `limits=SessionLimits(max_pending_requests=..., max_batch_bytes=...)` to `Client.connect()`, `TCPSession.connect()` or `TCPSession` to change these limits; import `SessionLimits` from `velis.config`. Additional calls wait for a slot. A cancelled sent request retains its slot until its reply arrives, keeping cancellation bookkeeping bounded. If a peer stops replying, slots remain occupied until the connection closes; waiting calls can still be cancelled or timed out.
 
 Clients buffer at most 1,024 unread messages and 8 MiB of channel/payload bytes by default, measured as UTF-8 channel bytes plus payload bytes after wire decoding. Set `max_pending_messages` and `max_pending_bytes` on the same `SessionLimits` object to change these positive limits. Crossing either limit closes the connection and fails pending requests. Already queued messages can be drained before `next_message()` raises `ConnectionError`. A full message buffer never blocks the reply reader.
 
 `PUBLISH` returns the number of subscriber connections that accepted the message for delivery. It does not acknowledge that their applications have read or processed it.
+
+`Client.connect()` and `TCPSession.connect()` default to `127.0.0.1:9000`, matching the listener defaults. Explicit arguments override them; environment settings are loaded only through `Config.from_env()`.
+
+Connections use asyncio and operating-system socket defaults, including
+[asyncio's `TCP_NODELAY` default](https://docs.python.org/3.15/library/asyncio-eventloop.html#asyncio.loop.create_connection).
+Velis does not tune kernel buffers or enable TCP keepalive. Bound application
+waits with `asyncio.timeout()`; shutdown has its own flush deadline.
+
+The custom `Keepalive` type, `keepalive=` arguments and `VELIS_TCP_KEEP*`
+settings have been removed. Remove these arguments from embedded callers;
+the old environment variables no longer affect configuration.
 
 ---
 
@@ -132,17 +158,33 @@ flowchart TB
     broker -->|"Subscriber.send"| connection
 ```
 
-`Client` exposes typed commands and translates server errors. Values and publication payloads remain opaque bytes. It delegates requests and push buffering to a `Session`; `TCPSession` implements that interface using asyncio streams. For a different transport, construct `Client(session)` with an object implementing `request(command)`, `next_message()` and `close()`.
+`Client` exposes typed commands and translates server errors for individual calls; `batch(commands)` returns the ordered reply objects. Values and publication payloads remain opaque bytes. It delegates requests, batches and push buffering to a `Session`; `TCPSession` implements that interface using asyncio streams. For a different transport, construct `Client(session)` with an object implementing `request(command)`, `batch(commands)`, `next_message()` and `close()`.
 
 `TCPServer` creates a `Connection` protocol for each socket. The connection buffers partial input, executes complete commands synchronously on the owning event loop and writes each batch's replies together. Expected command errors produce `ERR` without closing; malformed wire data closes the connection after a best-effort error reply.
 
 Commands, replies and publication pushes are frozen dataclasses in `velis.core.messages`. `net.wire` provides reusable field codecs and a table-driven message codec. `net.protocol` declares each tag and its fields once, frames encoded bodies, and exposes `encode_command()`, `encode_message()`, `iter_frames()` and `read_frame()`.
 
+The design uses a few patterns with specific responsibilities. The
+[design review](docs/design-review.md) explains which abstractions earn their
+place and records the library experiments, validation fixes, enforced complexity
+limits, the shutdown issue found during review, and the remaining measurement
+gaps.
+
+| Pattern | Where it applies | Purpose |
+| --- | --- | --- |
+| Composition root | `serve()` and `build_engine()` | Construct dependencies and give runtime resources one owner. |
+| Strategy | `Eviction` with LRU, LFU and S3-FIFO | Change victim selection while `Store` owns capacity and expiry invariants. |
+| Ports and adapters | `Session` and `Subscriber` interfaces, with TCP implementations | Keep client semantics and core delivery independent of transport details. |
+| Immutable value objects | Limits, commands and replies | Validate configuration once and share values without mutable global state. |
+| Table-driven codec | `COMMANDS` and `SERVER_MESSAGES` | Derive encoding, decoding and maximum body sizes from one field declaration. |
+
+Concrete classes are constructed directly. Protocols mark the boundaries with interchangeable implementations, and async context managers own cleanup. Transport flow control stays in the network layer; cache consistency stays in the store.
+
 Clients support async context management, including cleanup after caller failures:
 
 ```python
 async def read_greeting() -> bytes | None:
-    async with await Client.connect("127.0.0.1", 9000) as client:
+    async with await Client.connect() as client:
         return await client.get("greeting")
 ```
 
@@ -193,7 +235,9 @@ sequenceDiagram
 
 The connection processes at most 64 commands per callback and writes their replies in one batch. If more commands remain, it pauses reading and schedules the next batch with `call_soon()`, allowing other connections and maintenance to run. Transport write backpressure also pauses reading until `resume_writing()` resumes buffered work. Each individual command and publication remains synchronous.
 
-`TCPSession` matches replies to the oldest unanswered request and routes pushes into a separate bounded queue. Complete buffered requests are drained after a client half-closes its write side; an incomplete trailing frame closes without a reply. Closing a connection releases admission and removes all its subscriptions.
+`TCPSession` matches replies to the oldest unanswered request and routes pushes into a separate bounded queue. After acquiring capacity, it registers reply waiters and writes their frames without yielding to another task. This keeps replies aligned without holding a lock across socket backpressure; concurrent callers can wait for the same transport to drain.
+
+The server drains complete buffered requests after a client half-closes its write side; an incomplete trailing frame closes without a reply. Closing a connection releases admission and removes all its subscriptions.
 
 ### Pub-sub
 
@@ -270,7 +314,7 @@ flowchart TD
     close --> restore["Restore signal handlers"]
 ```
 
-The `serve(server_limits, ...)` async context manager in `velis.app` owns the server and maintenance task, including cleanup after startup or caller failures. It yields the running `TCPServer`. `TCPServer` also supports `async with` directly for applications that own maintenance separately; the listener closes client transports and awaits their disconnect callbacks. Pass `engine=existing_engine` to reuse application state or a store with an injected clock; the default creates a fresh engine. Shutdown releases runtime resources while an injected engine remains available to its owner. The CLI separately configures logging and installs signal handlers; embedded callers control the runtime scope themselves:
+The `serve(server_limits, ...)` async context manager in `velis.app` owns the server and maintenance task, including cleanup after startup or caller failures. It yields the running `TCPServer`. `TCPServer` also supports `async with` directly for applications that own maintenance separately; the listener closes client transports and awaits their disconnect callbacks. Client and server cleanup allow five seconds to flush buffered writes by default, then abort stalled transports; cancelling cleanup also aborts. Set `close_timeout_seconds` on `ServerLimits` or `SessionLimits` to change this positive, finite grace period. Buffered data can be discarded on abort. Pass `engine=existing_engine` to reuse application state or a store with an injected clock; the default creates a fresh engine. Shutdown releases runtime resources while an injected engine remains available to its owner. The CLI separately configures logging and installs signal handlers; embedded callers control the runtime scope themselves:
 
 ```python
 from velis.app import serve
@@ -290,13 +334,13 @@ One task starts sweeping expired keys every `VELIS_SWEEP_MS`. Each round removes
 
 `ExpiryIndex` maps each key to its exact deadline and uses a min-heap of `(deadline, key)` entries to return due keys in deadline order. Replacing or cancelling a timer updates the deadline map immediately; old heap entries remain until cleanup or compaction. Readiness checks skip stale entries, so `has_due(now)` is true only when a live timer is due. Stale entries do not consume the returned-key budget, and repeated deadlines return each key once.
 
-Deadline lookup and cancellation take expected constant time. Scheduling costs amortized O(log h), where h includes stale heap entries. Scheduling rebuilds the heap from live timers when it exceeds twice the live timer count plus 64 entries. Cancellation alone does not compact the heap; readiness checks and sweeps discard stale heads, including heads with future deadlines. The sweep limit bounds removed keys, **not stale-entry cleanup, compaction work or wall-clock duration**. Clock jumps require no traversal of elapsed milliseconds.
+Deadline lookup takes expected constant time. Scheduling costs amortized O(log h), where h includes stale heap entries; cancellation costs amortized O(1). Scheduling, cancellation and sweeps rebuild the heap from live timers when it exceeds twice the live timer count plus 64 entries, so stale metadata stays bounded as the store shrinks. Readiness checks discard only due stale heads: a future heap head proves no timer can be due. Setting an unchanged deadline is a constant-time no-op. The sweep limit bounds removed keys, **not stale-entry cleanup, occasional O(n) compaction or wall-clock duration**. Clock jumps require no traversal of elapsed milliseconds.
 
 ---
 
 ## Wire protocol
 
-By default, every request, reply and push is `u32 length + encoded body`. Integers use big-endian byte order. The length counts the encoded body, excluding the four-byte outer prefix. The default outer limit is 2 MiB, checked before waiting for the rest of the body. The u32 prefix, field layouts and limits are fixed; there is no format negotiation.
+Every request, reply and push is `u32 length + encoded body`. Integers use big-endian byte order. The length counts the encoded body, excluding the four-byte outer prefix. Each direction's body limit is derived from its codec table (`MAX_COMMAND_BODY_BYTES` and `MAX_SERVER_BODY_BYTES`) and checked before waiting for the rest of the body. The u32 prefix, field layouts and limits are fixed; there is no format negotiation.
 
 Replies arrive in command order and carry no request identifiers. `MESSAGE` pushes can appear between replies and are routed separately. Cancelling a sent request leaves its place in the pending queue until its eventual reply arrives, which the client discards. An ordinary reply without a pending request closes the connection; an unsolicited `ERR` preserves the server rejection reason.
 
@@ -318,7 +362,7 @@ The following tables describe the fixed command and server-message bodies (`COMM
 
 The default encoded body is the command name as a string followed by its fields.
 
-Request keys contain 1–512 characters and request channels contain 1–256 characters. Their UTF-8 byte lengths are capped at 2,048 and 1,024 bytes respectively, allowing four bytes per character. These byte limits are checked before UTF-8 decoding, then the character rules run on the decoded strings. The character rules also run before sending; whitespace and control characters are allowed. Reply and push channels retain the existing UTF-8 and 1 MiB field size checks.
+Request keys contain 1–512 characters and request channels contain 1–256 characters. Their UTF-8 byte lengths are capped at 2,048 and 1,024 bytes respectively, allowing four bytes per character. These byte limits are checked before UTF-8 decoding, then the character rules run on the decoded strings. The character rules also run before sending; whitespace and control characters are allowed. Reply and push channels have the same 1,024-byte limit and UTF-8 validation, without the request-channel emptiness and character-count rules.
 
 **Replies and pushes**
 
@@ -357,11 +401,11 @@ Select one of three eviction policies with `VELIS_EVICTION_POLICY` or `Store(lim
 
 S3-FIFO follows the [SOSP 2023 paper's queue and counter rules](https://www.cs.cmu.edu/~rvinayak/papers/s3-fifo-sosp-2023-fifo-queues-are-all-you-need-for-cache-eviction.pdf). New keys enter the small queue unless ghost history places them directly in the main queue. Resident accesses increment a counter capped at three without moving the key. Small-queue keys with more than one reuse are promoted, with their counters reset; others enter ghost history. Main-queue eviction reinserts keys with remaining credit, decrementing the counter each time.
 
-In Velis, queue targets follow the **current resident key count**, independently of `max_keys`: the small target is `max(1, int(residents * small_ratio))`, and the main target is `max(1, residents - small_target)`. `S3FIFO(small_ratio=0.1, ghost_ratio=0.9)` supplies the defaults. Small ratios must be between zero and one; ghost ratios must be positive. When recording a small-queue victim, ghost history is trimmed to `max(1, int(residents * ghost_ratio))` keys and retains no values. It adds Python metadata and retained key strings outside `stored_bytes`. Queues borrow unused space, and the store independently enforces both total limits. With variable-sized values or very small caches, behavior can differ from the paper's equal-sized-object model. Each policy eviction removes exactly one resident, though it may first promote several small entries.
+In Velis, queue targets follow the **current resident key count**, independently of `max_keys`: the small target is `max(1, int(residents * small_ratio))`, and the main target is `max(1, residents - small_target)`. `S3FIFO(small_ratio=0.1, ghost_ratio=0.9)` supplies the defaults. Small ratios must be between zero and one; ghost ratios must be positive. After every deletion or eviction, ghost history is trimmed to `max(1, int(residents * ghost_ratio))` keys and retains no values. It adds Python metadata and retained key strings outside `stored_bytes`. Queues borrow unused space, and the store independently enforces both total limits. With variable-sized values or very small caches, behavior can differ from the paper's equal-sized-object model. Each policy eviction removes exactly one resident, though it may first promote several small entries.
 
 Eviction may remove several entries to fit the byte budget. Every victim's value, byte accounting, timer and resident policy metadata are removed together; S3-FIFO may retain ghost history. Explicit deletion and TTL expiry forget policy history. Under capacity pressure, every policy performs one bounded expiry sweep before evicting live entries. Remaining expired entries are reclaimed by later reads or maintenance. `GET` hits update access history. Each successful `SET` starts fresh access history and clears any TTL; a new S3-FIFO entry starts with zero reuse credit. Re-inserting a key remembered in S3-FIFO ghost history enters main directly. TTL inspection and expiry changes do not count as accesses. LFU uses a min-heap ordered by frequency and last access, with lazy stale-entry removal and compaction; access and eviction cost amortized O(log n).
 
-`Store` composes `Expiring` over `Evicting` over `Memory`: the outer layer owns TTLs, the middle layer enforces capacity and tracks policy history, and the base layer stores values and accounts for bytes. Expiry removes keys through the eviction layer. Capacity eviction clears timers through a hook, and a reclamation hook sweeps expired keys before selecting live victims.
+`Store` owns its value dictionary, byte accounting, an eviction policy and `ExpiryIndex`, keeping their key sets consistent in one place. Each entry retains its size so removal does not re-encode the key; policies choose victims; the expiry index tracks deadlines. Store-driven removals forget policy history, while capacity eviction preserves whatever ghost history the policy retains. Both paths remove the value and timer together. Capacity checks reclaim expired keys before selecting live victims.
 
 `store.stats()` returns a frozen `StoreStats(hits, misses, evictions, expirations)` snapshot. Hits and misses count `GET` results only. Evictions count capacity victims; expirations count keys physically removed by lazy access, sweeps or write-time cleanup. Deleting or overwriting live keys does not increment either removal counter. Counters accumulate from construction, and taking a snapshot does not purge keys or reset them.
 
@@ -379,7 +423,7 @@ Pub-sub provides at-most-once delivery to connected subscribers on the same serv
 
 > **`max_bytes` is a data budget, not a RAM limit.** It counts UTF-8 keys and stored values only. Python objects, dictionaries, eviction queues and expiry metadata use additional memory; with many small keys, process memory can be several times the budget. Use `max_keys` as well.
 
-`velis/config.py` defines the defaults, validated `ServerLimits`, `StoreLimits`, `SessionLimits`, and the immutable `Config` snapshot. `Config.from_env()` reads `VELIS_*` variables when called. The CLI loads it once before configuring logging or opening runtime resources. `Config()` uses explicit values and defaults; embedded callers can load environment settings themselves. Existing limit imports from the store, server and session modules remain available.
+`velis/settings.py` defines the defaults and validated `ServerLimits`, `StoreLimits`, `SessionLimits`. `velis/config.py` owns the immutable `Config` snapshot and environment loading, and re-exports settings for compatibility. `Config.from_env()` reads `VELIS_*` variables when called. The CLI loads it once before configuring logging or opening runtime resources. `Config()` uses explicit values and defaults; embedded callers can load environment settings themselves. Existing limit imports from the store, server and session modules remain available.
 
 Unknown log levels, ports outside `0–65535`, nonpositive limits or sweep intervals, and non-integer numeric settings raise `ValueError` before startup. Empty values are parsed and validated; only missing variables use defaults. Parsing errors include the environment variable name. Logging setup and signals belong to `__main__.py`; `velis.app` owns the runtime lifecycle.
 
@@ -395,9 +439,14 @@ Unknown log levels, ports outside `0–65535`, nonpositive limits or sweep inter
 | `VELIS_MAX_CONNECTIONS` | `1024` | Maximum admitted TCP connections; excess connections are closed after a best-effort error. |
 | `VELIS_MAX_SUBSCRIPTIONS` | `1024` | Maximum distinct channels per subscriber connection. |
 | `VELIS_SWEEP_MS` | `100` | Milliseconds between expiry sweeps; must be positive. |
-| `VELIS_MAX_PENDING_REQUESTS` | `128` | Maximum in-flight requests per client session. |
+| `VELIS_MAX_PENDING_REQUESTS` | `64` | Maximum in-flight requests per client session. |
 | `VELIS_MAX_PENDING_MESSAGES` | `1024` | Maximum unread publications per client session. |
 | `VELIS_MAX_PENDING_BYTES` | `8388608` (8 MiB) | Maximum unread channel/payload bytes per client session. |
+| `VELIS_MAX_BATCH_BYTES` | `262144` (256 KiB) | Encoded bytes per batch write target, including framing; one larger valid command is sent alone. |
+| `VELIS_CLOSE_TIMEOUT_SECONDS` | `5` | Grace period for client/server write flushing during close; remaining transports are then aborted. Must be positive and finite; fractional seconds are accepted. |
+
+
+The defaults balance bounded work with batching. The 64-request client window matches the server's 64-command turn; a 256 KiB target bounds typical write batches while still allowing one larger valid frame. The store's 64 MiB byte budget and 100,000-key limit bound different costs. Pub-sub uses both a 1,024-message count and an 8 MiB byte budget to accommodate bursts of different message sizes. Buffer and pending-message limits apply per connection, so capacity planning must account for their aggregate memory use. These are starting points, not workload-independent optimal values; the benchmark exposes the request and byte limits for comparison.
 
 For example, start the CLI with environment overrides:
 
@@ -427,7 +476,7 @@ async def embedded() -> None:
             await client.set("greeting", b"hello")
 ```
 
-Client environment settings take effect when passing `config.session_limits` to `Client.connect()` or `TCPSession`. `Config.from_env(mapping)` supports loading an explicit mapping, including an empty mapping for defaults.
+Client environment settings take effect when passing `config.session_limits` to `Client.connect()` or `TCPSession.connect()`. Host and port must also be passed explicitly when using environment overrides. `Config.from_env(mapping)` supports loading an explicit mapping, including an empty mapping for defaults.
 
 `serve(server_limits, store_limits=..., max_subscriptions=..., sweep_interval_ms=...)` applies the supplied store and broker limits when building its default engine. All arguments have defaults. When supplying `engine=...`, configure its store and broker directly; the runtime uses that engine without applying the store or broker limits. Listener and write-buffer limits still apply. `build_engine(store_limits=..., max_subscriptions=...)` constructs a standalone engine. Embedded callers control their own logging.
 
@@ -439,7 +488,7 @@ Stored values and publication payloads are opaque bytes from end to end. Applica
 
 `velis.net.wire.Codec` derives encoding, decoding and validation from the command and server-message tables in `net.protocol`. Reusable fields read by byte offset and use precompiled integer structs. Duplicate tags and field-count mismatches fail when a codec is declared. Both directions enforce UTF-8, text and byte limits, integer ranges, truncation and complete record consumption. `velis.net.limits` owns all wire limits.
 
-`protocol.COMMANDS` and `protocol.SERVER_MESSAGES` expose body encoding and decoding. `protocol.encode_command()` and `encode_message()` add the fixed u32 body length. `iter_frames(bytearray)` yields complete bodies and end offsets, leaving partial data unconsumed; callers discard consumed bytes only after iteration ends. The client loops over `read_frame(reader)`, which reads and validates the length before waiting for the body, then decodes each body with `SERVER_MESSAGES`. Clean EOF at a frame boundary returns `None`; partial headers and bodies raise `IncompleteReadError`.
+`protocol.COMMANDS` and `protocol.SERVER_MESSAGES` expose body encoding and decoding. `protocol.encode_command()` and `encode_message()` add the fixed u32 body length. `iter_frame_spans(bytearray)` yields body offsets so the server decodes directly from its input buffer, copying only retained fields. Decoded payloads are independent immutable bytes, and no view pins the receive buffer. `iter_frames(bytearray)` remains available for callers needing owned body bytes; callers discard consumed bytes only after iteration ends. The client loops over `read_frame(reader)`, which reads and validates the length before waiting for the body, then decodes each body with `SERVER_MESSAGES`. Clean EOF at a frame boundary returns `None`; partial headers and bodies raise `IncompleteReadError`.
 
 ```python
 from velis.core.messages import Get
@@ -459,18 +508,15 @@ Golden byte fixtures cover every command, reply and push. Truncation, malformed-
 ```
 src/velis/
   __main__.py — CLI: logging, signals and startup
-  config.py — all runtime settings, defaults, validation and VELIS_* loading
+  settings.py — immutable component limits, defaults and validation
+  config.py — application configuration and VELIS_* loading
   app.py — composition root: serve() owns networking and maintenance
   errors.py — VelisError, ProtocolError, CommandError, CapacityError
   validation.py — shared positive-limit validation
   core/ — no sockets, no wire format
     messages.py — Command / Reply / Message dataclasses and TTL sentinels
     engine.py — command dispatch and replies
-    store.py — public Store composition and StoreStats snapshots
-    kv.py — KV protocol, Memory and byte accounting
-    limits.py — re-export of StoreLimits and defaults from config.py
-    evicting.py — capacity enforcement, eviction policy and layer hooks
-    expiring.py — TTL operations, TtlStatus and expiration counts
+    store.py — Store invariants, capacity, TTL operations and StoreStats snapshots
     eviction.py — EvictionPolicy and S3-FIFO (default), LRU and LFU policies
     expiry_index.py — exact deadlines and a min-heap with lazy stale-entry removal
     broker.py — subscription limits, shared Message delivery and Subscriber protocol
@@ -479,25 +525,29 @@ src/velis/
   net/
     protocol.py — message tables, fixed u32 framing and shared PushEncoder
     wire.py — reusable field codecs and table-driven tagged message codec
-    limits.py — fixed wire field, frame and text limits
+    limits.py — fixed wire field and text limits; codecs derive frame limits
     connection.py — asyncio.Protocol callbacks, ordered batches and push buffering
     server.py — TCPServer listener lifecycle and connection admission
     client.py — opaque-byte command API, error translation and scoped cleanup
     session.py — Session interface and TCP request/message lifecycle
+    pending.py — bounded FIFO reply slots, independent of transport I/O
 tests/
   helpers.py — ManualClock and RecordingSubscriber test helpers
   app/ — runtime cleanup and CLI signal ownership
   core/ — store, engine, broker and cache lifetime
   net/ — protocol, client lifecycle and TCP integration tests
 benchmarks/
-  tcp.py — repeatable localhost TCP throughput benchmark
+  bench.py — one script with tcp (localhost throughput), hot-paths (isolated
+    encoding, dispatch and TTL) and expiry (index library comparison) commands
+docs/
+  design-review.md — architecture, performance and library review
 ```
 
 ---
 
 ## Development
 
-Tests use the standard library's `unittest` and Hypothesis state machines for shrinking cache operation sequences across all eviction policies.
+Tests use the standard library's `unittest` and Hypothesis. An independent LRU model checks generated cache operation sequences; policy tests cover LRU, LFU and S3-FIFO behavior and metadata bounds.
 
 ```bash
 make check
@@ -506,11 +556,11 @@ make lint
 make fmt
 ```
 
-`make check` runs Ruff lint and formatting checks, ty, Pyright in strict mode for `src`, and tests with `python -X dev -W error`; it is also the default `make` target. `make fmt` applies supported lint fixes and formatting.
+`make check` runs Ruff lint and formatting checks (including production complexity, branch and statement limits), ty, Pyright in strict mode for `src`, and tests with `python -X dev -W error`; it is also the default `make` target. `make fmt` applies supported lint fixes and formatting.
 
 `unittest discover` only descends into directories that contain an `__init__.py`, so every `tests/` subdirectory needs one.
 
-The core is deliberately easy to test without sockets or real time: the `Store` accepts any object implementing the `Clock` protocol's `now_ms()` method, without requiring inheritance. The `ManualClock` in `tests/helpers.py` makes TTLs deterministic. Wire tests exercise golden byte fixtures, every truncation of valid bodies, and seeded mutations in both directions. Network tests bind to localhost on an automatically selected port, so the test environment must allow local sockets.
+The core is deliberately easy to test without sockets or real time: the `Store` accepts any object implementing the `Clock` protocol's `now_ms()` method, without requiring inheritance. The `ManualClock` in `tests/helpers.py` makes TTLs deterministic. Wire tests exercise golden byte fixtures, every truncation of valid bodies, and generated mutations in both directions. Network tests bind to localhost on an automatically selected port, so the test environment must allow local sockets.
 
 Prefer direct stdlib APIs and clear ownership over custom infrastructure or small performance gains.
 
@@ -518,27 +568,149 @@ Prefer direct stdlib APIs and clear ownership over custom infrastructure or smal
 
 ## Benchmarks
 
-Run the current server's TCP benchmark from the repository root:
+Measured on **2026-11-10 UTC** with CPython **3.15.2**, Linux **7.2.15**, and an
+**AMD Ryzen 5 7535HS** using asyncio's default event loop. The server runs in a
+separate process with the real Store, Broker and maintenance loop. Each sample
+uses one localhost connection; setup and warmup are excluded, and every result
+is checked. Results are machine-specific and do not establish production p95/p99
+latency, fairness across connections or pub-sub fan-out performance.
+
+### Current TCP throughput
+
+The latest run followed the composability refactor: 20,000 measured operations,
+2,000 warmups, three repeats with alternating case order, 10,000 resident keys,
+16-byte keys and 64-byte values. The session allows 64 unanswered requests and
+a 256 KiB batch byte target. SET overwrites resident keys; GET misses use a
+disjoint prefix. Each submitted window is fully answered before the next.
+
+Cells show **median operations/s (minimum–maximum)** across three samples.
+Depth 1 measures sequential calls; depth 64 measures submitted pipeline windows.
+
+| Operation | Client.batch, depth 1 | Client.batch, depth 64 | Raw, depth 1 | Raw, depth 64 |
+| --- | ---: | ---: | ---: | ---: |
+| SET overwrite | 16,085 (10,186–17,161) | 123,681 (113,165–130,391) | 21,208 (14,698–22,428) | 188,820 (182,665–193,704) |
+| GET hit | 17,025 (16,771–17,341) | 144,491 (142,358–147,602) | 22,575 (22,432–23,232) | 246,634 (223,702–246,966) |
+| GET miss | 17,719 (17,593–18,464) | 178,872 (157,290–181,150) | 24,461 (23,411–25,285) | 333,165 (301,659–338,457) |
+
+The matching run before the composability refactor had median differences of
+−2.9% to +6.2% across these cases; this does not establish a material throughput
+change. An earlier 64-byte comparison around the buffer-decoding changes, also
+including concurrent client calls, ranged from −4.5% to +3.7%.
+
+### Large-value comparison
+
+The design review's performance pass compared its starting working tree with the buffer-copying
+and encoding changes. This run preceded the latest composability refactor:
+1,000 measured operations, 100 warmups, three repeats, 32 resident keys and 1 MiB
+values. Both snapshots already contained uncommitted changes; “before” does not
+mean git HEAD. Cells show **median operations/s (minimum–maximum)**.
+
+| Operation | Mode | Submitted depth | Before | After |
+| --- | --- | ---: | ---: | ---: |
+| SET overwrite | Client.batch | 1 | 1,377 (547–1,506) | 1,761 (1,505–1,793) |
+| SET overwrite | Client.batch | 8 | 1,028 (481–1,163) | 1,534 (847–1,593) |
+| SET overwrite | Raw | 1 | 1,683 (1,455–1,897) | 2,521 (2,497–2,594) |
+| SET overwrite | Raw | 8 | 2,144 (1,750–2,147) | 3,727 (3,424–3,799) |
+| GET hit | Client.batch | 1 | 1,326 (1,070–1,977) | 1,499 (1,407–1,661) |
+| GET hit | Client.batch | 8 | 1,572 (1,560–1,970) | 1,772 (1,692–1,793) |
+| GET hit | Raw | 1 | 1,691 (1,543–2,059) | 1,957 (1,826–2,055) |
+| GET hit | Raw | 8 | 896 (891–898) | 993 (868–1,260) |
+| GET miss | Client.batch | 1 | 16,253 (15,622–19,335) | 16,894 (16,691–17,984) |
+| GET miss | Client.batch | 8 | 87,101 (83,511–98,593) | 76,285 (69,401–82,539) |
+| GET miss | Raw | 1 | 23,597 (20,154–24,727) | 24,783 (23,101–26,023) |
+| GET miss | Raw | 8 | 133,687 (89,129–140,012) | 142,655 (138,313–144,336) |
+
+Large SET medians improved about 28–49% through `Client.batch()` and 50–74% in
+raw mode. Sample variation was substantial, especially in the first samples;
+these before/after runs were not randomized or CPU-pinned. The 256 KiB client
+byte target sends each 1 MiB command alone even at submitted depth 8, while raw
+mode can send a complete window, so those modes use different write sizes.
+
+### Isolated encoding, dispatch and TTL costs
+
+The same performance-pass snapshots were measured with five fresh-state samples
+per case. Setup is outside timing; result checks are inside timing. Values are
+median operations/s. Dispatch uses a checked in-memory transport, so these rates
+must not be presented as TCP throughput.
+
+| Operation | Before | After |
+| --- | ---: | ---: |
+| encode SET 64 B | 1,005,509 | 1,167,711 |
+| encode SET 1 MiB | 9,928 | 12,221 |
+| dispatch SET 64 B, depth 32 | 298,161 | 297,150 |
+| dispatch SET 1 MiB | 1,418 | 20,967 |
+| refresh unchanged TTL | 6,908,848 | 18,438,200 |
+| refresh changing TTL | 6,708,817 | 5,919,332 |
+
+The 1 MiB dispatch case's separately traced peak allocations fell from 4,195,300
+to 3,146,965 bytes, about 25%; this excludes prebuilt inputs and is not process RSS.
+A readiness check after preparing 100,000 stale future timers fell from roughly
+96 ms to 7 µs. That defers cleanup: stale entries can still take a long turn once
+due. Unchanged TTL refreshes improved about 2.7×, while changing TTL refreshes
+became about 12% slower because of the additional deadline lookup.
+
+### Expiry-library comparison
+
+Five samples per operation, with 20,000 keys initialized outside timing.
+Rescheduling moves every deadline forward; cancellation and expiry process every
+timer. The readiness case probes after the old deadlines but before the new ones.
+Values are **median milliseconds**, so lower is better.
+
+| Operation | Current heap | SortedList 2.4.0 adapter | heapdict 1.0.1 adapter |
+| --- | ---: | ---: | ---: |
+| Reschedule 20,000 timers | 5.946 | 25.672 | 103.970 |
+| Cancel 20,000 timers | 5.276 | 14.817 | 82.986 |
+| Expire 20,000 timers | 11.294 | 13.117 | 80.813 |
+| Probe stale due timers once | 12.217 | 0.007 | 0.004 |
+
+The indexed alternatives make stale-readiness checks much faster, with slower
+updates and cancellation. These synthetic results do not establish hard latency
+bounds. The [design review](docs/design-review.md#library-evaluation) explains
+the tradeoffs and compatibility findings, and records the implementation
+decisions and [remaining risks](docs/design-review.md#remaining-limitations-and-priorities).
+
+### Reproduce the measurements
+
+All benchmarks are commands of `benchmarks/bench.py`: `tcp`, `hot-paths` and
+`expiry`. Run `uv run python benchmarks/bench.py <command> --help` for options.
+`make bench` runs the `tcp` command.
+
+Run the TCP benchmark from the repository root:
 
 ```bash
-make bench
+make bench BENCH_ARGS="--requests 20000 --warmup 2000 --repeats 3 --mode batch raw --pipeline 1 64"
 ```
 
-Pass benchmark options with `BENCH_ARGS`, for example `make bench BENCH_ARGS="--pipeline 64 1024 --repeats 3"`. Benchmark progress goes to stderr; JSON results are written to stdout.
+`batch` uses `Client.batch()`, `concurrent` uses `asyncio.gather()` on individual
+calls, and `raw` sends pre-encoded frames. Add `concurrent` to `--mode` to measure
+that API. Override `--pending-requests`, `--batch-bytes`, `--pipeline` and
+`--value-bytes` to explore other workloads.
 
-The benchmark starts the real Store, Broker and TCP runtime in a separate process, with the default S3-FIFO policy, capacity limits and 100 ms maintenance interval. One load-generator process uses one localhost connection per sample. Requests are encoded before timing; every reply is validated inside the timed interval. Connection setup and warmup are excluded.
+Use `--keys` to keep large-value workloads within the store's capacity:
 
-Each case measures 100,000 operations after 10,000 warmup operations, repeated five times with alternating case order. Keys are 16 bytes, values are 64 bytes, and the working set is 10,000 preloaded keys. SET overwrites existing keys; GET hits cycle through the resident keys, and GET misses use a disjoint key prefix. A pipeline window is sent and fully answered before the next window; depth 1 waits for each individual reply.
+```bash
+make bench BENCH_ARGS="--keys 32 --value-bytes 1048576 --requests 1000 --warmup 100 --repeats 3 --pipeline 1 8 --mode batch raw"
+```
 
-Measured on **2026-11-09** at commit `4603f35` with **CPython 3.15.2**, the standard asyncio event loop, **Linux 7.2.15 x86_64**, and an **AMD Ryzen 5 7535HS**. No CPU affinity or frequency tuning was applied. Median operations per second, rounded to the nearest 100:
+Raw mode retains pre-encoded requests and expected replies outside timing; its
+memory grows with requests times value size. Use modest counts for large values.
 
-| Operation | Pipeline 1 | Pipeline 64 | Pipeline 1,024 |
-| --- | ---: | ---: | ---: |
-| SET overwrite | 21,400 | 192,300 | 220,900 |
-| GET hit | 23,100 | 257,900 | 309,600 |
-| GET miss | 24,200 | 319,200 | 391,300 |
+Run isolated encoding, dispatch and TTL measurements:
 
-Results are machine-specific and cover cache operations without expiry or eviction pressure. The load generator uses raw wire frames, so application serialization and the `Client` API add costs beyond these measurements. Multi-connection scaling, larger values, TTL churn and pub-sub fan-out need separate workloads.
+```bash
+uv run python benchmarks/bench.py hot-paths --repeats 5
+```
+
+For the optional expiry-library experiment, install the research dependencies
+into an isolated target and run the adapters:
+
+```bash
+uv pip install --python .venv/bin/python --target /tmp/velis-library-review sortedcontainers==2.4.0 heapdict==1.0.1
+PYTHONPATH=/tmp/velis-library-review .venv/bin/python benchmarks/bench.py expiry
+```
+
+Each command prints a JSON report to stdout; `--output PATH` also saves it.
+Results are summarized here; the repository does not retain result JSON files.
 
 ---
 

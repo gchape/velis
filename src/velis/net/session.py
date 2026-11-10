@@ -2,12 +2,19 @@
 
 import asyncio
 import contextlib
+from collections.abc import Iterable
 from typing import Protocol, Self
 
-from velis.config import DEFAULT_SESSION_LIMITS, SessionLimits
 from velis.core.messages import Command, Err, Message, Reply
 from velis.errors import ProtocolError
 from velis.net import protocol
+from velis.net.pending import PendingReplies
+from velis.settings import (
+    DEFAULT_HOST,
+    DEFAULT_PORT,
+    DEFAULT_SESSION_LIMITS,
+    SessionLimits,
+)
 
 _CLOSED = "connection closed"
 
@@ -57,6 +64,10 @@ class Session(Protocol):
         """Exchange one command for its corresponding reply."""
         ...
 
+    async def batch(self, commands: Iterable[Command]) -> list[Reply]:
+        """Exchange ordered commands for replies, retaining server error replies."""
+        ...
+
     async def next_message(self) -> Message:
         """Receive a Message containing its channel and opaque payload bytes."""
         ...
@@ -85,32 +96,42 @@ class TCPSession:
     ) -> None:
         self._reader = reader
         self._writer = writer
-        self._pending: asyncio.Queue[asyncio.Future[Reply]] = asyncio.Queue(
-            limits.max_pending_requests
+        self._pending = PendingReplies(
+            limits.max_pending_requests, limits.max_batch_bytes
         )
+        self._close_timeout_seconds = limits.close_timeout_seconds
         self._messages = _MessageBuffer(
             limits.max_pending_messages, limits.max_pending_bytes
         )
         self._close_reason: str | None = None
+        self._failure: Exception | None = None
         self._reader_task = asyncio.create_task(self._receive_messages())
 
     @classmethod
     async def connect(
         cls,
-        host: str,
-        port: int,
+        host: str = DEFAULT_HOST,
+        port: int = DEFAULT_PORT,
         *,
         limits: SessionLimits = DEFAULT_SESSION_LIMITS,
     ) -> Self:
         """Open a TCP connection and start reading replies and server pushes."""
         reader, writer = await asyncio.open_connection(host, port)
-        return cls(reader, writer, limits=limits)
+        try:
+            return cls(reader, writer, limits=limits)
+        except BaseException:
+            writer.close()
+            with contextlib.suppress(OSError):
+                await writer.wait_closed()
+            raise
 
     async def _receive_messages(self) -> None:
         """Route replies and pushes until closure or a transport/protocol error.
 
         EOF and OSError close normally; protocol errors preserve their reason.
-        Unexpected reader failures remain available to close() after cleanup.
+        An unexpected failure becomes the close reason seen by waiting callers
+        and is raised once by close() after cleanup, so no task exception is
+        ever left unretrieved.
         """
         try:
             while self._close_reason is None:
@@ -122,6 +143,9 @@ class TCPSession:
             self._begin_close(str(exc))
         except asyncio.IncompleteReadError, OSError:
             pass
+        except Exception as exc:
+            self._failure = exc
+            self._begin_close(f"reader failed: {exc!r}")
         finally:
             self._begin_close()
 
@@ -137,15 +161,11 @@ class TCPSession:
 
         An unsolicited Err closes the session with the server's rejection reason.
         """
-        try:
-            waiter = self._pending.get_nowait()
-        except asyncio.QueueEmpty:
+        if not self._pending.resolve(reply):
             if isinstance(reply, Err):
                 self._begin_close(reply.message)
                 return
             raise ProtocolError("reply received without a pending request") from None
-        if not waiter.done():
-            waiter.set_result(reply)
 
     def _begin_close(self, reason: str = _CLOSED) -> None:
         """Close and wake callers, preserving queued messages for draining.
@@ -157,12 +177,7 @@ class TCPSession:
             return
         self._close_reason = reason
         self._writer.close()
-        while not self._pending.empty():
-            waiter = self._pending.get_nowait()
-            if not waiter.done():
-                waiter.set_exception(ConnectionError(reason))
-                waiter.exception()
-        self._pending.shutdown()
+        self._pending.close(reason)
         self._messages.close()
 
     async def request(self, command: Command) -> Reply:
@@ -175,20 +190,59 @@ class TCPSession:
         Other I/O failures close the session to preserve reply ordering when
         a write leaves an unsent waiter or a partial frame.
         """
-        frame = protocol.encode_command(command)
-        waiter: asyncio.Future[Reply] = asyncio.get_running_loop().create_future()
+        return (await self.batch((command,)))[0]
+
+    async def batch(self, commands: Iterable[Command]) -> list[Reply]:
+        """Validate all commands, then write and collect bounded request windows.
+
+        Each window uses one write and drain, with at most max_pending_requests
+        unanswered requests across all callers and a max_batch_bytes write target.
+        A command larger than that target is written alone. Waiter registration
+        and writing never yield, keeping reply order aligned across callers.
+        Other calls may run between windows. Err replies keep their result positions.
+
+        Encoding retains the entire batch in memory before sending. Cancellation
+        discards replies for the sent window and sends no further windows, while
+        keeping sent slots occupied until their replies arrive or the stream closes.
+        """
+        frames = tuple(protocol.encode_command(command) for command in commands)
+        replies: list[Reply] = []
+        waiters: list[asyncio.Future[Reply]] = []
+        offset = 0
         try:
-            await self._pending.put(waiter)
-            self._writer.write(frame)
-            await self._writer.drain()
-            return await waiter
+            while offset < len(frames):
+                waiters = await self._write_batch(frames, offset)
+                offset += len(waiters)
+                for waiter in waiters:
+                    replies.append(await waiter)
+            return replies
         except asyncio.QueueShutDown as exc:
             raise ConnectionError(self._close_reason) from exc
         except Exception:
             await self.close()
             raise
         finally:
-            waiter.cancel()
+            for waiter in waiters:
+                waiter.cancel()
+
+    async def _write_batch(
+        self, frames: tuple[bytes, ...], offset: int
+    ) -> list[asyncio.Future[Reply]]:
+        """Wait for capacity, then register and write one uninterrupted window.
+
+        After the first slot is acquired, there must be no await until write:
+        another caller's bytes must never overtake registered reply waiters.
+        StreamWriter.drain supports concurrent waiters once the bytes are sent.
+        """
+        waiters = await self._pending.reserve(frames, offset)
+        try:
+            self._writer.write(b"".join(frames[offset : offset + len(waiters)]))
+            await self._writer.drain()
+            return waiters
+        except BaseException:
+            for waiter in waiters:
+                waiter.cancel()
+            raise
 
     async def next_message(self) -> Message:
         """Wait for the next Message with its original payload bytes.
@@ -206,13 +260,26 @@ class TCPSession:
         """Close the stream, wake waiting callers and stop the reader task.
 
         Safe to repeat. Cancelling the caller still propagates, and an
-        unexpected reader failure is raised after cleanup completes.
-        Expected OSError failures while closing the transport are suppressed.
+        unexpected reader failure is raised by the first close() to finish
+        cleanup, then not again. Expected OSError failures while closing the
+        transport are suppressed. A stalled flush is aborted after the close
+        timeout; cancelling close also aborts before propagating cancellation.
         """
         self._begin_close()
         self._reader_task.cancel()
-        await asyncio.wait((self._reader_task,))
-        with contextlib.suppress(OSError):
-            await self._writer.wait_closed()
-        if not self._reader_task.cancelled():
-            self._reader_task.result()
+        closed = asyncio.create_task(self._writer.wait_closed())
+        try:
+            async with asyncio.timeout(self._close_timeout_seconds):
+                # wait() preserves StreamWriter's close waiter if this scope
+                # times out or is cancelled; cleanup still needs to await it.
+                await asyncio.wait((self._reader_task, closed))
+        except TimeoutError:
+            pass
+        finally:
+            if not closed.done():
+                self._writer.transport.abort()
+            with contextlib.suppress(OSError):
+                await closed
+        failure, self._failure = self._failure, None
+        if failure is not None:
+            raise failure

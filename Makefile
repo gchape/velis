@@ -10,8 +10,8 @@ test:
 	uv run python -X dev -W error -m unittest discover -s tests -v
 
 bench:
-	uv run python benchmarks/tcp.py $(BENCH_ARGS)
-
+	uv run python benchmarks/bench.py tcp $(BENCH_ARGS)
+	
 lint:
 	uv run ruff check .
 	uv run ruff format --check .

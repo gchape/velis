@@ -5,9 +5,9 @@ import logging
 from types import TracebackType
 from typing import Self
 
-from velis.config import ServerLimits
 from velis.core.engine import Engine
 from velis.net.connection import Connection
+from velis.settings import ServerLimits
 
 log = logging.getLogger(__name__)
 
@@ -58,14 +58,27 @@ class TCPServer:
             raise
 
     async def close(self) -> None:
-        """Close listener and client transports, awaiting disconnect cleanup."""
+        """Stop accepting, allow a bounded flush, then abort remaining clients.
+
+        Cancellation also aborts clients before propagating, so losing the
+        listener reference never leaves its transports without an owner.
+        """
         listener = self._listener
         if listener is None:
             return
         self._listener = None
         listener.close()
         listener.close_clients()
-        await listener.wait_closed()
+        try:
+            async with asyncio.timeout(self._limits.close_timeout_seconds):
+                await listener.wait_closed()
+        except TimeoutError:
+            listener.abort_clients()
+            await listener.wait_closed()
+        except BaseException:
+            listener.abort_clients()
+            await listener.wait_closed()
+            raise
 
     def _new_connection(self) -> Connection:
         return Connection(

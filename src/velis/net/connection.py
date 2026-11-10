@@ -14,36 +14,31 @@ from velis.net import protocol
 
 log = logging.getLogger(__name__)
 COMMANDS_PER_TURN = 64
+REPLY_BYTES_PER_TURN = 1 << 18
 
 
 @dataclass(slots=True)
 class _Batch:
-    """Completed replies and consumed input, plus any subsequent protocol error."""
+    """Completed replies and consumed input, plus any subsequent protocol error.
+
+    ``limited`` means a per-turn limit ended the batch, so more complete
+    commands may be buffered even though none was left unhandled by an error.
+    """
 
     replies: list[bytes]
     consumed: int = 0
-    handled: int = 0
+    limited: bool = False
     error: ProtocolError | None = None
-
-
-@dataclass(slots=True)
-class _FlowControl:
-    """Read readiness and write backpressure, separate from connection lifetime.
-
-    Queued batches and blocked writes pause reads. EOF prevents resuming reads,
-    while complete buffered commands can still drain once writes resume.
-    """
-
-    reading: bool = True
-    write_blocked: bool = False
-    eof: bool = False
 
 
 class Connection(asyncio.Protocol):
     """Run ordered commands and batch replies on the engine's event-loop thread.
 
-    Process at most COMMANDS_PER_TURN commands before yielding. Pending work and
-    write backpressure pause reads; transport recovery resumes buffered commands.
+    Process at most COMMANDS_PER_TURN commands, or until REPLY_BYTES_PER_TURN of
+    replies are queued, before yielding, so a client that stops reading holds
+    at most one reply budget plus one maximum-size reply in the write buffer.
+    Pending work and write backpressure pause reads; transport recovery resumes
+    buffered commands.
     EOF drains complete buffered requests before closing. A protocol error flushes
     preceding replies and a best-effort ERR, then discards subsequent commands.
     """
@@ -62,7 +57,9 @@ class Connection(asyncio.Protocol):
         self._release = release
         self._buf = bytearray()
         self._admitted = False
-        self._flow = _FlowControl()
+        self._reading = True
+        self._write_blocked = False
+        self._eof = False
         self._closing = False
         self._peer: object = None
         self._transport: asyncio.Transport | None = None
@@ -98,17 +95,17 @@ class Connection(asyncio.Protocol):
 
     def eof_received(self) -> bool:
         """Finish accepted requests after a half-close; discard an incomplete tail."""
-        self._flow.eof = True
+        self._eof = True
         if self._pump_handle is None:
             self._pump()
         return True
 
     def pause_writing(self) -> None:
-        self._flow.write_blocked = True
+        self._write_blocked = True
         self._set_reading(False)
 
     def resume_writing(self) -> None:
-        self._flow.write_blocked = False
+        self._write_blocked = False
         if self._pump_handle is None:
             self._pump()
 
@@ -116,7 +113,12 @@ class Connection(asyncio.Protocol):
         """Execute and flush one batch, then apply its next flow-control state."""
         self._pump_handle = None
         transport = self._transport
-        if transport is None or not self._can_serve(transport):
+        if (
+            transport is None
+            or self._closing
+            or transport.is_closing()
+            or self._write_blocked
+        ):
             return
         try:
             batch = self._execute_batch(transport)
@@ -124,12 +126,20 @@ class Connection(asyncio.Protocol):
             if batch.replies:
                 transport.write(b"".join(batch.replies))
         except Exception as exc:
-            self._abort_after_failure(exc)
+            if not isinstance(exc, OSError):
+                log.exception("unexpected error serving %s", self._peer)
+            self._shutdown(abort=True)
             return
-        self._schedule_next(batch)
-
-    def _can_serve(self, transport: asyncio.Transport) -> bool:
-        return not (self._closing or transport.is_closing() or self._flow.write_blocked)
+        if batch.error is not None:
+            log.warning("protocol error from %s: %s", self._peer, batch.error)
+            self._write_now(Err(str(batch.error)))
+            self._shutdown()
+        elif batch.limited and self._buf:
+            self._yield_to_loop()
+        elif self._eof:
+            self._shutdown()
+        elif not self._write_blocked:
+            self._set_reading(True)
 
     def _execute_batch(self, transport: asyncio.Transport) -> _Batch:
         """Run a bounded frame prefix, retaining replies before a protocol error."""
@@ -137,44 +147,28 @@ class Connection(asyncio.Protocol):
         encode = protocol.encode_message
         execute = self._engine.execute
         replies: list[bytes] = []
-        consumed = handled = 0
+        consumed = queued = 0
+        limited = False
         error: ProtocolError | None = None
         try:
-            for body, end in protocol.iter_frames(self._buf):
-                command = decode(body)
+            for start, end in protocol.iter_frame_spans(self._buf):
+                command = decode(self._buf, start, end)
                 try:
                     reply: Reply = execute(command, self)
                 except CommandError as exc:
                     reply = Err(str(exc))
-                replies.append(encode(reply))
+                data = encode(reply)
+                replies.append(data)
                 consumed = end
-                handled += 1
-                if handled == COMMANDS_PER_TURN or transport.is_closing():
+                queued += len(data)
+                if len(replies) == COMMANDS_PER_TURN or queued >= REPLY_BYTES_PER_TURN:
+                    limited = True
+                    break
+                if transport.is_closing():
                     break
         except ProtocolError as exc:
             error = exc
-        return _Batch(replies, consumed, handled, error)
-
-    def _abort_after_failure(self, exc: Exception) -> None:
-        """Abort failures, logging unexpected errors and keeping OSError quiet."""
-        if not isinstance(exc, OSError):
-            log.exception("unexpected error serving %s", self._peer)
-        self._shutdown(abort=True)
-
-    def _schedule_next(self, batch: _Batch) -> None:
-        if batch.error is not None:
-            self._fail_protocol(batch.error)
-        elif batch.handled == COMMANDS_PER_TURN and self._buf:
-            self._yield_to_loop()
-        elif self._flow.eof:
-            self._shutdown()
-        elif not self._flow.write_blocked:
-            self._set_reading(True)
-
-    def _fail_protocol(self, error: ProtocolError) -> None:
-        log.warning("protocol error from %s: %s", self._peer, error)
-        self._write_now(Err(str(error)))
-        self._shutdown()
+        return _Batch(replies, consumed, limited, error)
 
     def _yield_to_loop(self) -> None:
         self._set_reading(False)
@@ -184,8 +178,8 @@ class Connection(asyncio.Protocol):
         transport = self._transport
         if (
             transport is None
-            or self._flow.reading == reading
-            or self._flow.eof
+            or self._reading == reading
+            or self._eof
             or transport.is_closing()
         ):
             return
@@ -193,7 +187,7 @@ class Connection(asyncio.Protocol):
             transport.resume_reading()
         else:
             transport.pause_reading()
-        self._flow.reading = reading
+        self._reading = reading
 
     def _write_now(self, reply: Reply) -> None:
         transport = self._transport

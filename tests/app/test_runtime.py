@@ -1,267 +1,148 @@
 import asyncio
 import unittest
-from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from unittest.mock import Mock, patch
 
-from tests.helpers import ManualClock
-from velis import __main__ as cli
-from velis.app import _maintain, serve
-from velis.config import ServerLimits
+from tests.helpers import ManualClock, RecordingSubscriber
+from velis.app import _maintain, build_engine, serve
+from velis.config import ServerLimits, StoreLimits
 from velis.core.broker import Broker
 from velis.core.engine import Engine
+from velis.core.messages import Get, Set, Subscribe, Value
 from velis.core.store import Store
-from velis.net.server import TCPServer
+from velis.errors import CapacityError, CommandError
+from velis.net.client import Client
+
+
+class BuildEngineTests(unittest.TestCase):
+    def test_build_engine_applies_limits_and_creates_independent_state(self) -> None:
+        engine = build_engine(
+            store_limits=StoreLimits(max_bytes=2), max_subscriptions=1
+        )
+        subscriber = RecordingSubscriber()
+        engine.execute(Set("k", b"v"), subscriber)
+        with self.assertRaises(CapacityError):
+            engine.execute(Set("k", b"xx"), subscriber)
+        engine.execute(Subscribe("a"), subscriber)
+        with self.assertRaises(CapacityError):
+            engine.execute(Subscribe("b"), subscriber)
+        self.assertNotEqual(
+            engine.execute(Get("k"), subscriber),
+            build_engine().execute(Get("k"), subscriber),
+        )
 
 
 class RuntimeTests(unittest.IsolatedAsyncioTestCase):
-    async def test_maintenance_skips_stale_deadlines_without_extra_yields(
+    async def test_serve_owns_listener_and_closes_connected_clients(self) -> None:
+        async with serve(ServerLimits(port=0)) as server:
+            client = await Client.connect("127.0.0.1", server.port)
+            self.addAsyncCleanup(client.close)
+            await client.set("k", b"v")
+            self.assertEqual(await client.get("k"), b"v")
+        with self.assertRaisesRegex(RuntimeError, "not started"):
+            _ = server.port
+        with self.assertRaises(ConnectionError):
+            async with asyncio.timeout(5):
+                await client.next_message()
+
+    async def test_injected_engine_is_reused_with_its_original_limits(self) -> None:
+        engine = build_engine(store_limits=StoreLimits(max_bytes=2))
+        async with (
+            serve(
+                ServerLimits(port=0),
+                engine=engine,
+                store_limits=StoreLimits(max_bytes=100),
+            ) as server,
+            await Client.connect("127.0.0.1", server.port) as client,
+        ):
+            await client.set("k", b"v")
+            with self.assertRaisesRegex(CommandError, "byte limit"):
+                await client.set("k", b"xx")
+        self.assertEqual(engine.execute(Get("k"), RecordingSubscriber()), Value(b"v"))
+
+    async def test_background_maintenance_removes_expired_keys_without_reads(
         self,
     ) -> None:
         clock = ManualClock()
         store = Store(clock)
-        for index in range(1001):
-            key = str(index)
-            store.set(key, b"v")
-            store.expire(key, index + 1)
-            store.expire(key, 100000 + index)
-        store.set("due", b"v")
-        store.expire("due", 1002)
-        clock.advance(1002)
-        intervals = 0
-        snapshots: list[int] = []
+        store.set("k", b"v")
+        store.expire("k", 5)
+        engine = Engine(store, Broker())
+        swept = asyncio.Event()
+        original = engine.sweep
 
-        async def wait(delay: float) -> None:
-            nonlocal intervals
-            if delay:
-                intervals += 1
-                if intervals == 2:
-                    raise asyncio.CancelledError
-            else:
-                snapshots.append(len(store))
+        def sweep() -> int:
+            removed = original()
+            if removed:
+                swept.set()
+            return removed
 
-        with (
-            patch("velis.app.asyncio.sleep", side_effect=wait),
-            self.assertRaises(asyncio.CancelledError),
-        ):
-            await _maintain(Engine(store, Broker()), 60)
-        self.assertEqual(snapshots, [])
-        self.assertEqual(store.stats().expirations, 1)
-        self.assertEqual(len(store), 1001)
-        self.assertFalse(store.has_due_expirations)
+        with patch.object(engine, "sweep", side_effect=sweep):
+            async with serve(ServerLimits(port=0), engine=engine, sweep_interval_ms=1):
+                clock.advance(5)
+                async with asyncio.timeout(5):
+                    await swept.wait()
+                self.assertEqual(len(store), 0)
+                self.assertEqual(store.stats().expirations, 1)
 
-    async def test_maintenance_drains_due_backlog_with_yields_between_rounds(
+    async def test_maintenance_yields_between_due_batches_before_sleeping_again(
         self,
     ) -> None:
-        clock = ManualClock()
-        store = Store(clock)
-        for index in range(3001):
-            key = str(index)
-            store.set(key, b"v")
-            store.expire(key, 0)
-        snapshots: list[int] = []
-        intervals = 0
-        sleep = asyncio.sleep
+        engine = Mock(spec=Engine)
+        engine.has_due_expirations = True
+        intervals: list[float] = []
 
-        async def wait(delay: float) -> None:
-            nonlocal intervals
-            if delay:
-                intervals += 1
-                if intervals == 2:
-                    raise asyncio.CancelledError
-            else:
-                snapshots.append(len(store))
-                await sleep(0)
+        def sweep() -> None:
+            if engine.sweep.call_count == 3:
+                engine.has_due_expirations = False
 
+        async def sleep(interval: float) -> None:
+            intervals.append(interval)
+            if len(intervals) == 4:
+                raise asyncio.CancelledError
+
+        engine.sweep.side_effect = sweep
         with (
-            patch("velis.app.asyncio.sleep", side_effect=wait),
+            patch("velis.app.asyncio.sleep", side_effect=sleep),
             self.assertRaises(asyncio.CancelledError),
         ):
-            await _maintain(Engine(store, Broker()), 60)
-        self.assertEqual(snapshots, [2001, 1001, 1])
-        self.assertEqual(len(store), 0)
-        self.assertEqual(store.stored_bytes, 0)
+            await _maintain(engine, 0.1)
+        self.assertEqual(intervals, [0.1, 0, 0, 0.1])
+        self.assertEqual(engine.sweep.call_count, 3)
 
-    async def test_maintenance_leaves_future_timers_until_the_next_interval(
+    async def test_maintenance_failure_interrupts_caller_and_closes_server(
         self,
     ) -> None:
-        clock = ManualClock()
-        store = Store(clock)
-        for index in range(1000):
-            key = f"a{index}"
-            store.set(key, b"v")
-            store.expire(key, 65)
-        store.set("z", b"due")
-        store.expire("z", 64)
-        clock.advance(64)
-        intervals = 0
-        yields = 0
-
-        async def wait(delay: float) -> None:
-            nonlocal intervals, yields
-            if delay:
-                intervals += 1
-                if intervals == 2:
-                    raise asyncio.CancelledError
-            else:
-                yields += 1
-
+        engine = build_engine()
+        error = RuntimeError("sweep failed")
         with (
-            patch("velis.app.asyncio.sleep", side_effect=wait),
-            self.assertRaises(asyncio.CancelledError),
+            patch.object(engine, "sweep", side_effect=error),
+            self.assertRaises(ExceptionGroup) as caught,
         ):
-            await _maintain(Engine(store, Broker()), 60)
-        self.assertEqual(yields, 0)
-        self.assertEqual(len(store), 1000)
-        self.assertFalse(store.has_due_expirations)
+            async with serve(
+                ServerLimits(port=0), engine=engine, sweep_interval_ms=1
+            ) as server:
+                async with asyncio.timeout(5):
+                    await asyncio.Future()
+        self.assertIn(error, caught.exception.exceptions)
+        with self.assertRaisesRegex(RuntimeError, "not started"):
+            _ = server.port
 
-    def setUp(self) -> None:
-        self.server_limits = ServerLimits("127.0.0.1", 0)
-        self.server = MagicMock(spec=TCPServer)
-        self.server.start = AsyncMock()
-        self.server.close = AsyncMock()
+    async def test_caller_failure_closes_runtime_and_propagates(self) -> None:
+        error = ValueError("caller failed")
+        with self.assertRaises(ExceptionGroup) as caught:
+            async with serve(ServerLimits(port=0)) as server:
+                raise error
+        self.assertIn(error, caught.exception.exceptions)
+        with self.assertRaises(RuntimeError):
+            _ = server.port
 
-        async def enter():
-            return await TCPServer.__aenter__(self.server)
-
-        async def leave(*args):
-            await TCPServer.__aexit__(self.server, *args)
-
-        self.server.__aenter__.side_effect = enter
-        self.server.__aexit__.side_effect = leave
-        self.patch_server = patch("velis.app.TCPServer", return_value=self.server)
-        self.patch_server.start()
-        self.addCleanup(self.patch_server.stop)
-
-    async def test_runtime_stops_maintenance_before_closing_server(self) -> None:
-        started, stopped = asyncio.Event(), asyncio.Event()
-
-        async def maintain(engine, interval):
-            started.set()
-            try:
-                await asyncio.Event().wait()
-            finally:
-                stopped.set()
-
-        async def close():
-            self.assertTrue(stopped.is_set())
-
-        self.server.close.side_effect = close
-        with patch("velis.app._maintain", side_effect=maintain):
-            async with asyncio.timeout(1):
-                async with serve(self.server_limits) as server:
-                    self.assertIs(server, self.server)
-                    await started.wait()
-                    self.server.start.assert_awaited_once()
-            self.server.close.assert_awaited_once()
-
-    async def test_startup_failure_does_not_start_maintenance(self) -> None:
-        self.server.start.side_effect = OSError("bind failed")
-        with patch("velis.app._maintain") as maintain:
-            with self.assertRaisesRegex(OSError, "bind failed"):
-                async with serve(self.server_limits):
-                    self.fail("runtime should not start")
-            maintain.assert_not_called()
-        self.server.close.assert_not_awaited()
-
-    async def test_invalid_sweep_interval_opens_no_runtime_resources(self) -> None:
+    async def test_invalid_sweep_interval_fails_before_opening_resources(self) -> None:
         for interval in (0, -1):
             with (
                 self.subTest(interval=interval),
-                self.assertRaisesRegex(ValueError, "sweep_interval_ms"),
+                patch("velis.app.TCPServer") as server,
             ):
-                async with serve(self.server_limits, sweep_interval_ms=interval):
-                    self.fail("invalid intervals must fail before entry")
-        self.server.start.assert_not_awaited()
-
-    async def test_normal_shutdown_preserves_callers_cancellation_state(self) -> None:
-        caller = asyncio.current_task()
-        assert caller is not None
-        cancelling = caller.cancelling()
-        for _ in range(2):
-            async with serve(self.server_limits):
-                await asyncio.sleep(0)
-            await asyncio.sleep(0)
-            self.assertEqual(caller.cancelling(), cancelling)
-
-    async def test_caller_failure_still_closes_server(self) -> None:
-        failure = RuntimeError("caller failed")
-        with self.assertRaises(ExceptionGroup) as raised:
-            async with serve(self.server_limits):
-                raise failure
-        self.assertEqual(raised.exception.exceptions, (failure,))
-        self.server.close.assert_awaited_once()
-
-    async def test_maintenance_failure_interrupts_caller_and_closes(self) -> None:
-        """A real sweep failure reaches the caller while the runtime is active."""
-        failure = RuntimeError("maintenance failed")
-        engine = Mock(spec=Engine)
-        engine.sweep.side_effect = failure
-        interrupted = asyncio.Event()
-        async with asyncio.timeout(1):
-            with self.assertRaises(ExceptionGroup) as raised:
-                async with serve(
-                    self.server_limits, engine=engine, sweep_interval_ms=1
-                ):
-                    try:
-                        await asyncio.Event().wait()
-                    finally:
-                        interrupted.set()
-        self.assertEqual(raised.exception.exceptions, (failure,))
-        self.assertTrue(interrupted.is_set())
-        engine.sweep.assert_called_once()
-        self.server.close.assert_awaited_once()
-
-    async def test_cancellation_stops_workers_and_closes_server(self) -> None:
-        """External cancellation retains its meaning and awaits worker cleanup."""
-        started, stopped = asyncio.Event(), asyncio.Event()
-
-        async def maintain(engine, interval):
-            started.set()
-            try:
-                await asyncio.Event().wait()
-            finally:
-                stopped.set()
-
-        async def run():
-            async with serve(self.server_limits):
-                await asyncio.Event().wait()
-
-        with patch("velis.app._maintain", side_effect=maintain):
-            async with asyncio.timeout(1):
-                task = asyncio.create_task(run())
-                try:
-                    await started.wait()
-                finally:
-                    task.cancel()
-                    with self.assertRaises(asyncio.CancelledError):
-                        await task
-        self.assertTrue(stopped.is_set())
-        self.server.close.assert_awaited_once()
-
-    async def test_signal_setup_failure_restores_handlers_before_startup(self) -> None:
-        loop = asyncio.get_running_loop()
-        with (
-            patch.object(
-                loop, "add_signal_handler", side_effect=[None, RuntimeError("signal")]
-            ),
-            patch.object(loop, "remove_signal_handler") as remove,
-        ):
-            with self.assertRaisesRegex(RuntimeError, "signal"):
-                await cli._main(serve(self.server_limits))
-            remove.assert_called_once()
-            self.server.start.assert_not_awaited()
-
-    async def test_cli_signal_stops_runtime_and_restores_handlers(self) -> None:
-        loop = asyncio.get_running_loop()
-
-        def signal_received(sig, callback):
-            callback()
-
-        with (
-            patch.object(loop, "add_signal_handler", side_effect=signal_received),
-            patch.object(loop, "remove_signal_handler") as remove,
-        ):
-            async with asyncio.timeout(1):
-                await cli._main(serve(self.server_limits))
-        self.server.start.assert_awaited_once()
-        self.server.close.assert_awaited_once()
-        self.assertEqual(remove.call_count, 2)
+                with self.assertRaisesRegex(ValueError, "sweep_interval_ms"):
+                    async with serve(sweep_interval_ms=interval):
+                        self.fail("invalid runtime started")
+                server.assert_not_called()

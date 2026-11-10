@@ -6,6 +6,8 @@ from heapq import heapify, heappop, heappush
 from itertools import count
 from typing import Protocol, assert_never
 
+from velis.validation import require_positive
+
 _EMPTY = "cannot evict from an empty store"
 
 
@@ -16,8 +18,8 @@ class Eviction(Protocol):
     removed for its own reasons. ``evict`` picks one victim and forgets it too,
     although a policy may keep ghost history about what it just evicted.
     Length and membership describe resident keys only, excluding ghosts.
-    Evicting from an empty policy raises AssertionError; discarding a missing
-    key is harmless.
+    Callers must not evict from an empty policy (a checked precondition, not
+    an API); discarding a missing key is harmless.
     """
 
     def __len__(self) -> int: ...
@@ -59,7 +61,7 @@ class LFU:
     pushes a new entry and leaves the old one behind; an entry is live only if
     it matches the key's current record, and stale ones are skipped during
     eviction. The heap is rebuilt once stale entries outnumber live ones, so
-    memory stays O(n). Access is O(log n), eviction amortized O(log n).
+    memory stays O(n). Access and eviction are amortized O(log n).
     """
 
     def __init__(self) -> None:
@@ -90,6 +92,7 @@ class LFU:
             frequency, tick, key = heappop(self._heap)
             if self._records.get(key) == (frequency, tick):
                 del self._records[key]
+                self._compact()
                 return key
 
     def _compact(self) -> None:
@@ -109,7 +112,8 @@ class S3FIFO:
     Queue targets are ratios of the resident key count, not fixed sizes, so
     they stay calibrated whether Store evicts on key count or on bytes: small
     gets ``small_ratio`` of resident keys (at least one), main gets the rest.
-    Ghost history holds at most ``ghost_ratio`` of the resident count.
+    Ghost history is bounded by ``ghost_ratio`` of the resident count, with
+    room for at least one remembered key.
     Hits increment counters capped at three without changing queue order. Two
     hits after insertion qualify a small-queue key for promotion. A ghost hit
     enters main directly; explicit deletion forgets both residency and ghost
@@ -120,8 +124,7 @@ class S3FIFO:
     def __init__(self, *, small_ratio: float = 0.1, ghost_ratio: float = 0.9) -> None:
         if not 0 < small_ratio < 1:
             raise ValueError(f"small_ratio must be in (0, 1), got {small_ratio}")
-        if ghost_ratio <= 0:
-            raise ValueError(f"ghost_ratio must be positive, got {ghost_ratio}")
+        require_positive(ghost_ratio=ghost_ratio)
         self._small_ratio = small_ratio
         self._ghost_ratio = ghost_ratio
         self._small: OrderedDict[str, int] = OrderedDict()
@@ -164,12 +167,16 @@ class S3FIFO:
     def discard(self, key: str) -> None:
         for queue in (self._small, self._main, self._ghost):
             queue.pop(key, None)
+        self._trim_ghost()
 
     def evict(self) -> str:
         assert self._small or self._main, _EMPTY
         if self._main and len(self._small) < self._small_limit:
-            return self._evict_main()
-        return self._evict_small()
+            victim = self._evict_main()
+        else:
+            victim = self._evict_small()
+        self._trim_ghost()
+        return victim
 
     def _evict_small(self) -> str:
         """Promote reused keys and evict one victim from small or main.
@@ -180,7 +187,7 @@ class S3FIFO:
         while self._small:
             key, hits = self._small.popitem(last=False)
             if hits < _PROMOTE_HITS:
-                self._remember(key)
+                self._ghost[key] = None
                 return key
             self._main[key] = 0
             if len(self._main) >= self._main_limit:
@@ -195,10 +202,12 @@ class S3FIFO:
                 return key
             self._main[key] = hits - 1
 
-    def _remember(self, key: str) -> None:
-        """Record an evicted key in the bounded ghost history."""
-        self._ghost[key] = None
-        while len(self._ghost) > self._ghost_limit:
+    def _trim_ghost(self) -> None:
+        """Bound history by current residency after either kind of removal."""
+        if not self._ghost:
+            return
+        limit = self._ghost_limit
+        while len(self._ghost) > limit:
             self._ghost.popitem(last=False)
 
 

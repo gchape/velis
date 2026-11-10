@@ -1,229 +1,153 @@
 import unittest
-from typing import cast
 
-from tests.helpers import ManualClock
-from velis.core.eviction import LFU, EvictionPolicy
-from velis.core.store import Store, StoreLimits, TtlStatus
-from velis.errors import CapacityError
+from hypothesis import given
+from hypothesis import strategies as st
+
+from velis.core.eviction import LFU, LRU, S3FIFO, EvictionPolicy
 
 
 class EvictionTests(unittest.TestCase):
-    def test_eviction_removes_exactly_one_resident_and_membership_ignores_ghosts(
-        self,
-    ) -> None:
-        for kind in EvictionPolicy:
-            with self.subTest(policy=kind):
-                policy = kind.create()
-                resident = {f"key-{i}" for i in range(10)}
-                for key in sorted(resident):
-                    for _ in range(3):
-                        policy.access(key)
-                self.assertEqual(len(policy), len(resident))
-                while resident:
-                    before = len(policy)
-                    victim = policy.evict()
-                    self.assertIn(victim, resident)
-                    resident.remove(victim)
-                    self.assertNotIn(victim, policy)
-                    self.assertEqual(len(policy), before - 1)
-                    self.assertTrue(all(key in policy for key in resident))
-                self.assertNotIn(None, policy)
-                policy.access("cold")
-                self.assertEqual(policy.evict(), "cold")
-                self.assertEqual(len(policy), 0)
-                self.assertNotIn("cold", policy)
-                policy.access("cold")
-                self.assertEqual(len(policy), 1)
-                policy.discard("cold")
-                policy.discard("missing")
-                policy.access("again")
-                policy.access("again")
-                self.assertEqual(len(policy), 1)
-                policy.discard("again")
-                self.assertEqual(len(policy), 0)
+    def test_policy_factories_create_independent_instances(self) -> None:
+        for policy, cls in (
+            (EvictionPolicy.LRU, LRU),
+            (EvictionPolicy.LFU, LFU),
+            (EvictionPolicy.S3_FIFO, S3FIFO),
+        ):
+            with self.subTest(policy=policy):
+                first, second = policy.create(), policy.create()
+                self.assertIsInstance(first, cls)
+                first.access("a")
+                self.assertNotIn("a", second)
 
-    def test_store_evicts_a_whole_multicharacter_key(self) -> None:
-        for kind in EvictionPolicy:
-            with self.subTest(policy=kind):
-                store = Store(limits=StoreLimits(max_keys=1, eviction_policy=kind))
-                store.set("old-key", b"old")
-                store.set("new-key", b"new")
-                self.assertIsNone(store.get("old-key"))
-                self.assertEqual(store.get("new-key"), b"new")
-                self.assertEqual(len(store), 1)
-                self.assertEqual(len(store._inner._inner._policy), 1)
+    def test_discard_is_idempotent_and_reinsertion_is_resident(self) -> None:
+        for policy in EvictionPolicy:
+            with self.subTest(policy=policy):
+                eviction = policy.create()
+                eviction.access("a")
+                eviction.access("a")
+                self.assertEqual(len(eviction), 1)
+                eviction.discard("a")
+                eviction.discard("a")
+                eviction.discard("missing")
+                self.assertNotIn("a", eviction)
+                self.assertEqual(len(eviction), 0)
+                eviction.access("a")
+                self.assertEqual(eviction.evict(), "a")
+                self.assertEqual(len(eviction), 0)
+                with self.assertRaisesRegex(AssertionError, "empty store"):
+                    eviction.evict()
 
-    def test_lfu_handles_frequency_gaps_after_deletion_and_reinsertion(self) -> None:
+    def test_lru_access_moves_key_to_newest_end(self) -> None:
+        policy = LRU()
+        for key in "abca":
+            policy.access(key)
+        self.assertEqual([policy.evict() for _ in range(3)], ["b", "c", "a"])
+
+    def test_lfu_frequency_then_oldest_access_breaks_ties(self) -> None:
         policy = LFU()
-        for key, accesses in (("low", 1), ("middle", 10), ("high", 30)):
-            for _ in range(accesses):
-                policy.access(key)
-        self.assertEqual(policy.evict(), "low")
-        self.assertEqual(policy.evict(), "middle")
-        policy.access("new")
-        self.assertEqual(policy.evict(), "new")
-        self.assertEqual(policy.evict(), "high")
-        with self.assertRaises(AssertionError):
+        for key in "abcacb":
+            policy.access(key)
+        self.assertEqual([policy.evict() for _ in range(3)], ["a", "c", "b"])
+
+    def test_lfu_compaction_and_reinsertion_ignore_stale_records(self) -> None:
+        policy = LFU()
+        policy.access("hot")
+        policy.access("cold")
+        for _ in range(1000):
+            policy.access("hot")
+        policy.discard("cold")
+        policy.access("cold")
+        self.assertEqual(policy.evict(), "cold")
+        self.assertEqual(policy.evict(), "hot")
+
+    def test_lfu_eviction_reclaims_stale_metadata_when_residency_shrinks(self) -> None:
+        policy = LFU()
+        for i in range(1000):
+            policy.access(str(i))
+        for _ in range(500):
+            policy.access("0")
+        while len(policy) > 1:
             policy.evict()
-        policy.access("again")
-        self.assertEqual(policy.evict(), "again")
+        self.assertLessEqual(len(policy._heap), 2)
 
-    def test_lru_keeps_the_recently_accessed_key(self) -> None:
-        store = Store(
-            limits=StoreLimits(max_keys=2, eviction_policy=EvictionPolicy.LRU)
-        )
-        store.set("a", b"first")
-        store.set("b", b"second")
-        self.assertEqual(store.get("a"), b"first")
-        store.set("c", b"third")
-        self.assertIsNone(store.get("b"))
-        self.assertEqual(store.get("a"), b"first")
-        self.assertEqual(store.get("c"), b"third")
+    def test_s3_fifo_deletion_trims_old_ghosts_to_current_residency(self) -> None:
+        policy = S3FIFO()
+        for i in range(1000):
+            policy.access(str(i))
+        for _ in range(400):
+            policy.evict()
+        for i in range(400, 999):
+            policy.discard(str(i))
+        self.assertEqual(len(policy), 1)
+        self.assertLessEqual(len(policy._ghost), 1)
+        self.assertIn("399", policy._ghost)
 
-    def test_lru_and_lfu_keep_accessed_key(self) -> None:
-        for policy in (EvictionPolicy.LRU, EvictionPolicy.LFU):
-            with self.subTest(policy=policy):
-                store = Store(limits=StoreLimits(max_keys=2, eviction_policy=policy))
-                store.set("a", b"a")
-                store.set("b", b"b")
-                store.get("a")
-                store.set("c", b"c")
-                self.assertIsNone(store.get("b"))
-                self.assertEqual(store.get("a"), b"a")
-                self.assertEqual(store.get("c"), b"c")
+    def test_s3_fifo_filters_one_hit_keys_without_reordering(self) -> None:
+        policy = S3FIFO()
+        for key in "abc":
+            policy.access(key)
+        policy.access("a")
+        self.assertEqual(policy.evict(), "a")
+        self.assertNotIn("a", policy)
+        self.assertEqual(len(policy), 2)
 
-    def test_lfu_breaks_frequency_ties_by_least_recent_access(self) -> None:
-        store = Store(
-            limits=StoreLimits(max_keys=2, eviction_policy=EvictionPolicy.LFU)
-        )
-        store.set("a", b"a")
-        store.set("b", b"b")
-        store.get("a")
-        store.get("b")
-        store.set("c", b"c")
-        self.assertIsNone(store.get("a"))
-        self.assertEqual(store.get("b"), b"b")
-        self.assertEqual(store.get("c"), b"c")
+    def test_s3_fifo_promotes_reused_keys_and_evicts_exactly_one(self) -> None:
+        policy = S3FIFO()
+        for key in "abcaa":
+            policy.access(key)
+        self.assertEqual(policy.evict(), "b")
+        self.assertEqual(len(policy), 2)
+        self.assertIn("a", policy)
+        self.assertEqual(policy.evict(), "c")
+        for _ in range(100):
+            policy.access("a")
+        self.assertEqual(policy.evict(), "a")
 
-    def test_lfu_replacement_restarts_access_history(self) -> None:
-        store = Store(
-            limits=StoreLimits(max_keys=2, eviction_policy=EvictionPolicy.LFU)
-        )
-        store.set("a", b"a")
-        store.set("b", b"b")
-        store.get("b")
-        store.get("a")
-        store.get("a")
-        store.set("a", b"updated")
-        store.set("c", b"c")
-        self.assertIsNone(store.get("a"))
-        self.assertEqual(store.get("b"), b"b")
-        self.assertEqual(store.get("c"), b"c")
+    def test_s3_fifo_ghost_hit_enters_main_but_discard_forgets_history(self) -> None:
+        for forget in (False, True):
+            with self.subTest(forget=forget):
+                policy = S3FIFO()
+                for key in "abc":
+                    policy.access(key)
+                self.assertEqual(policy.evict(), "a")
+                if forget:
+                    policy.discard("a")
+                policy.access("a")
+                self.assertEqual(policy.evict(), "b")
+                self.assertEqual(policy.evict(), "c")
+                policy.access("d")
+                self.assertEqual(policy.evict(), "a" if forget else "d")
 
-    def test_ttl_operations_do_not_promote_eviction_candidates(self) -> None:
-        for policy in EvictionPolicy:
-            with self.subTest(policy=policy):
-                store = Store(limits=StoreLimits(max_keys=2, eviction_policy=policy))
-                store.set("a", b"a")
-                store.set("b", b"b")
-                store.expire("a", 10_000)
-                store.ttl("a")
-                store.persist("a")
-                store.set("c", b"c")
-                self.assertIsNone(store.get("a"))
+    def test_s3_fifo_rejects_invalid_ratios(self) -> None:
+        for kwargs in (
+            {"small_ratio": 0},
+            {"small_ratio": 1},
+            {"small_ratio": -0.1},
+            {"ghost_ratio": 0},
+            {"ghost_ratio": -1},
+            {"ghost_ratio": float("nan")},
+            {"ghost_ratio": float("inf")},
+            {"small_ratio": float("nan")},
+            {"small_ratio": float("inf")},
+        ):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                S3FIFO(**kwargs)
 
-    def test_deleting_eviction_candidate_and_all_entries_allows_reuse(self) -> None:
-        for removal in ("delete", "expire"):
-            with self.subTest(removal=removal):
-                clock = ManualClock()
-                store = Store(
-                    clock,
-                    limits=StoreLimits(max_keys=3, eviction_policy=EvictionPolicy.LFU),
-                )
-                for key in ("a", "b", "c", "d"):
-                    store.set(key, b"x")
-                if removal == "delete":
-                    store.delete("b")
-                else:
-                    store.expire("b", 0)
-                    store.sweep()
-                store.set("e", b"x")
-                store.set("f", b"x")
-                for key in ("d", "e", "f"):
-                    self.assertEqual(store.get(key), b"x")
-                self.assertEqual(len(store), 3)
-                for key in ("d", "e", "f"):
-                    store.delete(key)
-                store.set("again", b"ok")
-                self.assertEqual(store.get("again"), b"ok")
-
-    def test_all_policies_handle_byte_limits_and_replacement_victims(self) -> None:
-        for policy in EvictionPolicy:
-            with self.subTest(policy=policy):
-                store = Store(
-                    limits=StoreLimits(max_keys=3, max_bytes=8, eviction_policy=policy)
-                )
-                store.set("a", b"1")
-                store.set("b", b"22")
-                store.set("a", b"1234567")
-                self.assertEqual(store.get("a"), b"1234567")
-                self.assertEqual(store.stored_bytes, 8)
-                self.assertEqual(len(store), 1)
-                store.set("a", b"")
-                self.assertEqual(store.stored_bytes, 1)
-                store.set("é", b"12345")
-                self.assertEqual(store.stored_bytes, 8)
-
-    def test_oversized_write_preserves_values_ttls_and_policy(self) -> None:
-        for policy in EvictionPolicy:
-            with self.subTest(policy=policy):
-                clock = ManualClock()
-                store = Store(
-                    clock,
-                    limits=StoreLimits(max_keys=2, max_bytes=4, eviction_policy=policy),
-                )
-                store.set("a", b"1")
-                store.set("b", b"2")
-                store.expire("a", 100)
-                for key in ("a", "new"):
-                    with self.assertRaises(CapacityError):
-                        store.set(key, b"oversized")
-                self.assertEqual(store.ttl("a"), 100)
-                self.assertEqual(store.stored_bytes, 4)
-                self.assertEqual(store.get("a"), b"1")
-                self.assertEqual(store.get("b"), b"2")
-
-    def test_eviction_cancels_ttl_before_a_key_is_reinserted(
-        self,
+    @given(
+        st.sampled_from(tuple(EvictionPolicy)),
+        st.lists(st.sampled_from("abcdefgh"), max_size=200),
+    )
+    def test_eviction_returns_each_resident_once(
+        self, policy: EvictionPolicy, accesses: list[str]
     ) -> None:
-        for policy in EvictionPolicy:
-            with self.subTest(policy=policy):
-                clock = ManualClock()
-                store = Store(
-                    clock, limits=StoreLimits(max_keys=1, eviction_policy=policy)
-                )
-                store.set("a", b"old")
-                store.expire("a", 5)
-                store.set("b", b"other")
-                self.assertIs(store.ttl("a"), TtlStatus.MISSING)
-                store.set("a", b"new")
-                clock.advance(5)
-                store.sweep()
-                self.assertEqual(store.get("a"), b"new")
-                self.assertIs(store.ttl("a"), TtlStatus.PERSISTENT)
-
-    def test_expired_entries_are_reclaimed_before_live_eviction(self) -> None:
-        clock = ManualClock()
-        store = Store(
-            clock, limits=StoreLimits(max_keys=2, eviction_policy=EvictionPolicy.LRU)
-        )
-        store.set("live", b"v")
-        store.set("expired", b"v")
-        store.expire("expired", 0)
-        store.set("new", b"v")
-        self.assertEqual(store.get("live"), b"v")
-        self.assertIsNone(store.get("expired"))
-
-    def test_unknown_policy_is_rejected(self) -> None:
-        with self.assertRaisesRegex(ValueError, "unknown"):
-            Store(limits=StoreLimits(eviction_policy=cast(EvictionPolicy, "unknown")))
+        eviction = policy.create()
+        for key in accesses:
+            eviction.access(key)
+        residents = set(accesses)
+        self.assertEqual(len(eviction), len(residents))
+        while residents:
+            victim = eviction.evict()
+            self.assertIn(victim, residents)
+            residents.remove(victim)
+            self.assertNotIn(victim, eviction)
+            self.assertEqual(len(eviction), len(residents))

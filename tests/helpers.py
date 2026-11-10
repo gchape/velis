@@ -1,28 +1,24 @@
+from dataclasses import dataclass, field
+
 from velis.core.messages import Message
 
 
+@dataclass
 class ManualClock:
-    """Test clock that advances without waiting for real time."""
-
-    def __init__(self, now_ms: int = 0) -> None:
-        self._now = now_ms
+    time_ms: int = 0
 
     def now_ms(self) -> int:
-        return self._now
+        return self.time_ms
 
     def advance(self, ms: int) -> None:
-        self._now += ms
+        self.time_ms += ms
 
 
+@dataclass(eq=False)
 class RecordingSubscriber:
-    """Record accepted messages and simulate a disconnected subscriber."""
-
-    def __init__(self) -> None:
-        self.alive = True
-        self.messages: list[tuple[str, bytes]] = []
+    accepting: bool = True
+    messages: list[Message] = field(default_factory=list)
 
     def send(self, message: Message) -> bool:
-        if not self.alive:
-            return False
-        self.messages.append((message.channel, message.payload))
-        return True
+        self.messages.append(message)
+        return self.accepting

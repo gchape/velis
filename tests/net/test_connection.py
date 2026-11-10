@@ -1,134 +1,169 @@
 import asyncio
+import struct
 import unittest
 from unittest.mock import Mock, patch
 
-from tests.helpers import RecordingSubscriber
-from tests.net.helpers import decode_message_frame, make_connection
-from velis.core.broker import Broker, Subscriber
-from velis.core.messages import Message
+from tests.net.helpers import RecordingTransport
+from velis.app import build_engine
+from velis.core.messages import Err, Get, Message, Nil, Ok, Set, Value
 from velis.errors import ProtocolError
 from velis.net import protocol
-from velis.net.limits import MAX_FIELD_BYTES
+from velis.net.connection import COMMANDS_PER_TURN, REPLY_BYTES_PER_TURN, Connection
 
 
-class PushEncoderTests(unittest.TestCase):
-    def test_cache_uses_message_identity_and_retains_empty_encodings(self) -> None:
-        first, second = Message("news", b"hello"), Message("news", b"hello")
-        encode = Mock(side_effect=[b"", b"second"])
-        encoder = protocol.PushEncoder(encode)
-        for _ in range(2):
-            self.assertEqual(encoder(first), b"")
-        for _ in range(2):
-            self.assertEqual(encoder(second), b"second")
-        self.assertEqual(encode.call_count, 2)
-        encode.assert_called_with(second)
-
-    def test_new_message_replaces_the_previous_cached_result(self) -> None:
-        first, second = Message("news", b"first"), Message("news", b"second")
-        encode = Mock(side_effect=[b"first", b"second", b"first again"])
-        encoder = protocol.PushEncoder(encode)
-        self.assertEqual(encoder(first), b"first")
-        self.assertEqual(encoder(second), b"second")
-        self.assertEqual(encoder(first), b"first again")
-        self.assertEqual(encode.call_count, 3)
-
-    def test_failed_encoding_preserves_the_previous_cached_result(self) -> None:
-        first, second = Message("news", b"first"), Message("news", b"second")
-        encode = Mock(side_effect=[b"first", ProtocolError("invalid"), b"second"])
-        encoder = protocol.PushEncoder(encode)
-        self.assertEqual(encoder(first), b"first")
-        with self.assertRaises(ProtocolError):
-            encoder(second)
-        self.assertEqual(encoder(first), b"first")
-        self.assertEqual(encoder(second), b"second")
-        self.assertEqual(encoder(second), b"second")
-        self.assertEqual(encode.call_count, 3)
-
-
-class ConnectionDeliveryTests(unittest.TestCase):
+class ConnectionTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
-        self.transport = Mock(spec=asyncio.Transport)
-        self.transport.is_closing.return_value = False
-        self.transport.get_write_buffer_size.return_value = 0
-        self.connection = make_connection(self.transport)
-
-    def test_nested_publication_keeps_each_message_intact(self) -> None:
-        broker = Broker()
-
-        def publish_another(message: Message) -> bool:
-            if message.payload == b"outer":
-                self.assertEqual(broker.publish("news", b"inner"), 2)
-            return True
-
-        subscriber = Mock(spec=Subscriber)
-        subscriber.send.side_effect = publish_another
-        for peer in (self.connection, subscriber):
-            broker.subscribe("news", peer)
-        self.assertEqual(broker.publish("news", b"outer"), 2)
-        messages = [
-            decode_message_frame(call.args[0])
-            for call in self.transport.write.call_args_list
-        ]
-        self.assertCountEqual(
-            messages, [Message("news", b"outer"), Message("news", b"inner")]
+        self.engine = build_engine()
+        self.transport = RecordingTransport()
+        self.release = Mock()
+        self.connection = Connection(
+            self.engine, 16, admit=lambda: True, release=self.release
         )
+        self.connection.connection_made(self.transport)
+        self.addCleanup(self.connection.connection_lost, None)
 
-    def test_publish_encodes_once_for_all_subscribers(self) -> None:
-        codec = Mock(wraps=protocol.SERVER_MESSAGES)
-        peers = tuple(make_connection(self.transport) for _ in range(3))
-        broker = Broker()
-        for peer in peers:
-            broker.subscribe("news", peer)
-        with patch.object(protocol, "SERVER_MESSAGES", codec):
-            for expected_calls in (1, 2):
-                self.transport.write.reset_mock()
-                self.assertEqual(broker.publish("news", b"hello"), 3)
-                self.assertEqual(codec.encode.call_count, expected_calls)
-                encoded = [call.args[0] for call in self.transport.write.call_args_list]
-                self.assertEqual(len(encoded), 3)
-                self.assertTrue(all(data is encoded[0] for data in encoded))
-                self.assertEqual(
-                    decode_message_frame(encoded[0]), Message("news", b"hello")
-                )
+    def test_fragmented_requests_execute_only_after_complete_frame(self) -> None:
+        frame = protocol.encode_command(Set("k", b"v"))
+        for byte in frame[:-1]:
+            self.connection.data_received(bytes([byte]))
+            self.assertEqual(self.transport.writes, [])
+        self.connection.data_received(frame[-1:])
+        self.assertEqual(self.transport.messages(), [Ok()])
 
-    def test_write_failure_drops_subscriber_and_preserves_fanout(self) -> None:
-        self.transport.write.side_effect = ConnectionResetError("peer disconnected")
-        broker, healthy = Broker(), RecordingSubscriber()
-        for channel in ("news", "other"):
-            broker.subscribe(channel, self.connection)
-            broker.subscribe(channel, healthy)
-        self.assertEqual(broker.publish("news", b"hello"), 1)
-        self.assertEqual(healthy.messages, [("news", b"hello")])
-        self.assertEqual(broker.subscribers("news"), 1)
-        self.assertEqual(broker.subscribers("other"), 1)
-        self.transport.abort.assert_called_once()
+    async def test_command_budget_yields_and_preserves_reply_order(self) -> None:
+        total = COMMANDS_PER_TURN + 3
+        commands = [Set(str(i), str(i).encode()) for i in range(total)]
+        self.connection.data_received(b"".join(map(protocol.encode_command, commands)))
+        self.assertEqual(len(self.transport.messages()), COMMANDS_PER_TURN)
+        self.assertFalse(self.transport.reading)
+        await asyncio.sleep(0)
+        self.assertEqual(self.transport.messages(), [Ok()] * total)
+        self.assertTrue(self.transport.reading)
+        self.connection.data_received(protocol.encode_command(Get(str(total - 1))))
+        self.assertEqual(self.transport.messages()[-1], Value(str(total - 1).encode()))
 
-    def test_closed_transport_rejects_without_writing(self) -> None:
-        self.transport.is_closing.return_value = True
-        self.assertFalse(self.connection.send(Message("news", b"hello")))
-        self.transport.write.assert_not_called()
+    async def test_reply_byte_budget_yields_before_command_budget(self) -> None:
+        value = b"x" * REPLY_BYTES_PER_TURN
+        self.connection.data_received(protocol.encode_command(Set("large", value)))
+        self.transport.writes.clear()
+        self.connection.data_received(protocol.encode_command(Get("large")) * 2)
+        self.assertEqual(self.transport.messages(), [Value(value)])
+        self.assertFalse(self.transport.reading)
+        await asyncio.sleep(0)
+        self.assertEqual(self.transport.messages(), [Value(value), Value(value)])
 
-    def test_buffer_limit_accepts_boundary_and_rejects_overflow(self) -> None:
-        self.transport.get_write_buffer_size.return_value = 16
-        self.assertTrue(self.connection.send(Message("news", b"hello")))
-        self.transport.abort.assert_not_called()
-        self.transport.get_write_buffer_size.return_value = 17
-        self.assertFalse(self.connection.send(Message("news", b"hello")))
-        self.transport.abort.assert_called_once()
+    async def test_write_backpressure_buffers_commands_until_resume(self) -> None:
+        self.connection.pause_writing()
+        self.assertFalse(self.transport.reading)
+        self.connection.data_received(protocol.encode_command(Set("k", b"v")))
+        self.assertEqual(self.transport.writes, [])
+        self.connection.resume_writing()
+        self.assertEqual(self.transport.messages(), [Ok()])
+        self.assertTrue(self.transport.reading)
 
-    def test_encoding_failure_drops_network_subscriber_and_preserves_fanout(
+    async def test_eof_while_write_blocked_drains_complete_requests_on_resume(
         self,
     ) -> None:
-        broker, healthy = Broker(), RecordingSubscriber()
-        for channel in ("news", "other"):
-            broker.subscribe(channel, self.connection)
-            broker.subscribe(channel, healthy)
-        payload = b"x" * (MAX_FIELD_BYTES + 1)
-        for _ in range(2):
-            broker.subscribe("news", self.connection)
-            self.assertEqual(broker.publish("news", payload), 1)
-            self.assertEqual(broker.subscribers("news"), 1)
-            self.assertEqual(broker.subscribers("other"), 1)
-        self.assertEqual(healthy.messages, [("news", payload)] * 2)
-        self.transport.write.assert_not_called()
-        self.assertEqual(self.transport.abort.call_count, 2)
+        self.connection.pause_writing()
+        self.connection.data_received(protocol.encode_command(Get("k")) * 2 + b"\x00")
+        self.assertTrue(self.connection.eof_received())
+        self.assertFalse(self.transport.closing)
+        self.connection.resume_writing()
+        self.assertEqual(self.transport.messages(), [Nil(), Nil()])
+        self.assertTrue(self.transport.closing)
+        self.assertFalse(self.transport.reading)
+
+    async def test_eof_drains_multiple_turns_and_discards_partial_tail(self) -> None:
+        total = COMMANDS_PER_TURN * 2 + 1
+        self.connection.data_received(
+            protocol.encode_command(Get("k")) * total + b"\x00"
+        )
+        self.connection.eof_received()
+        for _ in range(3):
+            await asyncio.sleep(0)
+        self.assertEqual(self.transport.messages(), [Nil()] * total)
+        self.assertTrue(self.transport.closing)
+
+    def test_protocol_error_flushes_prior_replies_and_discards_remaining_commands(
+        self,
+    ) -> None:
+        good = protocol.encode_command(Set("before", b"v"))
+        bad = struct.pack(">I", protocol.MAX_COMMAND_BODY_BYTES + 1)
+        after = protocol.encode_command(Set("after", b"v"))
+        with self.assertLogs("velis.net.connection", "WARNING"):
+            self.connection.data_received(good + bad + after)
+        replies = self.transport.messages()
+        self.assertEqual(replies[0], Ok())
+        self.assertIsInstance(replies[1], Err)
+        self.assertTrue(self.transport.closing)
+        self.assertFalse(self.transport.aborted)
+        self.connection.data_received(good)
+        self.assertEqual(self.transport.messages(), replies)
+
+    def test_admission_rejection_does_not_release_an_unowned_slot(self) -> None:
+        rejected = Connection(
+            self.engine, 16, admit=lambda: False, release=self.release
+        )
+        transport = RecordingTransport()
+        rejected.connection_made(transport)
+        self.assertEqual(transport.messages(), [Err("connection limit exceeded")])
+        self.assertTrue(transport.closing)
+        rejected.connection_lost(None)
+        self.release.assert_not_called()
+
+    async def test_disconnect_releases_once_and_cancels_scheduled_work(self) -> None:
+        self.connection.data_received(
+            protocol.encode_command(Get("k")) * (COMMANDS_PER_TURN + 1)
+        )
+        with patch.object(self.engine, "disconnect") as disconnect:
+            self.connection.connection_lost(None)
+            self.connection.connection_lost(None)
+            disconnect.assert_called_once_with(self.connection)
+        await asyncio.sleep(0)
+        self.release.assert_called_once_with()
+        self.assertEqual(len(self.transport.messages()), COMMANDS_PER_TURN)
+        self.assertFalse(self.connection.send(Message("a", b"v")))
+
+    def test_os_write_failure_aborts_without_unexpected_error_logging(self) -> None:
+        self.transport.write_error = OSError("write failed")
+        with self.assertNoLogs("velis.net.connection", "ERROR"):
+            self.connection.data_received(protocol.encode_command(Get("k")))
+        self.assertTrue(self.transport.aborted)
+
+    def test_unexpected_execution_failure_is_logged_and_aborted(self) -> None:
+        with (
+            patch.object(
+                self.engine, "execute", side_effect=RuntimeError("engine failed")
+            ),
+            self.assertLogs("velis.net.connection", "ERROR") as logs,
+        ):
+            self.connection.data_received(protocol.encode_command(Get("k")))
+        self.assertIn("engine failed", "\n".join(logs.output))
+        self.assertTrue(self.transport.aborted)
+
+    def test_push_buffer_limit_is_strictly_greater_than(self) -> None:
+        message = Message("a", b"v")
+        self.transport.buffer_size = 16
+        self.assertTrue(self.connection.send(message))
+        self.assertEqual(self.transport.messages(), [message])
+        self.transport.buffer_size = 17
+        self.assertFalse(self.connection.send(message))
+        self.assertTrue(self.transport.aborted)
+
+    def test_expected_push_failures_abort_and_return_false(self) -> None:
+        for error in (ProtocolError("bad push"), OSError("broken pipe")):
+            with self.subTest(error=error):
+                self.transport.closing = self.transport.aborted = False
+                with patch("velis.net.protocol.encode_push", side_effect=error):
+                    if isinstance(error, ProtocolError):
+                        with self.assertLogs("velis.net.connection", "WARNING"):
+                            self.assertFalse(self.connection.send(Message("a", b"v")))
+                    else:
+                        self.assertFalse(self.connection.send(Message("a", b"v")))
+                self.assertTrue(self.transport.aborted)
+
+    def test_unexpected_push_failure_propagates(self) -> None:
+        self.transport.write_error = RuntimeError("transport failed")
+        with self.assertRaisesRegex(RuntimeError, "transport failed"):
+            self.connection.send(Message("a", b"v"))
+        self.assertFalse(self.transport.aborted)

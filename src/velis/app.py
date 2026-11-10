@@ -5,7 +5,11 @@ import logging
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
-from velis.config import (
+from velis.core.broker import Broker
+from velis.core.engine import Engine
+from velis.core.store import Store
+from velis.net.server import TCPServer
+from velis.settings import (
     DEFAULT_MAX_SUBSCRIPTIONS,
     DEFAULT_SERVER_LIMITS,
     DEFAULT_STORE_LIMITS,
@@ -13,11 +17,7 @@ from velis.config import (
     ServerLimits,
     StoreLimits,
 )
-from velis.core.broker import Broker
-from velis.core.engine import Engine
-from velis.core.store import Store
-from velis.net.server import TCPServer
-from velis.validation import require_positive
+from velis.validation import require_positive_int
 
 log = logging.getLogger(__name__)
 
@@ -63,7 +63,7 @@ async def serve(
     Maintenance failure interrupts the caller and closes the server. TaskGroup
     reports worker or caller failures in an ExceptionGroup after cleanup.
     """
-    require_positive(sweep_interval_ms=sweep_interval_ms)
+    require_positive_int(sweep_interval_ms=sweep_interval_ms)
     if engine is None:
         engine = build_engine(
             store_limits=store_limits, max_subscriptions=max_subscriptions

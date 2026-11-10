@@ -1,8 +1,10 @@
-import random
 import struct
 import unittest
-from collections.abc import Callable
-from typing import TypeAliasType, cast, get_args
+from dataclasses import dataclass
+from typing import cast
+
+from hypothesis import given
+from hypothesis import strategies as st
 
 from velis.core.messages import (
     TTL,
@@ -28,34 +30,40 @@ from velis.core.messages import (
 )
 from velis.errors import ProtocolError
 from velis.net.limits import (
-    MAX_CHANNEL_CHARS,
+    MAX_CHANNEL_BYTES,
     MAX_FIELD_BYTES,
     MAX_KEY_CHARS,
     MAX_TAG_BYTES,
 )
-from velis.net.protocol import COMMANDS, SERVER_MESSAGES, ServerFrame
-from velis.net.wire import Codec
-from velis.net.wire import text as text_field
+from velis.net.protocol import COMMANDS, SERVER_MESSAGES
+from velis.net.wire import BLOB, U32, U64, Codec, Field, blob, free_text, msg, text
 
-COMMAND_CASES: tuple[tuple[Command, bytes], ...] = (
+
+def prefixed(raw: bytes) -> bytes:
+    return struct.pack(">I", len(raw)) + raw
+
+
+COMMAND_FIXTURES = (
     (Get("k"), b"\x00\x00\x00\x03GET\x00\x00\x00\x01k"),
-    (Get("é"), b"\x00\x00\x00\x03GET\x00\x00\x00\x02\xc3\xa9"),
     (
         Set("k", b"\x00\xff"),
         b"\x00\x00\x00\x03SET\x00\x00\x00\x01k\x00\x00\x00\x02\x00\xff",
     ),
     (
-        Expire("k", 0x0102030405060708),
-        b"\x00\x00\x00\x06EXPIRE\x00\x00\x00\x01k\x01\x02\x03\x04\x05\x06\x07\x08",
+        Expire("k", 258),
+        b"\x00\x00\x00\x06EXPIRE\x00\x00\x00\x01k\x00\x00\x00\x00\x00\x00\x01\x02",
     ),
     (Delete("k"), b"\x00\x00\x00\x03DEL\x00\x00\x00\x01k"),
     (TTL("k"), b"\x00\x00\x00\x03TTL\x00\x00\x00\x01k"),
     (Persist("k"), b"\x00\x00\x00\x07PERSIST\x00\x00\x00\x01k"),
     (Subscribe("c"), b"\x00\x00\x00\x09SUBSCRIBE\x00\x00\x00\x01c"),
     (Unsubscribe("c"), b"\x00\x00\x00\x0bUNSUBSCRIBE\x00\x00\x00\x01c"),
-    (Publish("c", b"p"), b"\x00\x00\x00\x07PUBLISH\x00\x00\x00\x01c\x00\x00\x00\x01p"),
+    (
+        Publish("c", b"\xff"),
+        b"\x00\x00\x00\x07PUBLISH\x00\x00\x00\x01c\x00\x00\x00\x01\xff",
+    ),
 )
-MESSAGE_CASES: tuple[tuple[ServerFrame, bytes], ...] = (
+SERVER_FIXTURES = (
     (Ok(), b"\x00\x00\x00\x02OK"),
     (Nil(), b"\x00\x00\x00\x03NIL"),
     (Persistent(), b"\x00\x00\x00\x0aPERSISTENT"),
@@ -63,315 +71,271 @@ MESSAGE_CASES: tuple[tuple[ServerFrame, bytes], ...] = (
     (Err("bad"), b"\x00\x00\x00\x03ERR\x00\x00\x00\x03bad"),
     (Subscribed("c"), b"\x00\x00\x00\x0aSUBSCRIBED\x00\x00\x00\x01c"),
     (Unsubscribed("c"), b"\x00\x00\x00\x0cUNSUBSCRIBED\x00\x00\x00\x01c"),
-    (Delivered(0x01020304), b"\x00\x00\x00\x09DELIVERED\x01\x02\x03\x04"),
+    (Delivered(258), b"\x00\x00\x00\x09DELIVERED\x00\x00\x01\x02"),
+    (TTLValue(258), b"\x00\x00\x00\x09TTL_VALUE\x00\x00\x00\x00\x00\x00\x01\x02"),
     (
-        TTLValue(0x0102030405060708),
-        b"\x00\x00\x00\x09TTL_VALUE\x01\x02\x03\x04\x05\x06\x07\x08",
+        Message("c", b"\x00"),
+        b"\x00\x00\x00\x07MESSAGE\x00\x00\x00\x01c\x00\x00\x00\x01\x00",
     ),
-    (Message("c", b"p"), b"\x00\x00\x00\x07MESSAGE\x00\x00\x00\x01c\x00\x00\x00\x01p"),
 )
 
 
-def field(data: bytes) -> bytes:
-    return struct.pack(">I", len(data)) + data
-
-
-def tag(value: str) -> bytes:
-    return field(value.encode())
-
-
-def members(alias: TypeAliasType) -> set[type]:
-    result: set[type] = set()
-    for variant in get_args(alias.__value__):
-        result |= members(variant) if isinstance(variant, TypeAliasType) else {variant}
-    return result
-
-
 class WireTests(unittest.TestCase):
-    def test_duplicate_tags_and_mismatched_field_counts_fail_at_declaration(
-        self,
+    def test_noninteger_fields_raise_protocol_errors_before_packing(self) -> None:
+        for field in (U32, U64):
+            for value in (1.5, True, "2", float("nan"), float("inf")):
+                with self.subTest(value=value), self.assertRaises(ProtocolError):
+                    field.write(cast(int, value))
+
+    def assert_fixtures[M](
+        self, codec: Codec[M], fixtures: tuple[tuple[M, bytes], ...]
     ) -> None:
-        key = text_field("key", MAX_KEY_CHARS)
-        with self.assertRaisesRegex(ValueError, "duplicate command tag"):
-            Codec[Command]("command", {Get: (b"DUP", key), Delete: (b"DUP", key)})
-        for schema in ((b"GET",), (b"GET", key, key)):
-            with (
-                self.subTest(schema=schema),
-                self.assertRaisesRegex(TypeError, "Get has 1 attributes"),
-            ):
-                Codec[Command]("command", {Get: schema})
-
-    def test_unregistered_subclasses_are_rejected(self) -> None:
-        class DerivedGet(Get):
-            pass
-
-        class DerivedValue(Value):
-            pass
-
-        with self.assertRaisesRegex(ProtocolError, "unsupported command: DerivedGet"):
-            COMMANDS.encode(DerivedGet("key"))
-        with self.assertRaisesRegex(
-            ProtocolError, "unsupported server message: DerivedValue"
-        ):
-            SERVER_MESSAGES.encode(DerivedValue(b"value"))
-
-    def _check_golden[T](
-        self,
-        encode: Callable[[T], bytes],
-        decode: Callable[[bytes], T],
-        cases: tuple[tuple[T, bytes], ...],
-    ) -> None:
-        for value, expected in cases:
+        for value, body in fixtures:
             with self.subTest(value=value):
-                self.assertEqual(encode(value), expected)
-                self.assertEqual(decode(expected), value)
+                self.assertEqual(codec.encode(value), body)
+                self.assertEqual(codec.decode(body), value)
 
-    def test_golden_bodies_cover_every_command_reply_and_push(self) -> None:
-        self.assertEqual({type(value) for value, _ in COMMAND_CASES}, members(Command))
-        self.assertEqual(
-            {type(value) for value, _ in MESSAGE_CASES}, members(ServerFrame)
-        )
-        self._check_golden(COMMANDS.encode, COMMANDS.decode, COMMAND_CASES)
-        self._check_golden(
-            SERVER_MESSAGES.encode,
-            SERVER_MESSAGES.decode,
-            MESSAGE_CASES,
-        )
+    def test_golden_bytes_cover_every_command_reply_and_push(self) -> None:
+        self.assert_fixtures(COMMANDS, COMMAND_FIXTURES)
+        self.assert_fixtures(SERVER_MESSAGES, SERVER_FIXTURES)
 
-    def test_every_truncation_and_trailing_byte_is_rejected(self) -> None:
-        for codec, cases in (
-            (COMMANDS, COMMAND_CASES),
-            (SERVER_MESSAGES, MESSAGE_CASES),
+    def test_decode_buffer_span_cannot_read_from_the_next_frame(self) -> None:
+        for codec, fixtures in (
+            (COMMANDS, COMMAND_FIXTURES),
+            (SERVER_MESSAGES, SERVER_FIXTURES),
         ):
-            for value, body in cases:
-                for malformed in (
-                    *[body[:end] for end in range(len(body))],
-                    body + b"Z",
+            for value, body in fixtures:
+                for data in (
+                    b"prefix" + body + b"suffix",
+                    bytearray(b"prefix" + body + b"suffix"),
                 ):
+                    with self.subTest(value=value, buffer=type(data)):
+                        self.assertEqual(codec.decode(data, 6, 6 + len(body)), value)
+                        for end in range(len(body)):
+                            with self.assertRaises(ProtocolError):
+                                codec.decode(data, 6, 6 + end)
+                        with self.assertRaisesRegex(ProtocolError, "trailing bytes"):
+                            codec.decode(data, 6, len(data))
+
+    def test_decoded_value_owns_its_bytes_and_does_not_pin_input(self) -> None:
+        body = bytearray(COMMANDS.encode(Set("key", b"original")))
+        command = COMMANDS.decode(body)
+        body[:] = b"changed"
+        body.clear()
+        self.assertEqual(command, Set("key", b"original"))
+        self.assertIsInstance(command, Set)
+        self.assertIs(type(cast(Set, command).value), bytes)
+
+    def test_invalid_record_bounds_raise_protocol_errors(self) -> None:
+        body = COMMANDS.encode(Get("key"))
+        for start, end in ((-1, 0), (2, 1), (0, len(body) + 1)):
+            with self.subTest(start=start, end=end), self.assertRaises(ProtocolError):
+                COMMANDS.decode(body, start, end)
+
+    def test_every_truncation_and_trailing_data_is_rejected(self) -> None:
+        for codec, fixtures in (
+            (COMMANDS, COMMAND_FIXTURES),
+            (SERVER_MESSAGES, SERVER_FIXTURES),
+        ):
+            for value, body in fixtures:
+                for end in range(len(body)):
                     with (
-                        self.subTest(variant=type(value), body=malformed),
+                        self.subTest(value=value, end=end),
                         self.assertRaises(ProtocolError),
                     ):
-                        codec.decode(malformed)
+                        codec.decode(body[:end])
+                with (
+                    self.subTest(value=value),
+                    self.assertRaisesRegex(ProtocolError, "trailing bytes"),
+                ):
+                    codec.decode(body + b"\x00")
 
-    def test_mutations_and_arbitrary_bytes_only_raise_protocol_errors(self) -> None:
-        def check[T](
-            encode: Callable[[T], bytes],
-            decode: Callable[[bytes], T],
-            cases: tuple[tuple[T, bytes], ...],
-        ) -> None:
-            rng = random.Random(0)
-            seeds = [body for _, body in cases]
-            bodies = [rng.randbytes(rng.randrange(256)) for _ in range(2000)]
-            for _ in range(20000):
-                body = bytearray(rng.choice(seeds))
-                body[rng.randrange(len(body))] = rng.randrange(256)
-                bodies.append(bytes(body))
-            for body in bodies:
-                try:
-                    value = decode(body)
-                except ProtocolError:
-                    continue
-                self.assertEqual(encode(value), body)
+    def test_unknown_and_invalid_utf8_tags_fail_with_protocol_errors(self) -> None:
+        for codec in (COMMANDS, SERVER_MESSAGES):
+            for tag in (b"", b"UNKNOWN", b"\xff"):
+                with self.subTest(tag=tag), self.assertRaises(ProtocolError):
+                    codec.decode(prefixed(tag))
+            with self.assertRaisesRegex(ProtocolError, "field too long"):
+                codec.decode(struct.pack(">I", MAX_TAG_BYTES + 1))
 
-        check(COMMANDS.encode, COMMANDS.decode, COMMAND_CASES)
-        check(
-            SERVER_MESSAGES.encode,
-            SERVER_MESSAGES.decode,
-            MESSAGE_CASES,
-        )
+    def test_key_limits_count_characters_and_accept_four_byte_utf8(self) -> None:
+        key = "😀" * MAX_KEY_CHARS
+        self.assertEqual(COMMANDS.decode(COMMANDS.encode(Get(key))), Get(key))
+        for invalid in ("", "a" * (MAX_KEY_CHARS + 1), "\ud800"):
+            with self.subTest(invalid=repr(invalid)), self.assertRaises(ProtocolError):
+                COMMANDS.encode(Get(invalid))
+        for raw in (b"", b"a" * (MAX_KEY_CHARS + 1), b"\xff"):
+            with self.subTest(raw=raw), self.assertRaises(ProtocolError):
+                COMMANDS.decode(prefixed(b"GET") + prefixed(raw))
 
-    def test_exact_errors_and_validation_precedence(self) -> None:
-        for codec, kind in (
-            (COMMANDS, "command"),
-            (SERVER_MESSAGES, "server message"),
-        ):
-            for body, expected in (
-                (b"", "truncated record: need 4 bytes"),
-                (
-                    struct.pack(">I", MAX_TAG_BYTES + 1),
-                    f"field too long: {MAX_TAG_BYTES + 1}",
-                ),
-                (field(b"\xff"), "invalid utf-8 in string field"),
-                (field(b""), f"unknown {kind}: ''"),
-                (tag("NOPE") + b"unread", f"unknown {kind}: 'NOPE'"),
+    def test_echoed_channels_allow_empty_text_but_obey_encoded_byte_limit(self) -> None:
+        for cls in (Subscribed, Unsubscribed):
+            for channel in (
+                "",
+                "a" * MAX_CHANNEL_BYTES,
+                "😀" * (MAX_CHANNEL_BYTES // 4),
             ):
-                with (
-                    self.subTest(kind=kind, body=body),
-                    self.assertRaises(ProtocolError) as raised,
-                ):
-                    codec.decode(body)
-                self.assertEqual(str(raised.exception), expected)
-        for body, expected in (
-            (tag("GET") + field(b""), "key must not be empty"),
-            (tag("GET") + field(b"\xff"), "invalid utf-8 in string field"),
-            (
-                tag("GET") + struct.pack(">I", MAX_KEY_CHARS * 4 + 1),
-                f"field too long: {MAX_KEY_CHARS * 4 + 1}",
-            ),
-            (
-                tag("GET") + field(b"x" * (MAX_KEY_CHARS + 1)),
-                f"key exceeds {MAX_KEY_CHARS} characters",
-            ),
-            (
-                tag("EXPIRE") + field(b"k") + b"\x00" * 7,
-                "truncated record: need 8 bytes",
-            ),
-            (
-                tag("SET") + field(b"k") + struct.pack(">I", 3) + b"ab",
-                "truncated record: need 3 bytes",
-            ),
-            (tag("GET") + field(b"k") + b"Z", "trailing bytes after record"),
-        ):
-            with self.subTest(body=body), self.assertRaises(ProtocolError) as raised:
-                COMMANDS.decode(body)
-            self.assertEqual(str(raised.exception), expected)
-        for body, expected in (
-            (tag("DELIVERED") + b"\x00" * 3, "truncated record: need 4 bytes"),
-            (tag("TTL_VALUE") + b"\x00" * 7, "truncated record: need 8 bytes"),
-            (tag("ERR") + field(b"\xff"), "invalid utf-8 in string field"),
-            (tag("OK") + b"Z", "trailing bytes after record"),
-            (
-                tag("MESSAGE") + field(b"") + struct.pack(">I", MAX_FIELD_BYTES + 1),
-                f"field too long: {MAX_FIELD_BYTES + 1}",
-            ),
-        ):
-            with self.subTest(body=body), self.assertRaises(ProtocolError) as raised:
-                SERVER_MESSAGES.decode(body)
-            self.assertEqual(str(raised.exception), expected)
-
-    def test_request_text_boundaries_in_both_directions(self) -> None:
-        for name, cls, what, limit, suffix in (
-            ("GET", Get, "key", MAX_KEY_CHARS, b""),
-            ("DEL", Delete, "key", MAX_KEY_CHARS, b""),
-            ("TTL", TTL, "key", MAX_KEY_CHARS, b""),
-            ("PERSIST", Persist, "key", MAX_KEY_CHARS, b""),
-            ("SET", lambda s: Set(s, b""), "key", MAX_KEY_CHARS, field(b"")),
-            ("EXPIRE", lambda s: Expire(s, 0), "key", MAX_KEY_CHARS, b"\x00" * 8),
-            ("SUBSCRIBE", Subscribe, "channel", MAX_CHANNEL_CHARS, b""),
-            ("UNSUBSCRIBE", Unsubscribe, "channel", MAX_CHANNEL_CHARS, b""),
-            (
-                "PUBLISH",
-                lambda s: Publish(s, b""),
-                "channel",
-                MAX_CHANNEL_CHARS,
-                field(b""),
-            ),
-        ):
-            for text in ("é" * limit, "\U0010ffff" * limit, " \x00\n"):
-                value = cls(text)
-                expected = tag(name) + field(text.encode()) + suffix
-                with self.subTest(name=name, length=len(text)):
-                    self.assertEqual(COMMANDS.encode(value), expected)
-                    self.assertEqual(COMMANDS.decode(expected), value)
-            for raw, expected_error in (
-                (b"", f"{what} must not be empty"),
-                (b"x" * (limit + 1), f"{what} exceeds {limit} characters"),
-                (b"\xff" * (limit * 4), "invalid utf-8 in string field"),
-                (b"\xff" * (limit * 4 + 1), f"field too long: {limit * 4 + 1}"),
-            ):
-                with (
-                    self.subTest(name=name, length=len(raw)),
-                    self.assertRaises(ProtocolError) as raised,
-                ):
-                    COMMANDS.decode(tag(name) + field(raw) + suffix)
-                self.assertEqual(str(raised.exception), expected_error)
-
-    def test_encoders_reject_invalid_fields_without_changing_errors(self) -> None:
-        def check[T](
-            encode: Callable[[T], bytes], cases: tuple[tuple[T, str], ...]
-        ) -> None:
-            for value, expected in cases:
-                with (
-                    self.subTest(variant=type(value)),
-                    self.assertRaises(ProtocolError) as raised,
-                ):
-                    encode(value)
-                self.assertEqual(str(raised.exception), expected)
-
-        check(
-            COMMANDS.encode,
-            (
-                (Get(""), "key must not be empty"),
-                (
-                    Get("x" * (MAX_KEY_CHARS + 1)),
-                    f"key exceeds {MAX_KEY_CHARS} characters",
-                ),
-                (Get("\ud800"), "invalid utf-8 in string field"),
-                (Subscribe(""), "channel must not be empty"),
-                (
-                    Subscribe("x" * (MAX_CHANNEL_CHARS + 1)),
-                    f"channel exceeds {MAX_CHANNEL_CHARS} characters",
-                ),
-                (Expire("k", -1), "u64 integer out of range: -1"),
-                (Expire("k", 1 << 64), f"u64 integer out of range: {1 << 64}"),
-            ),
-        )
-        check(
-            SERVER_MESSAGES.encode,
-            (
-                (Delivered(-1), "u32 integer out of range: -1"),
-                (Delivered(1 << 32), f"u32 integer out of range: {1 << 32}"),
-                (TTLValue(1 << 64), f"u64 integer out of range: {1 << 64}"),
-                (Err("\ud800"), "invalid utf-8 in string field"),
-            ),
-        )
-
-    def test_unsigned_integer_boundaries_roundtrip(self) -> None:
-        for value in (0, (1 << 64) - 1):
-            command = Expire("k", value)
-            self.assertEqual(COMMANDS.decode(COMMANDS.encode(command)), command)
-            reply = TTLValue(value)
-            self.assertEqual(
-                SERVER_MESSAGES.decode(SERVER_MESSAGES.encode(reply)),
-                reply,
-            )
-        for value in (0, (1 << 32) - 1):
-            reply = Delivered(value)
-            self.assertEqual(
-                SERVER_MESSAGES.decode(SERVER_MESSAGES.encode(reply)),
-                reply,
-            )
-
-    def test_reply_channels_allow_empty_and_longer_text(self) -> None:
-        for text in ("", "x" * (MAX_CHANNEL_CHARS + 1)):
-            for value in (Message(text, b""), Subscribed(text), Unsubscribed(text)):
+                value = cls(channel)
                 self.assertEqual(
-                    SERVER_MESSAGES.decode(SERVER_MESSAGES.encode(value)),
-                    value,
+                    SERVER_MESSAGES.decode(SERVER_MESSAGES.encode(value)), value
                 )
+            with self.assertRaises(ProtocolError):
+                SERVER_MESSAGES.encode(cls("a" * (MAX_CHANNEL_BYTES + 1)))
+        for raw in (b"\xff", b"a" * (MAX_CHANNEL_BYTES + 1)):
+            with self.assertRaises(ProtocolError):
+                SERVER_MESSAGES.decode(
+                    prefixed(b"MESSAGE") + prefixed(raw) + prefixed(b"")
+                )
+        with self.assertRaises(ProtocolError):
+            COMMANDS.encode(Subscribe(""))
 
-    def test_wrong_message_direction_is_rejected(self) -> None:
-        with self.assertRaisesRegex(ProtocolError, "unknown command"):
-            COMMANDS.decode(SERVER_MESSAGES.encode(Ok()))
-        with self.assertRaisesRegex(ProtocolError, "unknown server message"):
-            SERVER_MESSAGES.decode(COMMANDS.encode(Get("k")))
-        with self.assertRaisesRegex(ProtocolError, "unsupported command: Ok"):
+    def test_blob_accepts_exact_limit_and_rejects_oversized_header_before_body(
+        self,
+    ) -> None:
+        raw = b"\xff" * MAX_FIELD_BYTES
+        self.assertEqual(
+            BLOB.read(BLOB.write(raw), 0, 4 + len(raw)), (raw, 4 + len(raw))
+        )
+        with self.assertRaisesRegex(ProtocolError, "field too long"):
+            BLOB.write(raw + b"x")
+        with self.assertRaisesRegex(ProtocolError, "field too long"):
+            BLOB.read(struct.pack(">I", MAX_FIELD_BYTES + 1), 0, 4)
+
+    def assert_field_bounds[T](self, field: Field[T], value: T) -> None:
+        encoded = field.write(value)
+        data = b"prefix" + encoded + b"suffix"
+        stop = 6 + len(encoded)
+        self.assertEqual(field.read(data, 6, stop), (value, stop))
+        with self.assertRaisesRegex(ProtocolError, "truncated"):
+            field.read(data, 6, stop - 1)
+
+    def test_field_readers_obey_offsets_and_end_boundary(self) -> None:
+        self.assert_field_bounds(blob(3), b"abc")
+        self.assert_field_bounds(free_text(4), "é")
+        self.assert_field_bounds(text("key", 2), "😀")
+        self.assert_field_bounds(U32, 123)
+        self.assert_field_bounds(U64, 456)
+
+    def test_free_text_rejects_invalid_utf8_in_both_directions(self) -> None:
+        field = free_text(10)
+        self.assertEqual(field.write(""), b"\x00" * 4)
+        with self.assertRaisesRegex(ProtocolError, "invalid utf-8"):
+            field.write("\ud800")
+        with self.assertRaisesRegex(ProtocolError, "invalid utf-8"):
+            field.read(prefixed(b"\xff"), 0, 5)
+        with self.assertRaisesRegex(ProtocolError, "field too long"):
+            free_text(3).write("😀")
+
+    def test_unsigned_integer_boundaries(self) -> None:
+        for field, width in ((U32, 4), (U64, 8)):
+            for value in (0, 1, (1 << (width * 8)) - 1):
+                encoded = value.to_bytes(width, "big")
+                self.assertEqual(field.write(value), encoded)
+                self.assertEqual(field.read(encoded, 0, width), (value, width))
+            for value in (-1, 1 << (width * 8)):
+                with self.assertRaisesRegex(ProtocolError, "out of range"):
+                    field.write(value)
+
+    @given(st.text(min_size=1, max_size=30), st.binary(max_size=200))
+    def test_unicode_keys_and_opaque_values_roundtrip(
+        self, key: str, value: bytes
+    ) -> None:
+        command = Set(key, value)
+        self.assertEqual(COMMANDS.decode(COMMANDS.encode(command)), command)
+        push = Message(key, value)
+        self.assertEqual(SERVER_MESSAGES.decode(SERVER_MESSAGES.encode(push)), push)
+
+    def assert_decode_contract[M](self, codec: Codec[M], data: bytes) -> None:
+        try:
+            decoded = codec.decode(data)
+        except ProtocolError:
+            return
+        self.assertEqual(codec.encode(decoded), data)
+
+    @given(st.binary(max_size=150))
+    def test_arbitrary_input_decodes_or_raises_protocol_error(
+        self, data: bytes
+    ) -> None:
+        self.assert_decode_contract(COMMANDS, data)
+        self.assert_decode_contract(SERVER_MESSAGES, data)
+
+    @given(
+        st.sampled_from(COMMAND_FIXTURES + SERVER_FIXTURES),
+        st.integers(0, 1000),
+        st.integers(0, 255),
+    )
+    def test_mutated_valid_bodies_have_only_documented_decode_failures(
+        self, fixture: tuple[object, bytes], offset: int, byte: int
+    ) -> None:
+        _, body = fixture
+        pos = offset % len(body)
+        mutated = body[:pos] + bytes([byte]) + body[pos + 1 :]
+        self.assert_decode_contract(COMMANDS, mutated)
+        self.assert_decode_contract(SERVER_MESSAGES, mutated)
+
+
+@dataclass(frozen=True)
+class Pair:
+    name: str
+    value: bytes
+
+
+type OneMessage = Get
+type NestedMessages = OneMessage | Nil
+type PairMessage = Pair
+type NotDataclass = str
+
+
+class CodecDeclarationTests(unittest.TestCase):
+    def test_nested_aliases_are_covered_and_max_body_is_exact(self) -> None:
+        codec = Codec(
+            "test",
+            {Get: msg(b"G", key=text("key", 2)), Nil: msg(b"N")},
+            covers=NestedMessages,
+        )
+        self.assertEqual(codec.max_body, 5 + 4 + 8)
+        self.assertEqual(codec.decode(codec.encode(Get("😀😀"))), Get("😀😀"))
+
+    def test_missing_and_unexpected_union_members_are_rejected(self) -> None:
+        for table in (
+            {},
+            {Nil: msg(b"N")},
+            {Get: msg(b"G", key=text("key", 2)), Nil: msg(b"N")},
+        ):
+            with (
+                self.subTest(table=table),
+                self.assertRaisesRegex(TypeError, "table mismatch"),
+            ):
+                Codec("test", table, covers=OneMessage)
+
+    def test_non_dataclass_registration_is_rejected(self) -> None:
+        with self.assertRaisesRegex(TypeError, "not a dataclass"):
+            Codec("test", {str: msg(b"S")}, covers=NotDataclass)
+
+    def test_duplicate_and_oversized_tags_are_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            Codec(
+                "test",
+                {Get: msg(b"G", key=text("key", 2)), Nil: msg(b"G")},
+                covers=NestedMessages,
+            )
+        with self.assertRaisesRegex(ValueError, "tag longer"):
+            Codec(
+                "test",
+                {Get: msg(b"x" * (MAX_TAG_BYTES + 1), key=text("key", 2))},
+                covers=OneMessage,
+            )
+
+    def test_field_names_order_and_annotations_must_match(self) -> None:
+        for entry in (
+            msg(b"P", name=text("name", 3)),
+            msg(b"P", value=BLOB, name=text("name", 3)),
+            msg(b"P", name=text("name", 3), wrong=BLOB),
+            msg(b"P", name=BLOB, value=BLOB),
+        ):
+            with self.subTest(entry=entry), self.assertRaises(TypeError):
+                Codec("test", {Pair: entry}, covers=PairMessage)
+
+    def test_unregistered_outgoing_type_is_a_protocol_error(self) -> None:
+        with self.assertRaisesRegex(ProtocolError, "unsupported command"):
             COMMANDS.encode(cast(Command, Ok()))
-        with self.assertRaisesRegex(ProtocolError, "unsupported server message: Get"):
-            SERVER_MESSAGES.encode(cast(ServerFrame, Get("k")))
-
-    def test_payload_byte_limits_in_both_body_directions(self) -> None:
-        data = b"x" * MAX_FIELD_BYTES
-        for command in (Set("key", data), Publish("channel", data)):
-            with self.subTest(variant=type(command)):
-                self.assertEqual(COMMANDS.decode(COMMANDS.encode(command)), command)
-        for message in (
-            Value(data),
-            Message("channel", data),
-            Err("x" * MAX_FIELD_BYTES),
-        ):
-            with self.subTest(variant=type(message)):
-                self.assertEqual(
-                    SERVER_MESSAGES.decode(SERVER_MESSAGES.encode(message)), message
-                )
-        for command in (Set("key", data + b"x"), Publish("channel", data + b"x")):
-            with self.subTest(variant=type(command)), self.assertRaises(ProtocolError):
-                COMMANDS.encode(command)
-        for message in (
-            Value(data + b"x"),
-            Message("channel", data + b"x"),
-            Err("x" * (MAX_FIELD_BYTES + 1)),
-        ):
-            with self.subTest(variant=type(message)), self.assertRaises(ProtocolError):
-                SERVER_MESSAGES.encode(message)

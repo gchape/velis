@@ -5,6 +5,7 @@ Velis is a lightweight in-memory key-value store with TTL expiration, pub-sub an
 ## Table of contents
 
 - [Features](#features)
+- [Screenshots](#screenshots)
 - [Installation](#installation)
 - [Quick start](#quick-start)
 - [Architecture](#architecture)
@@ -34,6 +35,14 @@ Velis is a lightweight in-memory key-value store with TTL expiration, pub-sub an
 | **Pub-sub**       | `WATCH` / `UNWATCH` / `SEND`. At-most-once delivery to connected subscribers on one server. Slow network connections are disconnected when their server write buffer exceeds the configured limit. |
 | **Network**       | Fixed binary protocol over TCP, ordered pipelining, an `asyncio.Protocol` server with batched replies, and an async `Client`.                                                                      |
 | **Configuration** | CLI environment loading and frozen limits owned by each component.                                                                                                                                 |
+
+---
+
+## Screenshots
+
+<img width="2723" height="1706" alt="Screenshot_20261110_125801" src="https://github.com/user-attachments/assets/2c1870bf-743e-4a7c-80fe-496366b50ce5" />
+
+<img width="2723" height="1706" alt="Screenshot_20261110_125810" src="https://github.com/user-attachments/assets/5a7e2b46-a1f0-496d-8e0e-61119d473068" />
 
 ---
 

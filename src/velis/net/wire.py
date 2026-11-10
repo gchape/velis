@@ -94,13 +94,16 @@ def _span(data: Buffer, pos: int, end: int, limit: int) -> tuple[int, int]:
 
 
 def blob(limit: int) -> Field[bytes]:
-    """Opaque bytes of at most ``limit`` bytes."""
+    """Opaque bytes of at most ``limit`` bytes.
+
+    Decoding copies only the retained field, without an intermediate mutable
+    slice, and never retains a view of the input buffer.
+    """
 
     def read(data: Buffer, pos: int, end: int) -> tuple[bytes, int]:
         start, stop = _span(data, pos, end, limit)
         if isinstance(data, bytes):
             return data[start:stop], stop
-        # Copy only the retained field, without an intermediate bytearray slice.
         with memoryview(data) as view:
             return bytes(view[start:stop]), stop
 
@@ -124,6 +127,34 @@ def free_text(limit: int) -> Field[str]:
         return raw.write(_encode_utf8(value))
 
     return Field(str, raw.max_size, read, write)
+
+
+def text_tuple(max_items: int, max_bytes: int) -> Field[tuple[str, ...]]:
+    """A counted tuple of UTF-8 strings, bounded before allocating its items."""
+    item = free_text(max_bytes)
+
+    def read(data: Buffer, pos: int, end: int) -> tuple[tuple[str, ...], int]:
+        count, pos = U32.read(data, pos, end)
+        if count > max_items:
+            raise ProtocolError(f"too many text items: {count}")
+        values: list[str] = []
+        for _ in range(count):
+            value, pos = item.read(data, pos, end)
+            values.append(value)
+        return tuple(values), pos
+
+    def write(values: tuple[str, ...]) -> bytes:
+        if type(values) is not tuple:
+            raise ProtocolError("expected a tuple of strings")
+        if len(values) > max_items:
+            raise ProtocolError(f"too many text items: {len(values)}")
+        if any(type(value) is not str for value in values):
+            raise ProtocolError("expected a tuple of strings")
+        return U32.write(len(values)) + b"".join(item.write(value) for value in values)
+
+    return Field(
+        tuple[str, ...], _PREFIX_BYTES + max_items * item.max_size, read, write
+    )
 
 
 def text(what: str, max_chars: int) -> Field[str]:
@@ -234,7 +265,7 @@ class Codec[M]:
             )
         hints = get_type_hints(cls)
         for name, field in entry.schema.items():
-            if hints[name] is not field.py:
+            if hints[name] != field.py:
                 raise TypeError(
                     f"{cls.__name__}.{name}: annotated {hints[name]!r}, "
                     f"field serves {field.py!r}"
@@ -246,6 +277,7 @@ class Codec[M]:
         self.max_body = max(self.max_body, size)
 
     def encode(self, value: M) -> bytes:
+        """Encode a registered message, validating each field before returning."""
         entry = self._by_type.get(type(value))
         if entry is None:
             raise ProtocolError(f"unsupported {self._kind}: {type(value).__name__}")

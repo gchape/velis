@@ -68,13 +68,13 @@ class ExpiryIndexTests(unittest.TestCase):
         self.assertEqual(index.pop_due(2000, 10), ["other"])
 
     def test_cancelling_timers_releases_stale_metadata_behind_a_live_head(self) -> None:
+        """Compaction reclaims stale timers even when a live head blocks trimming."""
         index = ExpiryIndex()
         index.set("keep", 1)
         for i in range(1000):
             index.set(str(i), 1000 + i)
         for i in range(1000):
             self.assertTrue(index.clear(str(i)))
-        # A live earlier timer prevents head trimming from reclaiming this garbage.
         self.assertLess(len(index._heap), 100)
         self.assertEqual(index.pop_due(1, 1), ["keep"])
         self.assertFalse(index.has_due(10_000))

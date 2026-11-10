@@ -48,11 +48,15 @@ class PendingReplies:
         return True
 
     def close(self, reason: str) -> None:
-        """Fail pending replies and wake blocked reservations; safe to repeat."""
+        """Fail pending replies and wake blocked reservations; safe to repeat.
+
+        Retrieve exceptions immediately because callers may have abandoned
+        their futures while draining a transport write. Awaiters still receive
+        the same exceptions.
+        """
         while not self._queue.empty():
             waiter = self._queue.get_nowait()
             if not waiter.done():
                 waiter.set_exception(ConnectionError(reason))
-                # Callers may already have abandoned the future during drain().
                 waiter.exception()
         self._queue.shutdown()

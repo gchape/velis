@@ -19,10 +19,12 @@ class Memberships[G, M]:
         self._groups_by_member: dict[M, set[G]] = {}
 
     def join(self, group: G, member: M) -> None:
+        """Add membership to both indexes; duplicate joins are harmless."""
         self._members_by_group.setdefault(group, set()).add(member)
         self._groups_by_member.setdefault(member, set()).add(group)
 
     def leave(self, group: G, member: M) -> None:
+        """Remove membership from both indexes and discard empty entries."""
         _remove(self._members_by_group, group, member)
         _remove(self._groups_by_member, member, group)
 

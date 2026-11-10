@@ -118,7 +118,10 @@ def describe_value(raw: bytes, size: int, width: int) -> list[str]:
     """Safe display lines for a value preview: text if it is text, else hex."""
     lines = _text_lines(raw, size > len(raw))
     if lines is None:
-        lines = _hexdump(raw, 16 if width >= 74 else 8)
+        per_row = max(1, min(16, (width - 10) // 4))
+        lines = _hexdump(raw, per_row)
+    else:
+        lines = [part for line in lines for part in wrap_cells(line, width)]
     if size > len(raw):
         lines.append(f"{ELLIPSIS} {size - len(raw)} more bytes not shown")
     return lines
@@ -135,3 +138,19 @@ def format_duration(seconds: float) -> str:
     if hours < 48:
         return f"{hours}h{minutes:02d}m"
     return f"{hours // 24}d{hours % 24:02d}h"
+
+
+def wrap_cells(text: str, width: int) -> list[str]:
+    """Wrap printable text by terminal cells without losing any characters."""
+    if width <= 0:
+        return []
+    rows: list[str] = []
+    while text:
+        part = clip(text, width)
+        if len(part) < len(text) and (boundary := part.rfind(" ")) > 0:
+            part = part[: boundary + 1]
+        if not part:
+            part = text[0]
+        rows.append(part)
+        text = text[len(part) :]
+    return rows or [""]

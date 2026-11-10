@@ -5,28 +5,28 @@ from velis.config import SessionLimits
 from velis.core.messages import (
     MISSING,
     NO_EXPIRY,
-    TTL,
-    Delete,
-    Delivered,
     Err,
-    Expire,
-    Get,
+    Keep,
+    Lifetime,
     Message,
     Nil,
     Ok,
-    Persist,
-    Persistent,
-    Publish,
-    Set,
-    Subscribe,
-    Subscribed,
-    TTLValue,
-    Unsubscribe,
-    Unsubscribed,
+    Read,
+    Remaining,
+    RemainingValue,
+    Remove,
+    Send,
+    Sent,
+    Unlimited,
+    Unwatch,
+    Unwatched,
     Value,
+    Watch,
+    Watching,
+    Write,
 )
 from velis.errors import CommandError, ProtocolError
-from velis.net.client import Client
+from velis.net.client import Client, EntrySnapshot
 from velis.net.session import Session
 
 
@@ -38,23 +38,71 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         self.session.close = AsyncMock()
         self.client = Client(self.session)
 
+    async def test_read_entry_validates_value_and_lifetime(self) -> None:
+        for value, remaining, expected in (
+            (Value(b""), Unlimited(), EntrySnapshot(b"", NO_EXPIRY)),
+            (Value(b"data"), RemainingValue(25), EntrySnapshot(b"data", 25)),
+            (Nil(), Nil(), EntrySnapshot(None, MISSING)),
+        ):
+            with self.subTest(expected=expected):
+                self.session.batch.return_value = [value, remaining]
+                self.assertEqual(await self.client.read_entry("k"), expected)
+                self.session.batch.assert_awaited_with((Read("k"), Remaining("k")))
+
+    async def test_read_entry_rejects_invalid_lifetime_even_when_value_missing(
+        self,
+    ) -> None:
+        for replies, error in (
+            ([Nil(), Err("refused")], CommandError),
+            ([Nil(), Ok()], ProtocolError),
+            ([Nil()], ProtocolError),
+        ):
+            with self.subTest(replies=replies):
+                self.session.batch.return_value = replies
+                with self.assertRaises(error):
+                    await self.client.read_entry("k")
+
+    async def test_bulk_lifetimes_preserve_errors_and_duplicate_key_positions(
+        self,
+    ) -> None:
+        self.session.batch.return_value = [Nil(), Err("refused"), RemainingValue(9)]
+        result = await self.client.remaining_many(iter(("a", "b", "a")))
+        self.assertEqual(result[0], MISSING)
+        self.assertIsInstance(result[1], CommandError)
+        self.assertEqual(str(result[1]), "refused")
+        self.assertEqual(result[2], 9)
+        self.session.batch.assert_awaited_once_with(
+            (Remaining("a"), Remaining("b"), Remaining("a"))
+        )
+
+    async def test_bulk_lifetimes_reject_malformed_replies_and_count_mismatch(
+        self,
+    ) -> None:
+        for replies in ([Ok()], [], [Nil(), Nil()]):
+            with self.subTest(replies=replies):
+                self.session.batch.return_value = replies
+                with self.assertRaises(ProtocolError):
+                    await self.client.remaining_many(["a"])
+        self.session.batch.return_value = []
+        self.assertEqual(await self.client.remaining_many([]), [])
+
     async def test_commands_and_reply_values(self) -> None:
         cases = (
-            ("get", ("k",), Get("k"), Value(b"\x00\xff"), b"\x00\xff"),
-            ("get", ("k",), Get("k"), Nil(), None),
-            ("set", ("k", b"v"), Set("k", b"v"), Ok(), None),
-            ("expire", ("k", 12), Expire("k", 12), Ok(), True),
-            ("expire", ("k", 12), Expire("k", 12), Nil(), False),
-            ("delete", ("k",), Delete("k"), Ok(), True),
-            ("delete", ("k",), Delete("k"), Nil(), False),
-            ("persist", ("k",), Persist("k"), Ok(), True),
-            ("persist", ("k",), Persist("k"), Nil(), False),
-            ("ttl", ("k",), TTL("k"), Nil(), MISSING),
-            ("ttl", ("k",), TTL("k"), Persistent(), NO_EXPIRY),
-            ("ttl", ("k",), TTL("k"), TTLValue(12), 12),
-            ("subscribe", ("c",), Subscribe("c"), Subscribed("c"), None),
-            ("unsubscribe", ("c",), Unsubscribe("c"), Unsubscribed("c"), None),
-            ("publish", ("c", b"v"), Publish("c", b"v"), Delivered(3), 3),
+            ("read", ("k",), Read("k"), Value(b"\x00\xff"), b"\x00\xff"),
+            ("read", ("k",), Read("k"), Nil(), None),
+            ("write", ("k", b"v"), Write("k", b"v"), Ok(), None),
+            ("lifetime", ("k", 12), Lifetime("k", 12), Ok(), True),
+            ("lifetime", ("k", 12), Lifetime("k", 12), Nil(), False),
+            ("remove", ("k",), Remove("k"), Ok(), True),
+            ("remove", ("k",), Remove("k"), Nil(), False),
+            ("keep", ("k",), Keep("k"), Ok(), True),
+            ("keep", ("k",), Keep("k"), Nil(), False),
+            ("remaining", ("k",), Remaining("k"), Nil(), MISSING),
+            ("remaining", ("k",), Remaining("k"), Unlimited(), NO_EXPIRY),
+            ("remaining", ("k",), Remaining("k"), RemainingValue(12), 12),
+            ("watch", ("c",), Watch("c"), Watching("c"), None),
+            ("unwatch", ("c",), Unwatch("c"), Unwatched("c"), None),
+            ("send", ("c", b"v"), Send("c", b"v"), Sent(3), 3),
         )
         for method, args, command, reply, expected in cases:
             with self.subTest(command=command, reply=reply):
@@ -74,15 +122,15 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_server_errors_become_command_errors_for_every_api(self) -> None:
         for method, args in (
-            ("get", ("k",)),
-            ("set", ("k", b"v")),
-            ("expire", ("k", 1)),
-            ("delete", ("k",)),
-            ("persist", ("k",)),
-            ("ttl", ("k",)),
-            ("subscribe", ("c",)),
-            ("unsubscribe", ("c",)),
-            ("publish", ("c", b"v")),
+            ("read", ("k",)),
+            ("write", ("k", b"v")),
+            ("lifetime", ("k", 1)),
+            ("remove", ("k",)),
+            ("keep", ("k",)),
+            ("remaining", ("k",)),
+            ("watch", ("c",)),
+            ("unwatch", ("c",)),
+            ("send", ("c", b"v")),
         ):
             with self.subTest(method=method):
                 self.session.request.return_value = Err("rejected")
@@ -93,15 +141,15 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         for method, args, reply in (
-            ("get", ("k",), Ok()),
-            ("set", ("k", b"v"), Nil()),
-            ("expire", ("k", 1), Value(b"v")),
-            ("delete", ("k",), Persistent()),
-            ("persist", ("k",), TTLValue(1)),
-            ("ttl", ("k",), Ok()),
-            ("subscribe", ("c",), Subscribed("wrong")),
-            ("unsubscribe", ("c",), Unsubscribed("wrong")),
-            ("publish", ("c", b"v"), Ok()),
+            ("read", ("k",), Ok()),
+            ("write", ("k", b"v"), Nil()),
+            ("lifetime", ("k", 1), Value(b"v")),
+            ("remove", ("k",), Unlimited()),
+            ("keep", ("k",), RemainingValue(1)),
+            ("remaining", ("k",), Ok()),
+            ("watch", ("c",), Watching("wrong")),
+            ("unwatch", ("c",), Unwatched("wrong")),
+            ("send", ("c", b"v"), Ok()),
         ):
             with self.subTest(method=method, reply=reply):
                 self.session.request.return_value = reply
@@ -114,7 +162,7 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(await self.client.next_message(), message)
 
     async def test_batch_delegates_and_preserves_error_reply_positions(self) -> None:
-        commands = [Set("k", b"v"), Get("k"), Expire("k", 1)]
+        commands = [Write("k", b"v"), Read("k"), Lifetime("k", 1)]
         replies = [Ok(), Value(b"v"), Err("rejected")]
         self.session.batch.return_value = replies
         self.assertIs(await self.client.batch(commands), replies)
@@ -124,7 +172,7 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_batch_propagates_transport_failures(self) -> None:
         self.session.batch.side_effect = ConnectionError("batch failed")
         with self.assertRaisesRegex(ConnectionError, "batch failed"):
-            await self.client.batch([Get("k")])
+            await self.client.batch([Read("k")])
 
     async def test_context_manager_closes_on_success_and_caller_failure(self) -> None:
         async with self.client as entered:

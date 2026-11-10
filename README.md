@@ -2,8 +2,6 @@
 
 Velis is a lightweight in-memory key-value store with TTL expiration, pub-sub and a fixed binary TCP protocol. It runs on a single asyncio event loop, so the store needs no locks.
 
-> **Status: early development.** The store, TTL, pub-sub, TCP server and async client all work and are tested. The wire protocol is custom, and there is no authentication or TLS yet, so keep it bound to localhost. See [Roadmap](#roadmap) for what's next.
-
 ## Table of contents
 
 - [Features](#features)
@@ -29,13 +27,13 @@ Velis is a lightweight in-memory key-value store with TTL expiration, pub-sub an
 
 ## Features
 
-| Area              | Description                                                                                                                                                                                                   |
-| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Store**         | `GET` / `SET` / `DEL` / `EXPIRE` / `TTL` / `PERSIST` on opaque `bytes` values, with key-count and byte limits. Single-owner, so no locks.                                                                     |
-| **TTL**           | Exact monotonic deadlines, a heap-based expiry index, lazy read expiry and bounded background sweeps.                                                                                                         |
-| **Pub-sub**       | `SUBSCRIBE` / `UNSUBSCRIBE` / `PUBLISH`. At-most-once delivery to connected subscribers on one server. Slow network connections are disconnected when their server write buffer exceeds the configured limit. |
-| **Network**       | Fixed binary protocol over TCP, ordered pipelining, an `asyncio.Protocol` server with batched replies, and an async `Client`.                                                                                 |
-| **Configuration** | CLI environment loading and frozen limits owned by each component.                                                                                                                                            |
+| Area              | Description                                                                                                                                                                                        |
+| ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Store**         | `READ` / `WRITE` / `REMOVE` / `LIFETIME` / `REMAINING` / `KEEP` on opaque `bytes` values, with key-count and byte limits. Single-owner, so no locks.                                               |
+| **TTL**           | Exact monotonic deadlines, a heap-based expiry index, lazy read expiry and bounded background sweeps.                                                                                              |
+| **Pub-sub**       | `WATCH` / `UNWATCH` / `SEND`. At-most-once delivery to connected subscribers on one server. Slow network connections are disconnected when their server write buffer exceeds the configured limit. |
+| **Network**       | Fixed binary protocol over TCP, ordered pipelining, an `asyncio.Protocol` server with batched replies, and an async `Client`.                                                                      |
+| **Configuration** | CLI environment loading and frozen limits owned by each component.                                                                                                                                 |
 
 ---
 
@@ -66,16 +64,21 @@ Open the terminal client in another terminal:
 uv run python -m velis.tui
 ```
 
-Use `--host`, `--port` or `--read-only` as needed. Press `:` to enter commands,
-`?` for help, and `t` or `:stats` for session statistics: uptime, operation counts,
-errors, latency, GET hits/misses and pub-sub activity. Operations include background
-TTL refreshes; hit/miss counters count GET replies only. Tracked keys and statistics
-describe this client session because the protocol has no key-listing or server-stats
-command. Clearing the activity log preserves the counters.
+Use `--host`, `--port` or `--read-only` as needed. Press `:` to explore actions,
+Tab to complete an action, `/` to filter local key names, `?` for help, and
+`t` or `:status` for session statistics: uptime, operation counts,
+errors, latency, READ hits/misses and pub-sub activity. Operations include background
+TTL refreshes; hit/miss counters count READ replies only. Statistics describe this client session. `list` discovers server key names;
+tracked values and lifetime observations remain local previews, and server-wide
+statistics are unavailable. Clearing the activity log preserves the counters.
 
 The same purple mascot and wordmark appear at interactive server startup and in
 the TUI's empty value pane when there is room. A nonempty `NO_COLOR` environment
-variable disables their colors. Redirected logs stay plain.
+variable disables all TUI colors. Redirected logs stay plain.
+
+Help and statistics support ↑/↓, PgUp/PgDn and Home/End; Esc returns to browsing.
+Command mode shows matching actions and usage as you type. Value previews wrap to the pane width,
+and the layout keeps values and activity visible down to 60 columns by 14 rows.
 
 Use one connection for key/value commands and another for subscriptions:
 
@@ -89,13 +92,13 @@ async def main() -> None:
     kv = await Client.connect("127.0.0.1", 9000)
     sub = await Client.connect("127.0.0.1", 9000)
     try:
-        await kv.set("greeting", b"hello")
-        print(await kv.get("greeting"))
-        print(await kv.expire("greeting", 5_000))
-        print(await kv.get("missing"))
+        await kv.write("greeting", b"hello")
+        print(await kv.read("greeting"))
+        print(await kv.lifetime("greeting", 5_000))
+        print(await kv.read("missing"))
 
-        await sub.subscribe("news")
-        print(await kv.publish("news", b"hi"))
+        await sub.watch("news")
+        print(await kv.send("news", b"hi"))
         async with asyncio.timeout(1):
             print(await sub.next_message())
     finally:
@@ -110,17 +113,17 @@ The example prints `b"hello"`, `True`, `None`, `1`, and `Message(channel="news",
 
 Individual `Client` methods raise `CommandError` when the server replies `ERR`, `ProtocolError` for invalid outgoing fields or integer ranges, and `ConnectionError` when the connection drops or an incoming wire frame is invalid. Invalid outgoing data is rejected before writing and leaves the connection usable. Closing a client wakes waiting requests and message readers.
 
-Use `asyncio.gather(client.get("a"), client.get("b"))` to pipeline independent commands on one connection. The server executes commands and sends replies in received order; the session matches each reply to the oldest unanswered request. Server pushes are routed separately. Await an earlier command when a later one depends on its result.
+Use `asyncio.gather(client.read("a"), client.read("b"))` to pipeline independent commands on one connection. The server executes commands and sends replies in received order; the session matches each reply to the oldest unanswered request. Server pushes are routed separately. Await an earlier command when a later one depends on its result.
 
 Use `Client.batch()` to group commands into writes and collect their replies in input order:
 
 ```python
-from velis.core.messages import TTL, Get, Set
+from velis.core.messages import Remaining, Read, Write
 
 replies = await client.batch(
-    [Set("greeting", b"hello"), Get("greeting"), TTL("greeting")]
+    [Write("greeting", b"hello"), Read("greeting"), Remaining("greeting")]
 )
-# [Ok(), Value(value=b"hello"), Persistent()]
+# [Ok(), Value(value=b"hello"), Unlimited()]
 ```
 
 Batch results are typed reply objects from `velis.core.messages`, including `Err` in the position of each command the server rejects. A command error does not stop later commands. All commands are encoded before anything is sent, so an invalid outgoing command rejects the whole batch without sending a prefix. Empty batches return `[]`.
@@ -135,7 +138,7 @@ Clients allow at most 64 in-flight requests by default, matching one server comm
 
 Clients buffer at most 1,024 unread messages and 8 MiB of channel/payload bytes by default, measured as UTF-8 channel bytes plus payload bytes after wire decoding. Set `max_pending_messages` and `max_pending_bytes` on the same `SessionLimits` object to change these positive limits. Crossing either limit closes the connection and fails pending requests. Already queued messages can be drained before `next_message()` raises `ConnectionError`. A full message buffer never blocks the reply reader.
 
-`PUBLISH` returns the number of subscriber connections that accepted the message for delivery. It does not acknowledge that their applications have read or processed it.
+`SEND` returns the number of subscriber connections that accepted the message for delivery. It does not acknowledge that their applications have read or processed it.
 
 `Client.connect()` and `TCPSession.connect()` default to `127.0.0.1:9000`, matching the listener defaults. Explicit arguments override them; environment settings are loaded only through `Config.from_env()`.
 
@@ -147,6 +150,61 @@ waits with `asyncio.timeout()`; shutdown has its own flush deadline.
 The custom `Keepalive` type, `keepalive=` arguments and `VELIS_TCP_KEEP*`
 settings have been removed. Remove these arguments from embedded callers;
 the old environment variables no longer affect configuration.
+
+The terminal and wire use the same command names:
+
+| Terminal action          | Wire command | Purpose                                         |
+| ------------------------ | ------------ | ----------------------------------------------- |
+| `ping`                   | `PING`       | Check a round trip                              |
+| `list [PREFIX] [CURSOR]` | `LIST`       | Discover a page of server key names             |
+| `exists NAME`            | `EXISTS`     | Inspect existence without reading the value     |
+| `size NAME`              | `SIZE`       | Inspect value byte length without reading it    |
+| `read NAME`              | `READ`       | Read a value                                    |
+| `write NAME TEXT`        | `WRITE`      | Write text; Python/wire values remain bytes     |
+| `remove NAME`            | `REMOVE`     | Remove a key                                    |
+| `lifetime NAME 5m`       | `LIFETIME`   | Set a relative lifetime; wire uses milliseconds |
+| `remaining NAME`         | `REMAINING`  | Inspect remaining lifetime                      |
+| `keep NAME`              | `KEEP`       | Remove the lifetime limit                       |
+| `watch CHANNEL`          | `WATCH`      | Listen for messages                             |
+| `unwatch CHANNEL`        | `UNWATCH`    | Stop listening                                  |
+| `send CHANNEL TEXT`      | `SEND`       | Send a message                                  |
+
+`sync`, `untrack`, `clear`, `status`, `help` and `quit` manage the terminal session.
+Use `w`, `l`, `x` or `p` to start write, lifetime, remove or keep for the selected
+key. `b` starts a server key listing. `/` filters names locally; Enter accepts the filter and Esc restores it while
+editing or clears it while browsing. `r` syncs observed lifetimes. Reads remain
+explicit: selecting or filtering a key never reads it from the server.
+
+Every queued terminal action has ten seconds from submission to completion.
+Expired queued actions are reported and discarded before sending. A timeout after
+transmission may leave the action applied on the server. Read-only policy is checked
+at submission and again before execution. A sync reports per-key errors while still
+applying successful results for other keys.
+
+`list` returns up to 100 names per page and scans at most 1,000 candidates.
+A nonzero cursor means more candidates remain, including when a filtered page is
+empty. Continue with `list "PREFIX" CURSOR`; cursor zero ends the listing. Treat continuation cursors as opaque. Names
+are tracked without fetching values. Listing is weakly consistent: concurrent
+inserts, removals or expiry can change later pages. Offset skipping costs grow
+with the cursor; the candidate bound is not a hard latency guarantee.
+
+`Client.list_keys(prefix="", cursor=0, limit=100)` returns `KeyPage(cursor, keys)`;
+limits must be between 1 and 100. `Client.exists(key)` returns a boolean,
+`Client.size(key)` returns the value byte length or `None` for a missing key, and
+`Client.ping()` checks a complete round trip. These metadata operations do not
+increment read hit/miss counters or update eviction usage.
+
+`Client.read_entry(key)` returns an `EntrySnapshot(value, remaining_ms)` from two
+ordered commands; it is not an atomic snapshot. `Client.remaining_many(keys)`
+returns ordered integers or `CommandError` objects for individual server rejections;
+malformed replies and transport failures raise. `Client.batch()` retains raw replies.
+
+**Breaking change:** the old command names and Python client methods have been
+removed. Update clients and servers together. The dedicated hex-write terminal
+command has been removed; use `write` for text or `Client.write()` for opaque bytes.
+Reply tags now follow the same vocabulary: WATCHING, UNWATCHED, SENT,
+REMAINING_VALUE and UNLIMITED. Update reply decoders together with request
+encoders. Length-prefixed field encodings retain their existing layouts.
 
 ---
 
@@ -181,7 +239,9 @@ flowchart TB
 
 Commands, replies and publication pushes are frozen dataclasses in `velis.core.messages`. `net.wire` provides reusable field codecs and a table-driven message codec. `net.protocol` declares each tag and its fields once, frames encoded bodies, and exposes `encode_command()`, `encode_message()`, `iter_frames()` and `read_frame()`.
 
-The design uses a few patterns with specific responsibilities.
+The design uses a few patterns with specific responsibilities. See the
+[architecture review](docs/architecture.md) for ownership boundaries, pattern
+choices, terminal behavior and validation limits.
 
 | Pattern                 | Where it applies                                                | Purpose                                                                      |
 | ----------------------- | --------------------------------------------------------------- | ---------------------------------------------------------------------------- |
@@ -198,16 +258,16 @@ Clients support async context management, including cleanup after caller failure
 ```python
 async def read_greeting() -> bytes | None:
     async with await Client.connect() as client:
-        return await client.get("greeting")
+        return await client.read("greeting")
 ```
 
 ### Request lifecycle
 
 Cache mutations only change memory. The store validates the TTL range and raises `CommandError` for invalid TTLs without changing existing values or deadlines. The engine lets command errors reach the transport, which replies with `ERR` and keeps the connection open. The store owns its monotonic clock and delegates timer scheduling, cancellation and sweeps to `ExpiryIndex`. System wall-clock adjustments do not change TTL duration.
 
-`SET` clears any previous TTL. `EXPIRE` returns `NIL` for a missing or already expired key, so it cannot revive expired data. A zero TTL expires a live key immediately. Accepted TTLs are between `0` and `2**62` milliseconds, inclusive.
+`WRITE` clears any previous TTL. `LIFETIME` returns `NIL` for a missing or already expired key, so it cannot revive expired data. A zero TTL expires a live key immediately. Accepted TTLs are between `0` and `2**62` milliseconds, inclusive.
 
-`await client.delete(key)` returns `True` when a live key was deleted, freeing its key and byte capacity; missing or expired keys return `False`. `await client.ttl(key)` returns remaining milliseconds, `-1` for a live key without expiry, or `-2` for a missing or expired key. TTL reads remove expired values without refreshing their deadlines. `await client.persist(key)` removes a live key's TTL while keeping its value and returns whether a deadline was removed. It returns `False` for missing, expired or already persistent keys. On the wire, `TTL` uses `TTL_VALUE` for remaining milliseconds, `PERSISTENT` for no expiry and `NIL` for missing keys; the client maps these to the integer API above. These commands use the same key validation as `GET`.
+`await client.remove(key)` returns `True` when a live key was deleted, freeing its key and byte capacity; missing or expired keys return `False`. `await client.remaining(key)` returns remaining milliseconds, `-1` for a live key without expiry, or `-2` for a missing or expired key. TTL reads remove expired values without refreshing their deadlines. `await client.keep(key)` removes a live key's TTL while keeping its value and returns whether a deadline was removed. It returns `False` for missing, expired or already persistent keys. On the wire, `REMAINING` uses `REMAINING_VALUE` for remaining milliseconds, `UNLIMITED` for no expiry and `NIL` for missing keys; the client maps these to the integer API above. These commands use the same key validation as `READ`.
 
 Direct core callers use `Store.ttl(key)`, which returns remaining milliseconds, `TtlStatus.PERSISTENT` or `TtlStatus.MISSING`. Import `TtlStatus` from `velis.core.store`. The `Engine` translates these enum values into wire replies; the client's `-1` and `-2` sentinels remain unchanged.
 
@@ -219,11 +279,11 @@ sequenceDiagram
     participant E as Engine
     participant K as Store
 
-    C->>T: request(Set(key, value))
+    C->>T: request(Write(key, value))
     T->>T: protocol.encode_command(command)
-    T->>S: Length-prefixed SET frame
+    T->>S: Length-prefixed WRITE frame
     S->>S: data_received(), decode next complete frame
-    S->>E: execute(Set, connection)
+    S->>E: execute(Write, connection)
     E->>K: set(key, value)
     E-->>S: Ok()
     S->>S: encode reply and flush batch
@@ -231,11 +291,11 @@ sequenceDiagram
     T->>T: protocol.read_frame(reader), decode and resolve oldest request
     T-->>C: Ok()
 
-    C->>T: request(Get(key))
+    C->>T: request(Read(key))
     T->>T: protocol.encode_command(command)
-    T->>S: Length-prefixed GET frame
+    T->>S: Length-prefixed READ frame
     S->>S: data_received(), decode next complete frame
-    S->>E: execute(Get, connection)
+    S->>E: execute(Read, connection)
     E->>K: get(key)
     K-->>E: value
     E-->>S: Value(value)
@@ -268,41 +328,41 @@ sequenceDiagram
     participant N as Subscriber Connection
     participant P as Publisher TCPSession
 
-    A->>S: SUBSCRIBE news frame
-    S->>E: execute(Subscribe, subscriber connection)
+    A->>S: WATCH news frame
+    S->>E: execute(Watch, subscriber connection)
     E->>B: subscribe(news, subscriber connection)
-    E-->>S: Subscribed(news)
-    S-->>A: SUBSCRIBED news frame
+    E-->>S: Watching(news)
+    S-->>A: WATCHING news frame
 
-    P->>S: PUBLISH news payload frame
-    S->>E: execute(Publish, publisher connection)
+    P->>S: SEND news payload frame
+    S->>E: execute(Send, publisher connection)
     E->>B: publish(news, payload)
     B->>N: send(Message(news, payload))
     N->>N: protocol.encode_push(message)
     N-->>A: MESSAGE news payload frame
     N-->>B: True when accepted for delivery
     B-->>E: accepted count
-    E-->>S: Delivered(1)
-    S-->>P: DELIVERED 1 frame
+    E-->>S: Sent(1)
+    S-->>P: SENT 1 frame
     A->>A: Decode wire frame and queue Message
 ```
 
-Network arrows above represent complete length-prefixed frames encoded and decoded with the fixed wire format. `DELIVERED 1` means one connection accepted the push, regardless of when the subscriber reads it.
+Network arrows above represent complete length-prefixed frames encoded and decoded with the fixed wire format. `SENT 1` means one connection accepted the push, regardless of when the subscriber reads it.
 
 ### Key lifecycle
 
 ```mermaid
 stateDiagram-v2
     [*] --> Missing
-    Missing --> Live: SET
-    Missing --> Missing: GET or EXPIRE returns NIL
-    Live --> Live: SET overwrites
-    Live --> Expiring: EXPIRE sets a deadline
-    Expiring --> Expiring: EXPIRE replaces deadline
-    Expiring --> Live: SET clears TTL
+    Missing --> Live: WRITE
+    Missing --> Missing: READ or LIFETIME returns NIL
+    Live --> Live: WRITE overwrites
+    Live --> Expiring: LIFETIME sets a deadline
+    Expiring --> Expiring: LIFETIME replaces deadline
+    Expiring --> Live: WRITE clears TTL
     Expiring --> Expired: deadline reached
-    Expired --> Missing: GET, EXPIRE or sweep removes entry
-    Expired --> Live: SET replaces expired entry
+    Expired --> Missing: READ, LIFETIME or sweep removes entry
+    Expired --> Live: WRITE replaces expired entry
     note right of Expired
         Logically missing immediately.
         Physical cleanup can happen later.
@@ -360,34 +420,45 @@ The following tables describe the fixed command and server-message bodies (`COMM
 
 **Requests**
 
-| Command       | Fields                           | Reply                                      |
-| ------------- | -------------------------------- | ------------------------------------------ |
-| `GET`         | `key: str`                       | `VALUE` or `NIL`                           |
-| `SET`         | `key: str`, `value: bytes`       | `OK`                                       |
-| `EXPIRE`      | `key: str`, `ms: u64`            | `OK`, or `NIL` if the key doesn't exist    |
-| `DEL`         | `key: str`                       | `OK` if deleted, otherwise `NIL`           |
-| `TTL`         | `key: str`                       | `TTL_VALUE`, `PERSISTENT`, or `NIL`        |
-| `PERSIST`     | `key: str`                       | `OK` if a TTL was removed, otherwise `NIL` |
-| `SUBSCRIBE`   | `channel: str`                   | `SUBSCRIBED`                               |
-| `UNSUBSCRIBE` | `channel: str`                   | `UNSUBSCRIBED`                             |
-| `PUBLISH`     | `channel: str`, `payload: bytes` | `DELIVERED`                                |
+| Command     | Fields                                     | Reply                                                 |
+| ----------- | ------------------------------------------ | ----------------------------------------------------- |
+| `PING`      | none                                       | `PONG`                                                |
+| `EXISTS`    | `key: str`                                 | `FOUND` or `NIL`                                      |
+| `SIZE`      | `key: str`                                 | `SIZE_VALUE` or `NIL`                                 |
+| `LIST`      | `prefix: str`, `cursor: u64`, `limit: u32` | `KEY_PAGE`                                            |
+| `READ`      | `key: str`                                 | `VALUE` or `NIL`                                      |
+| `WRITE`     | `key: str`, `value: bytes`                 | `OK`                                                  |
+| `LIFETIME`  | `key: str`, `ms: u64`                      | `OK`, or `NIL` if the key does not exist              |
+| `REMOVE`    | `key: str`                                 | `OK` if removed, otherwise `NIL`                      |
+| `REMAINING` | `key: str`                                 | `REMAINING_VALUE`, `UNLIMITED`, or `NIL`              |
+| `KEEP`      | `key: str`                                 | `OK` if a lifetime limit was removed, otherwise `NIL` |
+| `WATCH`     | `channel: str`                             | `WATCHING`                                            |
+| `UNWATCH`   | `channel: str`                             | `UNWATCHED`                                           |
+| `SEND`      | `channel: str`, `payload: bytes`           | `SENT`                                                |
 
-The default encoded body is the command name as a string followed by its fields.
+The encoded body is the command name as a string followed by its fields. LIST
+accepts an empty prefix of at most 2,048 UTF-8 bytes; its limit is 1–100. The reply
+KEY_PAGE carries `cursor: u64` followed by `keys: tuple[str, ...]`, encoded as a
+u32 count and that many length-prefixed UTF-8 strings. At most 100 names are
+returned, each at most 2,048 encoded bytes.
 
 Request keys contain 1–512 characters and request channels contain 1–256 characters. Their UTF-8 byte lengths are capped at 2,048 and 1,024 bytes respectively, allowing four bytes per character. These byte limits are checked before UTF-8 decoding, then the character rules run on the decoded strings. The character rules also run before sending; whitespace and control characters are allowed. Reply and push channels have the same 1,024-byte limit and UTF-8 validation, without the request-channel emptiness and character-count rules.
 
 **Replies and pushes**
 
-| Server message                         | Fields                             |
-| -------------------------------------- | ---------------------------------- |
-| `OK` / `NIL`                           | none                               |
-| `VALUE`                                | `value: bytes`                     |
-| `TTL_VALUE`                            | `ms: u64`                          |
-| `PERSISTENT`                           | none; the key exists without a TTL |
-| `ERR`                                  | `message: str`                     |
-| `SUBSCRIBED` / `UNSUBSCRIBED`          | `channel: str`                     |
-| `DELIVERED`                            | `count: u32`                       |
-| `MESSAGE` _(server push, not a reply)_ | `channel: str`, `payload: bytes`   |
+| Server message           | Fields                                 |
+| ------------------------ | -------------------------------------- |
+| `OK` / `NIL`             | none                                   |
+| `VALUE`                  | `value: bytes`                         |
+| `REMAINING_VALUE`        | `ms: u64`                              |
+| `UNLIMITED`              | none; the key has no lifetime limit    |
+| `ERR`                    | `message: str`                         |
+| `WATCHING` / `UNWATCHED` | `channel: str`                         |
+| `SENT`                   | `count: u32`                           |
+| `PONG` / `FOUND`         | none                                   |
+| `SIZE_VALUE`             | `size: u64`                            |
+| `KEY_PAGE`               | `cursor: u64`, `keys: tuple[str, ...]` |
+| `MESSAGE` (server push)  | `channel: str`, `payload: bytes`       |
 
 **Errors**
 
@@ -415,11 +486,11 @@ S3-FIFO follows the [SOSP 2023 paper's queue and counter rules](https://www.cs.c
 
 In Velis, queue targets follow the **current resident key count**, independently of `max_keys`: the small target is `max(1, int(residents * small_ratio))`, and the main target is `max(1, residents - small_target)`. `S3FIFO(small_ratio=0.1, ghost_ratio=0.9)` supplies the defaults. Small ratios must be between zero and one; ghost ratios must be positive. After every deletion or eviction, ghost history is trimmed to `max(1, int(residents * ghost_ratio))` keys and retains no values. It adds Python metadata and retained key strings outside `stored_bytes`. Queues borrow unused space, and the store independently enforces both total limits. With variable-sized values or very small caches, behavior can differ from the paper's equal-sized-object model. Each policy eviction removes exactly one resident, though it may first promote several small entries.
 
-Eviction may remove several entries to fit the byte budget. Every victim's value, byte accounting, timer and resident policy metadata are removed together; S3-FIFO may retain ghost history. Explicit deletion and TTL expiry forget policy history. Under capacity pressure, every policy performs one bounded expiry sweep before evicting live entries. Remaining expired entries are reclaimed by later reads or maintenance. `GET` hits update access history. Each successful `SET` starts fresh access history and clears any TTL; a new S3-FIFO entry starts with zero reuse credit. Re-inserting a key remembered in S3-FIFO ghost history enters main directly. TTL inspection and expiry changes do not count as accesses. LFU uses a min-heap ordered by frequency and last access, with lazy stale-entry removal and compaction; access and eviction cost amortized O(log n).
+Eviction may remove several entries to fit the byte budget. Every victim's value, byte accounting, timer and resident policy metadata are removed together; S3-FIFO may retain ghost history. Explicit deletion and TTL expiry forget policy history. Under capacity pressure, every policy performs one bounded expiry sweep before evicting live entries. Remaining expired entries are reclaimed by later reads or maintenance. `READ` hits update access history. Each successful `WRITE` starts fresh access history and clears any TTL; a new S3-FIFO entry starts with zero reuse credit. Re-inserting a key remembered in S3-FIFO ghost history enters main directly. TTL inspection and expiry changes do not count as accesses. LFU uses a min-heap ordered by frequency and last access, with lazy stale-entry removal and compaction; access and eviction cost amortized O(log n).
 
 `Store` owns its value dictionary, byte accounting, an eviction policy and `ExpiryIndex`, keeping their key sets consistent in one place. Each entry retains its size so removal does not re-encode the key; policies choose victims; the expiry index tracks deadlines. Store-driven removals forget policy history, while capacity eviction preserves whatever ghost history the policy retains. Both paths remove the value and timer together. Capacity checks reclaim expired keys before selecting live victims.
 
-`store.stats()` returns a frozen `StoreStats(hits, misses, evictions, expirations)` snapshot. Hits and misses count `GET` results only. Evictions count capacity victims; expirations count keys physically removed by lazy access, sweeps or write-time cleanup. Deleting or overwriting live keys does not increment either removal counter. Counters accumulate from construction, and taking a snapshot does not purge keys or reset them.
+`store.stats()` returns a frozen `StoreStats(hits, misses, evictions, expirations)` snapshot. Hits and misses count `READ` results only. Evictions count capacity victims; expirations count keys physically removed by lazy access, sweeps or write-time cleanup. Deleting or overwriting live keys does not increment either removal counter. Counters accumulate from construction, and taking a snapshot does not purge keys or reset them.
 
 Eviction policies expose resident key counts and membership through `len(policy)` and `key in policy`; S3-FIFO ghosts are excluded.
 
@@ -427,7 +498,7 @@ Running `uv run velis` uses S3-FIFO by default. Choose LRU with `VELIS_EVICTION_
 
 Each connection can subscribe to at most 1,024 channels by default. Repeating an existing subscription uses no extra capacity; unsubscribing frees a slot. The listener admits at most 1,024 active connections by default. Excess connections receive a best-effort `ERR` and are closed, leaving admitted clients usable.
 
-Pub-sub provides at-most-once delivery to connected subscribers on the same server. Messages are not persisted, retried or replayed, and no server-to-server replication is implemented. Slow subscribers are disconnected when server write buffers or client unread-message queues overflow. A network subscriber that cannot accept an encoded push is disconnected and removed from every channel; publication continues to healthy subscribers. Messages may be lost on disconnect; `PUBLISH` counts accepted deliveries, without acknowledging application processing. Future replication should carry pub-sub messages, not cache state.
+Pub-sub provides at-most-once delivery to connected subscribers on the same server. Messages are not persisted, retried or replayed, and no server-to-server replication is implemented. Slow subscribers are disconnected when server write buffers or client unread-message queues overflow. A network subscriber that cannot accept an encoded push is disconnected and removed from every channel; publication continues to healthy subscribers. Messages may be lost on disconnect; `SEND` counts accepted deliveries, without acknowledging application processing.
 
 ---
 
@@ -484,7 +555,7 @@ async def embedded() -> None:
         async with await Client.connect(
             config.server_limits.host, server.port, limits=config.session_limits
         ) as client:
-            await client.set("greeting", b"hello")
+            await client.write("greeting", b"hello")
 ```
 
 Client environment settings take effect when passing `config.session_limits` to `Client.connect()` or `TCPSession.connect()`. Host and port must also be passed explicitly when using environment overrides. `Config.from_env(mapping)` supports loading an explicit mapping, including an empty mapping for defaults.
@@ -502,12 +573,12 @@ Stored values and publication payloads are opaque bytes from end to end. Applica
 `protocol.COMMANDS` and `protocol.SERVER_MESSAGES` expose body encoding and decoding. `protocol.encode_command()` and `encode_message()` add the fixed u32 body length. `iter_frame_spans(bytearray)` yields body offsets so the server decodes directly from its input buffer, copying only retained fields. Decoded payloads are independent immutable bytes, and no view pins the receive buffer. `iter_frames(bytearray)` remains available for callers needing owned body bytes; callers discard consumed bytes only after iteration ends. The client loops over `read_frame(reader)`, which reads and validates the length before waiting for the body, then decodes each body with `SERVER_MESSAGES`. Clean EOF at a frame boundary returns `None`; partial headers and bodies raise `IncompleteReadError`.
 
 ```python
-from velis.core.messages import Get
+from velis.core.messages import Read
 from velis.net.protocol import COMMANDS, encode_command
 
-encoded = encode_command(Get("k"))
-assert encoded == b"\x00\x00\x00\x0c\x00\x00\x00\x03GET\x00\x00\x00\x01k"
-assert COMMANDS.decode(encoded[4:]) == Get("k")
+encoded = encode_command(Read("k"))
+assert encoded == b"\x00\x00\x00\x0d\x00\x00\x00\x04READ\x00\x00\x00\x01k"
+assert COMMANDS.decode(encoded[4:]) == Read("k")
 ```
 
 Golden byte fixtures cover every command, reply and push. Truncation, malformed-field and mutation tests enforce the fixed format and error contracts; raw TCP tests cover batching, fragmentation, backpressure, admission and shutdown.
@@ -537,9 +608,11 @@ src/velis/
     wire.py — reusable field codecs and table-driven tagged message codec
     limits.py — fixed wire field and text limits; codecs derive frame limits
     defaults.py — default host, port and close timeout shared by client and server
-    connection.py — asyncio.Protocol callbacks, ordered batches and push buffering
+    connection.py — asyncio.Protocol callbacks, flow control and push buffering
+    dispatch.py — synchronous bounded command execution and reply batching
     server.py — TCPServer listener lifecycle and connection admission
-    client.py — opaque-byte command API, error translation and scoped cleanup
+    client.py — opaque-byte command API and scoped cleanup
+    replies.py — shared reply validation and value/TTL interpretation
     session.py — Session interface and TCP request/message lifecycle
     pending.py — bounded FIFO reply slots, independent of transport I/O
   tui/
@@ -547,9 +620,18 @@ src/velis/
     commands.py — quoted command parsing, validation and help metadata
     text.py — escaped text, terminal cell widths and value previews
     models.py — tracked keys, activity records and session statistics
-    workspace.py — queued client operations, TTL refreshes and pub-sub delivery
-    view.py — screen state and rendering
-    ui.py — keyboard input, command history and task lifecycle
+    workspace.py — queue lifecycle, shared deadlines and pub-sub delivery
+    admission.py — command policy and explicit submission outcomes
+    session_model.py — bounded observations and session counters
+    operations.py — command execution and successful reply effects
+    discovery.py — connectivity, metadata and paginated name discovery
+    state.py — selection, scrolling, mode and command draft
+    view.py — composition of terminal presenters
+    layout.py, surface.py — pane geometry, safe terminal writes and theme
+    panes.py, overlays.py, chrome.py — values, keys, activity, help and status
+    ui.py — terminal task lifecycle
+    keyboard.py, filtering.py — mode routing and local key filtering
+    editor.py — command editing, bounded history and draft restoration
 tests/
   helpers.py — ManualClock and RecordingSubscriber test helpers
   app/ — runtime cleanup, CLI signals and terminal client behavior
@@ -603,17 +685,17 @@ latency, fairness across connections or pub-sub fan-out performance.
 The latest run followed the composability refactor: 20,000 measured operations,
 2,000 warmups, three repeats with alternating case order, 10,000 resident keys,
 16-byte keys and 64-byte values. The session allows 64 unanswered requests and
-a 256 KiB batch byte target. SET overwrites resident keys; GET misses use a
+a 256 KiB batch byte target. WRITE overwrites resident keys; READ misses use a
 disjoint prefix. Each submitted window is fully answered before the next.
 
 Cells show **median operations/s (minimum–maximum)** across three samples.
 Depth 1 measures sequential calls; depth 64 measures submitted pipeline windows.
 
-| Operation     |  Client.batch, depth 1 |    Client.batch, depth 64 |           Raw, depth 1 |             Raw, depth 64 |
-| ------------- | ---------------------: | ------------------------: | ---------------------: | ------------------------: |
-| SET overwrite | 16,085 (10,186–17,161) | 123,681 (113,165–130,391) | 21,208 (14,698–22,428) | 188,820 (182,665–193,704) |
-| GET hit       | 17,025 (16,771–17,341) | 144,491 (142,358–147,602) | 22,575 (22,432–23,232) | 246,634 (223,702–246,966) |
-| GET miss      | 17,719 (17,593–18,464) | 178,872 (157,290–181,150) | 24,461 (23,411–25,285) | 333,165 (301,659–338,457) |
+| Operation       |  Client.batch, depth 1 |    Client.batch, depth 64 |           Raw, depth 1 |             Raw, depth 64 |
+| --------------- | ---------------------: | ------------------------: | ---------------------: | ------------------------: |
+| WRITE overwrite | 16,085 (10,186–17,161) | 123,681 (113,165–130,391) | 21,208 (14,698–22,428) | 188,820 (182,665–193,704) |
+| READ hit        | 17,025 (16,771–17,341) | 144,491 (142,358–147,602) | 22,575 (22,432–23,232) | 246,634 (223,702–246,966) |
+| READ miss       | 17,719 (17,593–18,464) | 178,872 (157,290–181,150) | 24,461 (23,411–25,285) | 333,165 (301,659–338,457) |
 
 The matching run before the composability refactor had median differences of
 −2.9% to +6.2% across these cases; this does not establish a material throughput
@@ -628,22 +710,22 @@ and encoding changes. This run preceded the latest composability refactor:
 values. Both snapshots already contained uncommitted changes; “before” does not
 mean git HEAD. Cells show **median operations/s (minimum–maximum)**.
 
-| Operation     | Mode         | Submitted depth |                   Before |                     After |
-| ------------- | ------------ | --------------: | -----------------------: | ------------------------: |
-| SET overwrite | Client.batch |               1 |        1,377 (547–1,506) |       1,761 (1,505–1,793) |
-| SET overwrite | Client.batch |               8 |        1,028 (481–1,163) |         1,534 (847–1,593) |
-| SET overwrite | Raw          |               1 |      1,683 (1,455–1,897) |       2,521 (2,497–2,594) |
-| SET overwrite | Raw          |               8 |      2,144 (1,750–2,147) |       3,727 (3,424–3,799) |
-| GET hit       | Client.batch |               1 |      1,326 (1,070–1,977) |       1,499 (1,407–1,661) |
-| GET hit       | Client.batch |               8 |      1,572 (1,560–1,970) |       1,772 (1,692–1,793) |
-| GET hit       | Raw          |               1 |      1,691 (1,543–2,059) |       1,957 (1,826–2,055) |
-| GET hit       | Raw          |               8 |            896 (891–898) |           993 (868–1,260) |
-| GET miss      | Client.batch |               1 |   16,253 (15,622–19,335) |    16,894 (16,691–17,984) |
-| GET miss      | Client.batch |               8 |   87,101 (83,511–98,593) |    76,285 (69,401–82,539) |
-| GET miss      | Raw          |               1 |   23,597 (20,154–24,727) |    24,783 (23,101–26,023) |
-| GET miss      | Raw          |               8 | 133,687 (89,129–140,012) | 142,655 (138,313–144,336) |
+| Operation       | Mode         | Submitted depth |                   Before |                     After |
+| --------------- | ------------ | --------------: | -----------------------: | ------------------------: |
+| WRITE overwrite | Client.batch |               1 |        1,377 (547–1,506) |       1,761 (1,505–1,793) |
+| WRITE overwrite | Client.batch |               8 |        1,028 (481–1,163) |         1,534 (847–1,593) |
+| WRITE overwrite | Raw          |               1 |      1,683 (1,455–1,897) |       2,521 (2,497–2,594) |
+| WRITE overwrite | Raw          |               8 |      2,144 (1,750–2,147) |       3,727 (3,424–3,799) |
+| READ hit        | Client.batch |               1 |      1,326 (1,070–1,977) |       1,499 (1,407–1,661) |
+| READ hit        | Client.batch |               8 |      1,572 (1,560–1,970) |       1,772 (1,692–1,793) |
+| READ hit        | Raw          |               1 |      1,691 (1,543–2,059) |       1,957 (1,826–2,055) |
+| READ hit        | Raw          |               8 |            896 (891–898) |           993 (868–1,260) |
+| READ miss       | Client.batch |               1 |   16,253 (15,622–19,335) |    16,894 (16,691–17,984) |
+| READ miss       | Client.batch |               8 |   87,101 (83,511–98,593) |    76,285 (69,401–82,539) |
+| READ miss       | Raw          |               1 |   23,597 (20,154–24,727) |    24,783 (23,101–26,023) |
+| READ miss       | Raw          |               8 | 133,687 (89,129–140,012) | 142,655 (138,313–144,336) |
 
-Large SET medians improved about 28–49% through `Client.batch()` and 50–74% in
+Large WRITE medians improved about 28–49% through `Client.batch()` and 50–74% in
 raw mode. Sample variation was substantial, especially in the first samples;
 these before/after runs were not randomized or CPU-pinned. The 256 KiB client
 byte target sends each 1 MiB command alone even at submitted depth 8, while raw
@@ -656,14 +738,14 @@ per case. Setup is outside timing; result checks are inside timing. Values are
 median operations/s. Dispatch uses a checked in-memory transport, so these rates
 must not be presented as TCP throughput.
 
-| Operation                   |    Before |      After |
-| --------------------------- | --------: | ---------: |
-| encode SET 64 B             | 1,005,509 |  1,167,711 |
-| encode SET 1 MiB            |     9,928 |     12,221 |
-| dispatch SET 64 B, depth 32 |   298,161 |    297,150 |
-| dispatch SET 1 MiB          |     1,418 |     20,967 |
-| refresh unchanged TTL       | 6,908,848 | 18,438,200 |
-| refresh changing TTL        | 6,708,817 |  5,919,332 |
+| Operation                     |    Before |      After |
+| ----------------------------- | --------: | ---------: |
+| encode WRITE 64 B             | 1,005,509 |  1,167,711 |
+| encode WRITE 1 MiB            |     9,928 |     12,221 |
+| dispatch WRITE 64 B, depth 32 |   298,161 |    297,150 |
+| dispatch WRITE 1 MiB          |     1,418 |     20,967 |
+| refresh unchanged TTL         | 6,908,848 | 18,438,200 |
+| refresh changing TTL          | 6,708,817 |  5,919,332 |
 
 The 1 MiB dispatch case's separately traced peak allocations fell from 4,195,300
 to 3,146,965 bytes, about 25%; this excludes prebuilt inputs and is not process RSS.
@@ -749,9 +831,18 @@ Results are summarized here; the repository does not retain result JSON files.
 
 ## Roadmap
 
-- [x] `DEL`, `TTL` and `PERSIST` commands.
-- [x] Bounded ordered pipelining with cancellation-safe reply handling.
-- [ ] Pub-sub message replication between servers, independent of cache state.
-- [x] Connection and memory limits.
-- [x] Built-in S3-FIFO (default), LRU and LFU eviction policies.
-- [ ] Authentication and TLS.
+Delivered capabilities:
+
+- [x] Opaque-byte storage, value reads and removal.
+- [x] Relative lifetimes, remaining-lifetime queries and unlimited retention.
+- [x] S3-FIFO, LRU and LFU eviction with key and byte limits.
+- [x] Bounded maintenance and lazy expiry.
+- [x] Channel watching and sending with bounded message buffers.
+- [x] Fixed binary commands, typed replies and validated codecs.
+- [x] Connectivity probes, existence and size metadata, and paginated key discovery.
+- [x] Async Python client and ordered, cancellation-safe pipelining.
+- [x] Batched commands and typed value/lifetime observations.
+- [x] Connection admission, backpressure and bounded shutdown.
+- [x] Immutable component limits and environment configuration.
+- [x] Terminal workspace with local filtering, completion, help and session status.
+- [x] Shared admission policy, read-only enforcement and queued-action deadlines.

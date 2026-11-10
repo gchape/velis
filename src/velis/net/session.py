@@ -83,6 +83,7 @@ class _MessageBuffer:
         return message
 
     def close(self) -> None:
+        """Wake readers while preserving queued messages for draining."""
         self._queue.shutdown()
 
 
@@ -297,14 +298,14 @@ class TCPSession:
         cleanup, then not again. Expected OSError failures while closing the
         transport are suppressed. A stalled flush is aborted after the close
         timeout; cancelling close also aborts before propagating cancellation.
+        asyncio.wait preserves StreamWriter's shared close waiter on timeout
+        or cancellation so cleanup can await it after aborting.
         """
         self._begin_close()
         self._reader_task.cancel()
         closed = asyncio.create_task(self._writer.wait_closed())
         try:
             async with asyncio.timeout(self._close_timeout_seconds):
-                # wait() preserves StreamWriter's close waiter if this scope
-                # times out or is cancelled; cleanup still needs to await it.
                 await asyncio.wait((self._reader_task, closed))
         except TimeoutError:
             pass

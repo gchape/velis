@@ -54,16 +54,12 @@ from velis.config import (
 from velis.core.broker import Broker
 from velis.core.engine import Engine
 from velis.core.expiry_index import ExpiryIndex
-from velis.core.messages import NIL, OK, Get, Nil, Ok, Set, Value
+from velis.core.messages import NIL, OK, Nil, Ok, Read, Value, Write
 from velis.core.store import Store
 from velis.net.client import Client
 from velis.net.connection import Connection
 from velis.net.limits import MAX_FIELD_BYTES
 from velis.net.protocol import encode_command, encode_message
-
-# --------------------------------------------------------------------------
-# Shared helpers
-# --------------------------------------------------------------------------
 
 
 def _cpu_model() -> str:
@@ -80,7 +76,7 @@ def _git(*args: str) -> str | None:
         return subprocess.run(
             ["git", *args], check=True, capture_output=True, text=True
         ).stdout.strip()
-    except (OSError, subprocess.CalledProcessError):
+    except OSError, subprocess.CalledProcessError:
         return None
 
 
@@ -104,12 +100,8 @@ def _emit(report: dict[str, object], output: Path | None) -> None:
     print(encoded, end="")
 
 
-# --------------------------------------------------------------------------
-# tcp: Client.batch, concurrent calls and raw pipeline windows
-# --------------------------------------------------------------------------
-
 KEY_COUNT = 10_000
-type CacheCommand = Get | Set
+type CacheCommand = Read | Write
 type Windows = list[tuple[CacheCommand, ...]]
 
 
@@ -177,14 +169,16 @@ def _workloads(value_bytes: int, key_count: int) -> tuple[Workload, ...]:
     value = b"x" * value_bytes
     return (
         Workload(
-            "SET overwrite",
-            tuple(Set(_key("k", i), value) for i in range(key_count)),
+            "WRITE overwrite",
+            tuple(Write(_key("k", i), value) for i in range(key_count)),
             OK,
         ),
         Workload(
-            "GET hit", tuple(Get(_key("k", i)) for i in range(key_count)), Value(value)
+            "READ hit",
+            tuple(Read(_key("k", i)) for i in range(key_count)),
+            Value(value),
         ),
-        Workload("GET miss", tuple(Get(_key("m", i)) for i in range(key_count)), NIL),
+        Workload("READ miss", tuple(Read(_key("m", i)) for i in range(key_count)), NIL),
     )
 
 
@@ -211,10 +205,10 @@ async def _exchange_raw(
     writer: asyncio.StreamWriter,
     windows: list[tuple[bytes, bytes]],
 ) -> float:
+    """Time raw exchanges, reading before drain to avoid mutual backpressure."""
     start = perf_counter()
     for request, expected in windows:
         writer.write(request)
-        # Read while the server reads/writes too, including under backpressure.
         actual = await reader.readexactly(len(expected))
         if actual != expected:
             raise RuntimeError("raw server reply differs from the expected wire bytes")
@@ -235,9 +229,9 @@ async def _exchange_client(
         else:
             values = await asyncio.gather(
                 *(
-                    client.set(command.key, command.value)
-                    if isinstance(command, Set)
-                    else client.get(command.key)
+                    client.write(command.key, command.value)
+                    if isinstance(command, Write)
+                    else client.read(command.key)
                     for command in commands
                 )
             )
@@ -395,11 +389,6 @@ def _run_tcp(args: argparse.Namespace) -> dict[str, object]:
     }
 
 
-# --------------------------------------------------------------------------
-# hot-paths: codec, server dispatch and expiry without socket scheduling
-# --------------------------------------------------------------------------
-
-
 class CheckedTransport(asyncio.Transport):
     """Check replies without adding socket or event-loop overhead."""
 
@@ -425,7 +414,7 @@ class Case:
 
 
 def _encoding(size: int, count: int) -> Callable[[], None]:
-    command = Set("key", b"x" * size)
+    command = Write("key", b"x" * size)
     expected = encode_command(command)
 
     def run() -> None:
@@ -437,7 +426,7 @@ def _encoding(size: int, count: int) -> Callable[[], None]:
 
 
 def _dispatch(size: int, depth: int, count: int) -> Callable[[], None]:
-    frame = encode_command(Set("key", b"x" * size)) * depth
+    frame = encode_command(Write("key", b"x" * size)) * depth
     transport = CheckedTransport(encode_message(OK) * depth)
     connection = Connection(
         Engine(Store(), Broker()), 8 << 20, admit=lambda: True, release=lambda: None
@@ -483,10 +472,10 @@ def _future_probe() -> Callable[[], None]:
 
 
 HOT_PATH_CASES = (
-    Case("encode SET 64 B", lambda: _encoding(64, 100_000), 100_000),
-    Case("encode SET 1 MiB", lambda: _encoding(1 << 20, 500), 500),
-    Case("dispatch SET 64 B, depth 32", lambda: _dispatch(64, 32, 1000), 32_000),
-    Case("dispatch SET 1 MiB", lambda: _dispatch(1 << 20, 1, 500), 500),
+    Case("encode WRITE 64 B", lambda: _encoding(64, 100_000), 100_000),
+    Case("encode WRITE 1 MiB", lambda: _encoding(1 << 20, 500), 500),
+    Case("dispatch WRITE 64 B, depth 32", lambda: _dispatch(64, 32, 1000), 32_000),
+    Case("dispatch WRITE 1 MiB", lambda: _dispatch(1 << 20, 1, 500), 500),
     Case(
         "refresh unchanged TTL", lambda: _refresh(100_000, same_deadline=True), 100_000
     ),
@@ -498,11 +487,11 @@ HOT_PATH_CASES = (
 
 
 def _run_hot_paths(args: argparse.Namespace) -> dict[str, object]:
+    """Measure isolated cases after warming interpreter specialization."""
     if args.repeats <= 0:
         args.parser.error("repeats must be positive")
     results = []
     for case in HOT_PATH_CASES:
-        # Warm interpreter specialization outside the measured samples.
         case.prepare()()
         elapsed = []
         for _ in range(args.repeats):
@@ -532,10 +521,6 @@ def _run_hot_paths(args: argparse.Namespace) -> dict[str, object]:
         "results": results,
     }
 
-
-# --------------------------------------------------------------------------
-# expiry: production heap versus indexed and sorted research adapters
-# --------------------------------------------------------------------------
 
 EXPIRY_KEYS = tuple(str(i) for i in range(20_000))
 EXPIRY_OPERATIONS = ("reschedule", "cancel", "expire", "stale due probe")
@@ -662,11 +647,6 @@ def _run_expiry(args: argparse.Namespace) -> dict[str, object]:
         "repeats": args.repeats,
         "results": results,
     }
-
-
-# --------------------------------------------------------------------------
-# Command line
-# --------------------------------------------------------------------------
 
 
 def _build_parser() -> argparse.ArgumentParser:

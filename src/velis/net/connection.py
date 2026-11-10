@@ -4,31 +4,17 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass
 from typing import cast
 
 from velis.core.engine import Engine
 from velis.core.messages import Err, Message, Reply
-from velis.errors import CommandError, ProtocolError
+from velis.errors import ProtocolError
 from velis.net import protocol
+from velis.net.dispatch import COMMANDS_PER_TURN, REPLY_BYTES_PER_TURN, execute_batch
+
+__all__ = ["COMMANDS_PER_TURN", "REPLY_BYTES_PER_TURN", "Connection"]
 
 log = logging.getLogger(__name__)
-COMMANDS_PER_TURN = 64
-REPLY_BYTES_PER_TURN = 1 << 18
-
-
-@dataclass(slots=True)
-class _Batch:
-    """Completed replies and consumed input, plus any subsequent protocol error.
-
-    ``limited`` means a per-turn limit ended the batch, so more complete
-    commands may be buffered even though none was left unhandled by an error.
-    """
-
-    replies: list[bytes]
-    consumed: int = 0
-    limited: bool = False
-    error: ProtocolError | None = None
 
 
 class Connection(asyncio.Protocol):
@@ -121,7 +107,9 @@ class Connection(asyncio.Protocol):
         ):
             return
         try:
-            batch = self._execute_batch(transport)
+            batch = execute_batch(
+                self._buf, self._engine.execute, self, transport.is_closing
+            )
             del self._buf[: batch.consumed]
             if batch.replies:
                 transport.write(b"".join(batch.replies))
@@ -140,35 +128,6 @@ class Connection(asyncio.Protocol):
             self._shutdown()
         elif not self._write_blocked:
             self._set_reading(True)
-
-    def _execute_batch(self, transport: asyncio.Transport) -> _Batch:
-        """Run a bounded frame prefix, retaining replies before a protocol error."""
-        decode = protocol.COMMANDS.decode
-        encode = protocol.encode_message
-        execute = self._engine.execute
-        replies: list[bytes] = []
-        consumed = queued = 0
-        limited = False
-        error: ProtocolError | None = None
-        try:
-            for start, end in protocol.iter_frame_spans(self._buf):
-                command = decode(self._buf, start, end)
-                try:
-                    reply: Reply = execute(command, self)
-                except CommandError as exc:
-                    reply = Err(str(exc))
-                data = encode(reply)
-                replies.append(data)
-                consumed = end
-                queued += len(data)
-                if len(replies) == COMMANDS_PER_TURN or queued >= REPLY_BYTES_PER_TURN:
-                    limited = True
-                    break
-                if transport.is_closing():
-                    break
-        except ProtocolError as exc:
-            error = exc
-        return _Batch(replies, consumed, limited, error)
 
     def _yield_to_loop(self) -> None:
         self._set_reading(False)

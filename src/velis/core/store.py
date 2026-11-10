@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from enum import Enum, auto
+from itertools import islice
 
 from velis.core.clock import Clock, MonotonicClock
 from velis.core.eviction import Eviction, EvictionPolicy
@@ -15,6 +16,8 @@ __all__ = [
     "DEFAULT_MAX_KEYS",
     "DEFAULT_STORE_LIMITS",
     "DEFAULT_SWEEP_INTERVAL_MS",
+    "LIST_SCAN_LIMIT",
+    "MAX_LIST_KEYS",
     "MAX_TTL_MS",
     "SWEEP_LIMIT",
     "Store",
@@ -24,6 +27,8 @@ __all__ = [
 ]
 
 MAX_TTL_MS = 1 << 62
+MAX_LIST_KEYS = 100
+LIST_SCAN_LIMIT = 1000
 SWEEP_LIMIT = 1000
 DEFAULT_SWEEP_INTERVAL_MS = 100
 DEFAULT_MAX_KEYS = 100_000
@@ -62,7 +67,7 @@ class TtlStatus(Enum):
 
 @dataclass(frozen=True, slots=True)
 class StoreStats:
-    """Cumulative GET hits/misses, capacity evictions and removed expired keys.
+    """Cumulative value-read hits/misses, capacity evictions and removed expired keys.
 
     Expirations count physical removal, including lazy reads and write-time
     cleanup. Deleting or overwriting live keys does not increment either count.
@@ -120,16 +125,20 @@ class Store:
 
     @property
     def stored_bytes(self) -> int:
+        """Retained UTF-8 key and value bytes, including unswept expired keys."""
         return self._stored_bytes
 
     @property
     def has_due_expirations(self) -> bool:
+        """Whether any resident key is due for expiry at the current clock time."""
         return self._expiry.has_due(self._clock.now_ms())
 
     def stats(self) -> StoreStats:
+        """Return an immutable snapshot of cumulative operation counters."""
         return StoreStats(self._hits, self._misses, self._evictions, self._expirations)
 
     def get(self, key: str) -> bytes | None:
+        """Read a live value, recording a hit and policy access, or a miss."""
         self._purge(key, self._clock.now_ms())
         entry = self._entries.get(key)
         if entry is None:
@@ -138,6 +147,59 @@ class Store:
         self._hits += 1
         self._policy.access(key)
         return entry[0]
+
+    def exists(self, key: str) -> bool:
+        """Check live membership without counting a read or updating eviction."""
+        self._purge(key, self._clock.now_ms())
+        return key in self._entries
+
+    def size(self, key: str) -> int | None:
+        """Return value bytes, or None for a missing key, without recording a read."""
+        self._purge(key, self._clock.now_ms())
+        entry = self._entries.get(key)
+        return None if entry is None else len(entry[0])
+
+    def list_keys(
+        self, prefix: str = "", cursor: int = 0, limit: int = MAX_LIST_KEYS
+    ) -> tuple[int, tuple[str, ...]]:
+        """Scan at most LIST_SCAN_LIMIT candidates and return at most limit keys.
+
+        Continuation cursors encode offset + 1 in insertion order. Mutations
+        between calls may repeat or omit keys. Zero indicates exhaustion; a
+        nonzero cursor can accompany an empty page. Snapshot only the candidate window
+        before lazy expiry removes keys. Skipping to an offset takes O(cursor)
+        iteration time; the bound limits candidate work and temporary memory.
+        """
+        if type(cursor) is not int or cursor < 0:
+            raise CommandError("list cursor must be a nonnegative integer")
+        if type(limit) is not int or not 1 <= limit <= MAX_LIST_KEYS:
+            raise CommandError(f"list limit must be between 1 and {MAX_LIST_KEYS}")
+        cursor = max(0, cursor - 1)
+        total = len(self._entries)
+        if cursor >= total:
+            return 0, ()
+        candidates = tuple(islice(self._entries, cursor, cursor + LIST_SCAN_LIMIT))
+        keys, scanned, expired = self._scan_keys(candidates, prefix, limit)
+        next_cursor = 0 if cursor + scanned >= total else cursor + scanned - expired + 1
+        return next_cursor, keys
+
+    def _scan_keys(
+        self, candidates: tuple[str, ...], prefix: str, limit: int
+    ) -> tuple[tuple[str, ...], int, int]:
+        """Collect matching live keys and count removals before the next offset."""
+        now = self._clock.now_ms()
+        keys: list[str] = []
+        scanned = expired = 0
+        for key in candidates:
+            scanned += 1
+            self._purge(key, now)
+            if key not in self._entries:
+                expired += 1
+            elif key.startswith(prefix):
+                keys.append(key)
+            if len(keys) == limit:
+                break
+        return tuple(keys), scanned, expired
 
     def set(self, key: str, value: bytes) -> None:
         """Store a value and clear its TTL, evicting if capacity requires.

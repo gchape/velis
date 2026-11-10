@@ -46,8 +46,7 @@ class ShutdownTests(unittest.IsolatedAsyncioTestCase):
     async def test_session_timeout_aborts_without_cancelling_the_close_waiter(
         self,
     ) -> None:
-        # StreamWriter reuses one close future. Cancelling it during a timeout
-        # would make subsequent cleanup raise CancelledError even after abort.
+        """Abort must preserve the shared close future for subsequent cleanup."""
         closed = asyncio.get_running_loop().create_future()
         writer = Mock(spec=asyncio.StreamWriter)
 

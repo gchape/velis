@@ -212,11 +212,14 @@ class S3FIFO:
 
 
 class EvictionPolicy(StrEnum):
+    """Configured policy names and their independent, empty implementations."""
+
     LRU = "lru"
     LFU = "lfu"
     S3_FIFO = "s3-fifo"
 
     def create(self) -> Eviction:
+        """Create fresh policy state for one store to own."""
         match self:
             case EvictionPolicy.LRU:
                 return LRU()

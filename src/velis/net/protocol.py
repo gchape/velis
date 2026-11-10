@@ -13,30 +13,44 @@ import asyncio
 from collections.abc import Callable, Iterator
 
 from velis.core.messages import (
-    TTL,
     Command,
-    Delete,
-    Delivered,
     Err,
-    Expire,
-    Get,
+    Exists,
+    Found,
+    Keep,
+    KeyPage,
+    Lifetime,
+    ListKeys,
     Message,
     Nil,
     Ok,
-    Persist,
-    Persistent,
-    Publish,
+    Ping,
+    Pong,
+    Read,
+    Remaining,
+    RemainingValue,
+    Remove,
     Reply,
-    Set,
-    Subscribe,
-    Subscribed,
-    TTLValue,
-    Unsubscribe,
-    Unsubscribed,
+    Send,
+    Sent,
+    Size,
+    SizeValue,
+    Unlimited,
+    Unwatch,
+    Unwatched,
     Value,
+    Watch,
+    Watching,
+    Write,
 )
+from velis.core.store import MAX_LIST_KEYS
 from velis.errors import ProtocolError
-from velis.net.limits import MAX_CHANNEL_BYTES, MAX_CHANNEL_CHARS, MAX_KEY_CHARS
+from velis.net.limits import (
+    MAX_CHANNEL_BYTES,
+    MAX_CHANNEL_CHARS,
+    MAX_KEY_CHARS,
+    MAX_UTF8_BYTES_PER_CHAR,
+)
 from velis.net.wire import (
     BLOB,
     FREE_TEXT,
@@ -47,6 +61,7 @@ from velis.net.wire import (
     msg,
     pack_u32,
     text,
+    text_tuple,
     unpack_u32,
 )
 
@@ -71,19 +86,25 @@ type ServerFrame = Reply | Message
 KEY = text("key", MAX_KEY_CHARS)
 CHANNEL = text("channel", MAX_CHANNEL_CHARS)
 ECHOED_CHANNEL = free_text(MAX_CHANNEL_BYTES)
+PREFIX = free_text(MAX_KEY_CHARS * MAX_UTF8_BYTES_PER_CHAR)
+KEYS = text_tuple(MAX_LIST_KEYS, MAX_KEY_CHARS * MAX_UTF8_BYTES_PER_CHAR)
 
 COMMANDS = Codec[Command](
     "command",
     {
-        Get: msg(b"GET", key=KEY),
-        Set: msg(b"SET", key=KEY, value=BLOB),
-        Expire: msg(b"EXPIRE", key=KEY, ms=U64),
-        Delete: msg(b"DEL", key=KEY),
-        TTL: msg(b"TTL", key=KEY),
-        Persist: msg(b"PERSIST", key=KEY),
-        Subscribe: msg(b"SUBSCRIBE", channel=CHANNEL),
-        Unsubscribe: msg(b"UNSUBSCRIBE", channel=CHANNEL),
-        Publish: msg(b"PUBLISH", channel=CHANNEL, payload=BLOB),
+        Ping: msg(b"PING"),
+        Exists: msg(b"EXISTS", key=KEY),
+        Size: msg(b"SIZE", key=KEY),
+        ListKeys: msg(b"LIST", prefix=PREFIX, cursor=U64, limit=U32),
+        Read: msg(b"READ", key=KEY),
+        Write: msg(b"WRITE", key=KEY, value=BLOB),
+        Lifetime: msg(b"LIFETIME", key=KEY, ms=U64),
+        Remove: msg(b"REMOVE", key=KEY),
+        Remaining: msg(b"REMAINING", key=KEY),
+        Keep: msg(b"KEEP", key=KEY),
+        Watch: msg(b"WATCH", channel=CHANNEL),
+        Unwatch: msg(b"UNWATCH", channel=CHANNEL),
+        Send: msg(b"SEND", channel=CHANNEL, payload=BLOB),
     },
     covers=Command,
 )
@@ -91,15 +112,19 @@ COMMANDS = Codec[Command](
 SERVER_MESSAGES = Codec[ServerFrame](
     "server message",
     {
+        Pong: msg(b"PONG"),
+        Found: msg(b"FOUND"),
+        SizeValue: msg(b"SIZE_VALUE", size=U64),
+        KeyPage: msg(b"KEY_PAGE", cursor=U64, keys=KEYS),
         Ok: msg(b"OK"),
         Nil: msg(b"NIL"),
-        Persistent: msg(b"PERSISTENT"),
+        Unlimited: msg(b"UNLIMITED"),
         Value: msg(b"VALUE", value=BLOB),
         Err: msg(b"ERR", message=FREE_TEXT),
-        Subscribed: msg(b"SUBSCRIBED", channel=ECHOED_CHANNEL),
-        Unsubscribed: msg(b"UNSUBSCRIBED", channel=ECHOED_CHANNEL),
-        Delivered: msg(b"DELIVERED", count=U32),
-        TTLValue: msg(b"TTL_VALUE", ms=U64),
+        Watching: msg(b"WATCHING", channel=ECHOED_CHANNEL),
+        Unwatched: msg(b"UNWATCHED", channel=ECHOED_CHANNEL),
+        Sent: msg(b"SENT", count=U32),
+        RemainingValue: msg(b"REMAINING_VALUE", ms=U64),
         Message: msg(b"MESSAGE", channel=ECHOED_CHANNEL, payload=BLOB),
     },
     covers=ServerFrame,
@@ -176,9 +201,12 @@ def iter_frame_spans(
 def iter_frames(
     buf: bytearray, limit: int = MAX_COMMAND_BODY_BYTES
 ) -> Iterator[tuple[bytes, int]]:
-    """Yield owned body bytes and end offsets; leave buf untouched."""
+    """Yield owned body bytes and end offsets; leave buf untouched.
+
+    Release temporary views before yielding so no exported view prevents the
+    caller from discarding consumed bytes after iteration ends.
+    """
     for start, end in iter_frame_spans(buf, limit):
-        # Release the view before yielding so callers can safely resize later.
         with memoryview(buf) as view:
             body = bytes(view[start:end])
         yield body, end

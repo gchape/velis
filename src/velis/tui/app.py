@@ -90,7 +90,7 @@ def main() -> None:
     parser.add_argument(
         "--read-only",
         action="store_true",
-        help="refuse set, setx, del, expire, persist and pub",
+        help="refuse write, remove, lifetime, keep and send",
     )
     args = parser.parse_args()
     if not (sys.stdin.isatty() and sys.stdout.isatty()):

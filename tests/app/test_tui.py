@@ -8,16 +8,10 @@ from unittest.mock import Mock, patch
 
 from velis.core.messages import (
     NO_EXPIRY,
-    TTL,
-    Err,
-    Get,
     Message,
-    Nil,
-    Persistent,
-    Value,
 )
 from velis.errors import CommandError, ProtocolError
-from velis.net.client import Client
+from velis.net.client import Client, EntrySnapshot
 from velis.tui.commands import Request, UsageError, parse_line
 from velis.tui.models import Entry, Kind, Status
 from velis.tui.text import cells, clean, command_window
@@ -32,13 +26,12 @@ class CommandTests(unittest.TestCase):
     def test_quoted_values_aliases_durations_and_local_stats(self) -> None:
         """Parse binary, quoted and local commands without network access."""
         cases = {
-            'set "two words" "hello world"': Request(
-                "set", "two words", b"hello world"
+            'write "two words" "hello world"': Request(
+                "write", "two words", b"hello world"
             ),
-            'setx key "00 ff"': Request("setx", "key", b"\x00\xff"),
-            "expire key 2h": Request("expire", "key", ms=7_200_000),
-            "DELETE key": Request("del", "key"),
-            "stats": Request("stats"),
+            "lifetime key 2h": Request("lifetime", "key", ms=7_200_000),
+            "REMOVE key": Request("remove", "key"),
+            "status": Request("status"),
         }
         for line, expected in cases.items():
             with self.subTest(line=line):
@@ -48,12 +41,12 @@ class CommandTests(unittest.TestCase):
         """Reject malformed input before it can enter the request queue."""
         for line in (
             "",
-            'set key "unfinished',
-            "get",
-            "stats extra",
+            'write key "unfinished',
+            "read",
+            "status extra",
             "setx key zz",
-            "expire key -1s",
-            "expire key 999999999999999999d",
+            "lifetime key -1s",
+            "lifetime key 999999999999999999d",
             "unknown",
         ):
             with self.subTest(line=line), self.assertRaises(UsageError):
@@ -85,51 +78,47 @@ class WorkspaceTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         """Exercise every network handler, including binary values and refreshes."""
-        self.client.batch.side_effect = [
-            [Value(b"value"), Persistent()],
-            [Nil(), Nil()],
-            [Persistent(), Nil()],
+        self.client.read_entry.side_effect = [
+            EntrySnapshot(b"value", NO_EXPIRY),
+            EntrySnapshot(None, -2),
         ]
-        self.client.ttl.return_value = NO_EXPIRY
-        self.client.expire.return_value = True
-        self.client.persist.return_value = False
-        self.client.delete.return_value = True
-        self.client.publish.return_value = 2
+        self.client.remaining_many.return_value = [NO_EXPIRY, -2]
+        self.client.remaining.return_value = NO_EXPIRY
+        self.client.lifetime.return_value = True
+        self.client.keep.return_value = False
+        self.client.remove.return_value = True
+        self.client.send.return_value = 2
         await self.run_commands(
-            "set key value",
-            "setx key 76616c7565",
-            "get key",
-            "get missing",
-            "expire key 1s",
-            "ttl key",
-            "persist key",
-            "sub updates",
-            "pub updates hello",
-            "unsub updates",
-            "refresh",
-            "del key",
+            "write key value",
+            "read key",
+            "read missing",
+            "lifetime key 1s",
+            "remaining key",
+            "keep key",
+            "watch updates",
+            "send updates hello",
+            "unwatch updates",
+            "sync",
+            "remove key",
         )
-        stats = self.workspace.stats
-        self.assertEqual((stats.operations, stats.errors), (12, 0))
+        stats = self.workspace.model.stats
+        self.assertEqual((stats.operations, stats.errors), (11, 0))
         self.assertEqual((stats.hits, stats.misses, stats.hit_rate), (1, 1, 50))
         self.assertEqual(stats.published, 1)
-        self.assertEqual(self.workspace.channels, set())
-        self.assertEqual(self.workspace.entries["key"].status, Status.GONE)
-        self.client.get.assert_not_awaited()
-        self.assertEqual(
-            self.client.batch.call_args_list[-1].args[0],
-            [TTL("key"), TTL("missing")],
-        )
-        self.client.batch.assert_any_await([Get("key"), TTL("key")])
+        self.assertEqual(self.workspace.model.channels, set())
+        self.assertEqual(self.workspace.model.entries["key"].status, Status.GONE)
+        self.client.read.assert_not_awaited()
+        self.client.remaining_many.assert_awaited_once_with(["key", "missing"])
+        self.client.read_entry.assert_any_await("key")
 
     async def test_failures_count_and_latency_includes_failed_attempts(self) -> None:
         """A rejection does not block later commands or disappear from the mean."""
-        self.client.set.side_effect = [CommandError("denied\x1b"), None]
+        self.client.write.side_effect = [CommandError("denied\x1b"), None]
         with patch(
             "velis.tui.workspace.time.perf_counter", side_effect=[1, 1.02, 2, 2.06]
         ):
-            await self.run_commands("set bad value", "set good value")
-        stats = self.workspace.stats
+            await self.run_commands("write bad value", "write good value")
+        stats = self.workspace.model.stats
         self.assertEqual((stats.operations, stats.errors), (2, 1))
         assert stats.last_ms is not None
         average_ms = stats.average_ms
@@ -137,49 +126,51 @@ class WorkspaceTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(stats.last_ms, 60)
         self.assertAlmostEqual(average_ms, 40)
         self.assertIsNone(stats.hit_rate)
-        self.assertNotIn("bad", self.workspace.entries)
-        self.assertEqual(self.workspace.entries["good"].preview, b"value")
+        self.assertNotIn("bad", self.workspace.model.entries)
+        self.assertEqual(self.workspace.model.entries["good"].preview, b"value")
         self.assertTrue(
             all(item.text.isprintable() for item in self.workspace.activity)
         )
 
     async def test_refresh_errors_are_reported_without_counting_reads(self) -> None:
-        """A rejected TTL refresh increments errors and permits another refresh."""
-        self.workspace.entries["key"] = Entry("key")
-        self.client.batch.return_value = [Err("refresh rejected")]
-        await self.run_commands("refresh")
-        stats = self.workspace.stats
+        """A rejected Remaining sync increments errors and permits another sync."""
+        self.workspace.model.entries["key"] = Entry("key")
+        self.client.remaining_many.return_value = [CommandError("sync rejected")]
+        await self.run_commands("sync")
+        stats = self.workspace.model.stats
         self.assertEqual((stats.operations, stats.errors), (1, 1))
         self.assertEqual((stats.hits, stats.misses), (0, 0))
-        self.assertIn("refresh rejected", self.workspace.activity[-1].text)
-        self.assertTrue(self.workspace.submit(Request("refresh")))
+        self.assertTrue(
+            any("sync rejected" in item.text for item in self.workspace.activity)
+        )
+        self.assertTrue(self.workspace.submit(Request("sync")))
         self.assertEqual(self.workspace.pending, 1)
 
     async def test_refreshes_coalesce_while_queued_and_running(self) -> None:
-        """Slow background checks cannot accumulate duplicate refresh requests."""
-        self.workspace.entries["key"] = Entry("key")
+        """Slow background checks cannot accumulate duplicate sync requests."""
+        self.workspace.model.entries["key"] = Entry("key")
         started, release = asyncio.Event(), asyncio.Event()
 
-        async def batch(commands: object) -> list[Persistent]:
-            """Hold a refresh in flight until the test releases its reply."""
+        async def batch(commands: object) -> list[int]:
+            """Hold a sync in flight until the test releases its reply."""
             started.set()
             await release.wait()
-            return [Persistent()]
+            return [NO_EXPIRY]
 
-        self.client.batch.side_effect = batch
-        self.workspace.submit(Request("refresh"))
-        self.workspace.submit(Request("refresh"))
+        self.client.remaining_many.side_effect = batch
+        self.workspace.submit(Request("sync"))
+        self.workspace.submit(Request("sync"))
         self.assertEqual(self.workspace.pending, 1)
         worker = asyncio.create_task(self.workspace._work())
         try:
             async with asyncio.timeout(2):
                 await started.wait()
-                self.assertTrue(self.workspace.submit(Request("refresh")))
+                self.assertTrue(self.workspace.submit(Request("sync")))
                 self.assertEqual(self.workspace.pending, 0)
                 release.set()
                 await self.workspace._queue.join()
-            self.client.batch.assert_awaited_once()
-            self.assertEqual(self.workspace.stats.operations, 1)
+            self.client.remaining_many.assert_awaited_once()
+            self.assertEqual(self.workspace.model.stats.operations, 1)
         finally:
             worker.cancel()
             with suppress(asyncio.CancelledError):
@@ -194,10 +185,10 @@ class WorkspaceTests(unittest.IsolatedAsyncioTestCase):
         ):
             with self.subTest(error=type(error).__name__):
                 self.workspace = Workspace(self.client)
-                self.client.set.side_effect = error
-                await self.run_commands("set key value")
-                self.assertEqual(self.workspace.stats.operations, 1)
-                self.assertEqual(self.workspace.stats.errors, 1)
+                self.client.write.side_effect = error
+                await self.run_commands("write key value")
+                self.assertEqual(self.workspace.model.stats.operations, 1)
+                self.assertEqual(self.workspace.model.stats.errors, 1)
                 self.assertEqual(
                     self.workspace.connected, not isinstance(error, ConnectionError)
                 )
@@ -211,7 +202,7 @@ class WorkspaceTests(unittest.IsolatedAsyncioTestCase):
         ]
         await self.workspace._pump()
         self.workspace.activity.clear()
-        self.assertEqual(self.workspace.stats.received, 2)
+        self.assertEqual(self.workspace.model.stats.received, 2)
         self.assertFalse(self.workspace.connected)
 
     async def test_cancellation_releases_queue_without_completing_an_operation(
@@ -225,8 +216,8 @@ class WorkspaceTests(unittest.IsolatedAsyncioTestCase):
             started.set()
             await asyncio.Event().wait()
 
-        self.client.set.side_effect = set_value
-        self.workspace.submit(Request("set", "key", b"value"))
+        self.client.write.side_effect = set_value
+        self.workspace.submit(Request("write", "key", b"value"))
         worker = asyncio.create_task(self.workspace._work())
         try:
             async with asyncio.timeout(2):
@@ -237,8 +228,8 @@ class WorkspaceTests(unittest.IsolatedAsyncioTestCase):
                 await worker
         async with asyncio.timeout(2):
             await self.workspace._queue.join()
-        self.assertEqual(self.workspace.stats.operations, 0)
-        self.assertIsNone(self.workspace.stats.average_ms)
+        self.assertEqual(self.workspace.model.stats.operations, 0)
+        self.assertIsNone(self.workspace.model.stats.average_ms)
 
 
 class TerminalTests(unittest.TestCase):
@@ -256,46 +247,47 @@ class TerminalTests(unittest.TestCase):
     def test_stats_shortcut_and_command_work_without_a_connection(self) -> None:
         """Statistics remain local and can be viewed after disconnection."""
         self.workspace.connected = False
-        self.tui._handle("t")
+        self.tui.input.handle("t")
         self.assertEqual(self.tui._state.mode, Mode.STATS)
-        self.tui._handle("\x1b")
+        self.tui.input.handle("\x1b")
         self.assertEqual(self.tui._state.mode, Mode.BROWSE)
-        for key in ":stats\n":
-            self.tui._handle(key)
+        for key in ":status\n":
+            self.tui.input.handle(key)
         self.assertEqual(self.tui._state.mode, Mode.STATS)
         self.assertEqual(self.workspace.pending, 0)
-        self.assertEqual(self.workspace.stats.operations, 0)
+        self.assertEqual(self.workspace.model.stats.operations, 0)
 
     def test_editing_and_history_restore_the_original_draft(self) -> None:
         """Cursor edits preserve arguments and history preserves an unfinished draft."""
-        self.tui._open_line("get key")
-        self.tui._edit(curses.KEY_HOME)
-        self.tui._edit(curses.KEY_BACKSPACE)
-        self.assertEqual(self.tui._state.line, "get key")
-        self.tui._edit(curses.KEY_END)
-        self.tui._edit("\x17")
+        self.tui.input._open_line("read key")
+        self.tui.input._edit(curses.KEY_HOME)
+        self.tui.input._edit(curses.KEY_BACKSPACE)
+        self.assertEqual(self.tui._state.line, "read key")
+        self.tui.input._edit(curses.KEY_END)
+        self.tui.input._edit("\x17")
         for key in "other\n":
-            self.tui._edit(key)
-        self.assertEqual(self.workspace._queue.get_nowait(), Request("get", "other"))
-        self.tui._open_line("unfinished")
-        self.tui._edit(curses.KEY_UP)
-        self.assertEqual(self.tui._state.line, "get other")
-        self.tui._edit(curses.KEY_DOWN)
+            self.tui.input._edit(key)
+        self.assertEqual(
+            self.workspace._queue.get_nowait().request, Request("read", "other")
+        )
+        self.tui.input._open_line("unfinished")
+        self.tui.input._edit(curses.KEY_UP)
+        self.assertEqual(self.tui._state.line, "read other")
+        self.tui.input._edit(curses.KEY_DOWN)
         self.assertEqual(self.tui._state.line, "unfinished")
 
     def test_read_only_rejects_all_write_commands(self) -> None:
         """Every write alias respects read-only mode before submission."""
         self.workspace.read_only = True
         for line in (
-            "set key value",
-            "setx key ff",
-            "delete key",
-            "expire key 1s",
-            "persist key",
-            "publish updates hello",
+            "write key value",
+            "remove key",
+            "lifetime key 1s",
+            "keep key",
+            "send updates hello",
         ):
             with self.subTest(line=line):
-                self.tui._run_line(line)
+                self.tui.input._run_line(line)
                 self.assertEqual(self.workspace.activity[-1].kind, Kind.ERROR)
         self.assertEqual(self.workspace.pending, 0)
 
@@ -310,9 +302,9 @@ class TerminalTests(unittest.TestCase):
     def test_all_views_fit_small_terminals_and_escape_prefilled_keys(self) -> None:
         """Keep output inert and within bounds across modes and terminal sizes."""
         key = "wide界\x1b[31m\u202e"
-        self.workspace.entries[key] = Entry(key)
+        self.workspace.model.entries[key] = Entry(key)
         self.workspace.log(Kind.INFO, "notice\x1b")
-        self.tui._prefill("set")
+        self.tui.input._prefill("write")
         raw_draft = self.tui._state.line
         shown, offset = command_window(raw_draft, len(raw_draft), 99)
         self.assertEqual(shown, clean(raw_draft))

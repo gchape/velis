@@ -5,7 +5,17 @@ from unittest.mock import AsyncMock, Mock
 
 from tests.net.helpers import cancel_task
 from velis.config import DEFAULT_SESSION_LIMITS, SessionLimits
-from velis.core.messages import Command, Err, Get, Message, Nil, Ok, Reply, Set, Value
+from velis.core.messages import (
+    Command,
+    Err,
+    Message,
+    Nil,
+    Ok,
+    Read,
+    Reply,
+    Value,
+    Write,
+)
 from velis.errors import ProtocolError
 from velis.net import protocol
 from velis.net.session import TCPSession
@@ -24,7 +34,7 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         return session, reader, writer
 
     async def start_request(self, session: TCPSession, key: str) -> asyncio.Task:
-        task = asyncio.create_task(session.request(Get(key)))
+        task = asyncio.create_task(session.request(Read(key)))
         self.addAsyncCleanup(cancel_task, task)
         await asyncio.sleep(0)
         return task
@@ -39,7 +49,7 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_batch_writes_commands_together_and_separates_pushes(self) -> None:
         session, reader, writer = self.make_session()
-        commands = [Set("k", b"v"), Get("k"), Get("missing")]
+        commands = [Write("k", b"v"), Read("k"), Read("missing")]
         batch = await self.start_batch(session, commands)
         writer.write.assert_called_once_with(
             b"".join(map(protocol.encode_command, commands))
@@ -72,8 +82,8 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         pending = await self.start_request(session, "pending")
         async with asyncio.timeout(1):
             with self.assertRaises(ProtocolError):
-                await session.batch([Set("new", b"v"), Get("")])
-        writer.write.assert_called_once_with(protocol.encode_command(Get("pending")))
+                await session.batch([Write("new", b"v"), Read("")])
+        writer.write.assert_called_once_with(protocol.encode_command(Read("pending")))
         writer.close.assert_not_called()
         reader.feed_data(protocol.encode_message(Nil()))
         self.assertEqual(await pending, Nil())
@@ -84,7 +94,7 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         session, reader, writer = self.make_session(
             SessionLimits(max_pending_requests=2)
         )
-        commands = [Get(str(i)) for i in range(5)]
+        commands = [Read(str(i)) for i in range(5)]
         batch = await self.start_batch(session, iter(commands))
         writer.write.assert_called_once_with(
             b"".join(map(protocol.encode_command, commands[:2]))
@@ -117,7 +127,7 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
     async def test_batch_byte_target_includes_framing_and_accepts_exact_fit(
         self,
     ) -> None:
-        commands = [Get("😀"), Get("é"), Get("last")]
+        commands = [Read("😀"), Read("é"), Read("last")]
         frames = list(map(protocol.encode_command, commands))
         session, reader, writer = self.make_session(
             SessionLimits(max_batch_bytes=len(frames[0]) + len(frames[1]))
@@ -133,7 +143,7 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await batch, [Nil()] * 3)
 
     async def test_command_larger_than_batch_target_is_sent_alone(self) -> None:
-        commands = [Set("k", b"x" * 100), Get("k")]
+        commands = [Write("k", b"x" * 100), Read("k")]
         session, reader, writer = self.make_session(SessionLimits(max_batch_bytes=1))
         batch = await self.start_batch(session, commands)
         writer.write.assert_called_once_with(protocol.encode_command(commands[0]))
@@ -153,7 +163,7 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
             SessionLimits(max_pending_requests=3)
         )
         pending = await self.start_request(session, "pending")
-        commands = [Get(str(i)) for i in range(3)]
+        commands = [Read(str(i)) for i in range(3)]
         batch = await self.start_batch(session, commands)
         self.assertEqual(writer.write.call_count, 2)
         self.assertEqual(
@@ -190,7 +200,7 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
             ]
             windows.append(len(commands))
             for command in commands:
-                assert isinstance(command, Get)
+                assert isinstance(command, Read)
                 reader.feed_data(protocol.encode_message(Value(command.key.encode())))
 
         async def drain() -> None:
@@ -198,13 +208,13 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
 
         writer.write.side_effect = echo
         writer.drain.side_effect = drain
-        first = [Get(f"a{i}") for i in range(10)]
-        second = [Get(f"b{i}") for i in range(7)]
+        first = [Read(f"a{i}") for i in range(10)]
+        second = [Read(f"b{i}") for i in range(7)]
         async with asyncio.timeout(1):
             replies = await asyncio.gather(
                 session.batch(first),
                 session.batch(second),
-                session.request(Get("single")),
+                session.request(Read("single")),
             )
         self.assertEqual(
             replies,
@@ -225,8 +235,8 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         )
         resume = asyncio.Event()
         writer.drain.side_effect = resume.wait
-        first = await self.start_batch(session, [Get("a"), Get("b")])
-        second = await self.start_batch(session, [Get("c"), Get("d")])
+        first = await self.start_batch(session, [Read("a"), Read("b")])
+        second = await self.start_batch(session, [Read("c"), Read("d")])
         self.assertEqual(writer.write.call_count, 2)
         blocked = await self.start_request(session, "e")
         self.assertEqual(writer.write.call_count, 2)
@@ -248,7 +258,7 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         session, reader, writer = self.make_session(
             SessionLimits(max_pending_requests=2)
         )
-        batch = await self.start_batch(session, [Get("a"), Get("b"), Get("unsent")])
+        batch = await self.start_batch(session, [Read("a"), Read("b"), Read("unsent")])
         await cancel_task(batch)
         following = await self.start_request(session, "following")
         self.assertEqual(writer.write.call_count, 1)
@@ -263,7 +273,7 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         async with asyncio.timeout(1):
             self.assertEqual(await following, Value(b"following"))
         self.assertEqual(
-            writer.write.call_args.args[0], protocol.encode_command(Get("following"))
+            writer.write.call_args.args[0], protocol.encode_command(Read("following"))
         )
         writer.close.assert_not_called()
 
@@ -272,11 +282,13 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
             SessionLimits(max_pending_requests=1)
         )
         pending = await self.start_request(session, "pending")
-        blocked = await self.start_batch(session, [Get("blocked-a"), Get("blocked-b")])
+        blocked = await self.start_batch(
+            session, [Read("blocked-a"), Read("blocked-b")]
+        )
         await cancel_task(blocked)
         reader.feed_data(protocol.encode_message(Nil()))
         self.assertEqual(await pending, Nil())
-        writer.write.assert_called_once_with(protocol.encode_command(Get("pending")))
+        writer.write.assert_called_once_with(protocol.encode_command(Read("pending")))
         following = await self.start_request(session, "following")
         reader.feed_data(protocol.encode_message(Value(b"following")))
         self.assertEqual(await following, Value(b"following"))
@@ -294,7 +306,7 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.Future()
 
         writer.drain.side_effect = drain
-        batch = await self.start_batch(session, [Get("a"), Get("b")])
+        batch = await self.start_batch(session, [Read("a"), Read("b")])
         self.assertTrue(draining.is_set())
         await cancel_task(batch)
         writer.drain.side_effect = None
@@ -312,8 +324,8 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         session, _, writer = self.make_session(SessionLimits(max_pending_requests=2))
-        active = await self.start_batch(session, [Get("a"), Get("b"), Get("unsent")])
-        blocked = await self.start_batch(session, [Get("blocked")])
+        active = await self.start_batch(session, [Read("a"), Read("b"), Read("unsent")])
+        blocked = await self.start_batch(session, [Read("blocked")])
         await session.close()
         async with asyncio.timeout(1):
             for task in (active, blocked):
@@ -327,14 +339,14 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
                 session, _, writer = self.make_session()
                 getattr(writer, method).side_effect = OSError("send failed")
                 with self.assertRaisesRegex(OSError, "send failed"):
-                    await session.batch([Get("a"), Get("b")])
+                    await session.batch([Read("a"), Read("b")])
                 writer.close.assert_called_once_with()
                 with self.assertRaises(ConnectionError):
                     await session.next_message()
 
     async def test_protocol_failure_during_batch_fails_remaining_requests(self) -> None:
         session, reader, _ = self.make_session()
-        batch = await self.start_batch(session, [Get("a"), Get("b")])
+        batch = await self.start_batch(session, [Read("a"), Read("b")])
         reader.feed_data(
             protocol.encode_message(Value(b"a"))
             + protocol.encode_frame(b"bad", protocol.MAX_SERVER_BODY_BYTES)
@@ -349,7 +361,7 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         second = await self.start_request(session, "b")
         self.assertEqual(
             [call.args[0] for call in writer.write.call_args_list],
-            [protocol.encode_command(Get("a")), protocol.encode_command(Get("b"))],
+            [protocol.encode_command(Read("a")), protocol.encode_command(Read("b"))],
         )
         reader.feed_data(
             b"".join(
@@ -400,7 +412,7 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
             SessionLimits(max_pending_requests=1)
         )
         with self.assertRaises(ProtocolError):
-            await session.request(Get(""))
+            await session.request(Read(""))
         writer.write.assert_not_called()
         writer.close.assert_not_called()
         request = await self.start_request(session, "valid")
@@ -472,7 +484,7 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ConnectionError, "connection limit exceeded"):
             await session.next_message()
         with self.assertRaisesRegex(ConnectionError, "connection limit exceeded"):
-            await session.request(Get("k"))
+            await session.request(Read("k"))
 
     async def test_unsolicited_reply_and_malformed_input_close_with_protocol_reason(
         self,
@@ -520,7 +532,7 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         session, _, writer = self.make_session()
         writer.write.side_effect = OSError("write failed")
         with self.assertRaisesRegex(OSError, "write failed"):
-            await session.request(Get("k"))
+            await session.request(Read("k"))
         with self.assertRaises(ConnectionError):
             await session.next_message()
         writer.close.assert_called_once_with()

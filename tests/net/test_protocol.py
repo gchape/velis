@@ -3,7 +3,7 @@ import struct
 import unittest
 from unittest.mock import Mock
 
-from velis.core.messages import Get, Message, Set
+from velis.core.messages import Message, Read, Write
 from velis.errors import ProtocolError
 from velis.net import protocol
 from velis.net.limits import MAX_CHANNEL_BYTES, MAX_FIELD_BYTES, MAX_KEY_CHARS
@@ -11,7 +11,7 @@ from velis.net.limits import MAX_CHANNEL_BYTES, MAX_FIELD_BYTES, MAX_KEY_CHARS
 
 class FramingTests(unittest.TestCase):
     def test_all_partial_headers_and_bodies_remain_buffered(self) -> None:
-        frame = protocol.encode_command(Get("key"))
+        frame = protocol.encode_command(Read("key"))
         for end in range(len(frame)):
             with self.subTest(end=end):
                 buf = bytearray(frame[:end])
@@ -19,8 +19,8 @@ class FramingTests(unittest.TestCase):
                 self.assertEqual(buf, frame[:end])
 
     def test_multiple_frames_report_end_offsets_without_consuming_buffer(self) -> None:
-        first = protocol.encode_command(Get("a"))
-        second = protocol.encode_command(Get("bb"))
+        first = protocol.encode_command(Read("a"))
+        second = protocol.encode_command(Read("bb"))
         buf = bytearray(first + second + b"\x00\x00")
         self.assertEqual(
             list(protocol.iter_frames(buf)),
@@ -37,7 +37,7 @@ class FramingTests(unittest.TestCase):
             protocol.encode_frame(b"abcd", 3)
 
     def test_oversized_header_fails_after_yielding_previous_valid_frames(self) -> None:
-        frame = protocol.encode_command(Get("a"))
+        frame = protocol.encode_command(Read("a"))
         iterator = protocol.iter_frames(
             bytearray(frame + struct.pack(">I", protocol.MAX_COMMAND_BODY_BYTES + 1))
         )
@@ -46,7 +46,7 @@ class FramingTests(unittest.TestCase):
             next(iterator)
 
     def test_directional_limits_equal_the_largest_encodable_body(self) -> None:
-        command = Set("😀" * MAX_KEY_CHARS, b"x" * MAX_FIELD_BYTES)
+        command = Write("😀" * MAX_KEY_CHARS, b"x" * MAX_FIELD_BYTES)
         push = Message("a" * MAX_CHANNEL_BYTES, b"x" * MAX_FIELD_BYTES)
         self.assertEqual(
             len(protocol.encode_command(command)) - 4, protocol.MAX_COMMAND_BODY_BYTES

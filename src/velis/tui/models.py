@@ -93,7 +93,7 @@ class Stats:
 
     Operations include background refreshes and failed attempts; cancellation
     does not complete an operation. Latency measures execution, excluding queue
-    time. Hits and misses count GET replies only, never TTL refreshes. These
+    time. Hits and misses count READ replies only, never TTL refreshes. These
     observations cannot determine server-wide evictions or expirations.
     """
 
@@ -121,6 +121,6 @@ class Stats:
 
     @property
     def hit_rate(self) -> float | None:
-        """Return the GET hit percentage, or None before the first GET reply."""
+        """Return the READ hit percentage, or None before the first READ reply."""
         reads = self.hits + self.misses
         return self.hits * 100 / reads if reads else None

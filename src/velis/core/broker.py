@@ -28,6 +28,7 @@ class Broker:
         self._memberships: Memberships[str, Subscriber] = Memberships()
 
     def subscribers(self, channel: str) -> int:
+        """Count current channel members without attempting delivery."""
         return self._memberships.member_count(channel)
 
     def subscribe(self, channel: str, subscriber: Subscriber) -> None:
@@ -39,13 +40,19 @@ class Broker:
         self._memberships.join(channel, subscriber)
 
     def unsubscribe(self, channel: str, subscriber: Subscriber) -> None:
+        """Leave one channel; missing subscriptions are harmless."""
         self._memberships.leave(channel, subscriber)
 
     def unsubscribe_all(self, subscriber: Subscriber) -> None:
+        """Remove all memberships on disconnect or failed delivery."""
         self._memberships.leave_all(subscriber)
 
     def publish(self, channel: str, payload: bytes) -> int:
-        """Return accepted deliveries; drop subscribers whose send fails."""
+        """Return accepted deliveries; remove recipients that return False.
+
+        Iterate a membership snapshot so delivery may change subscriptions.
+        Unexpected send exceptions propagate to the caller.
+        """
         message = Message(channel, payload)
         accepted = 0
         for subscriber in self._memberships.members(channel):

@@ -7,7 +7,7 @@ from velis.app import _maintain, build_engine, serve
 from velis.config import ServerLimits, StoreLimits
 from velis.core.broker import Broker
 from velis.core.engine import Engine
-from velis.core.messages import Get, Set, Subscribe, Value
+from velis.core.messages import Read, Value, Watch, Write
 from velis.core.store import Store
 from velis.errors import CapacityError, CommandError
 from velis.net.client import Client
@@ -19,15 +19,15 @@ class BuildEngineTests(unittest.TestCase):
             store_limits=StoreLimits(max_bytes=2), max_subscriptions=1
         )
         subscriber = RecordingSubscriber()
-        engine.execute(Set("k", b"v"), subscriber)
+        engine.execute(Write("k", b"v"), subscriber)
         with self.assertRaises(CapacityError):
-            engine.execute(Set("k", b"xx"), subscriber)
-        engine.execute(Subscribe("a"), subscriber)
+            engine.execute(Write("k", b"xx"), subscriber)
+        engine.execute(Watch("a"), subscriber)
         with self.assertRaises(CapacityError):
-            engine.execute(Subscribe("b"), subscriber)
+            engine.execute(Watch("b"), subscriber)
         self.assertNotEqual(
-            engine.execute(Get("k"), subscriber),
-            build_engine().execute(Get("k"), subscriber),
+            engine.execute(Read("k"), subscriber),
+            build_engine().execute(Read("k"), subscriber),
         )
 
 
@@ -36,8 +36,8 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         async with serve(ServerLimits(port=0)) as server:
             client = await Client.connect("127.0.0.1", server.port)
             self.addAsyncCleanup(client.close)
-            await client.set("k", b"v")
-            self.assertEqual(await client.get("k"), b"v")
+            await client.write("k", b"v")
+            self.assertEqual(await client.read("k"), b"v")
         with self.assertRaisesRegex(RuntimeError, "not started"):
             _ = server.port
         with self.assertRaises(ConnectionError):
@@ -54,10 +54,10 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             ) as server,
             await Client.connect("127.0.0.1", server.port) as client,
         ):
-            await client.set("k", b"v")
+            await client.write("k", b"v")
             with self.assertRaisesRegex(CommandError, "byte limit"):
-                await client.set("k", b"xx")
-        self.assertEqual(engine.execute(Get("k"), RecordingSubscriber()), Value(b"v"))
+                await client.write("k", b"xx")
+        self.assertEqual(engine.execute(Read("k"), RecordingSubscriber()), Value(b"v"))
 
     async def test_background_maintenance_removes_expired_keys_without_reads(
         self,

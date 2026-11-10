@@ -6,26 +6,34 @@ from velis.core.broker import Broker, Subscriber
 from velis.core.messages import (
     NIL,
     OK,
-    PERSISTENT,
-    TTL,
+    UNLIMITED,
     Command,
-    Delete,
-    Delivered,
-    Expire,
-    Get,
+    Exists,
+    Found,
+    Keep,
+    KeyPage,
+    Lifetime,
+    ListKeys,
     Nil,
     Ok,
-    Persist,
-    Persistent,
-    Publish,
+    Ping,
+    Pong,
+    Read,
+    Remaining,
+    RemainingValue,
+    Remove,
     Reply,
-    Set,
-    Subscribe,
-    Subscribed,
-    TTLValue,
-    Unsubscribe,
-    Unsubscribed,
+    Send,
+    Sent,
+    Size,
+    SizeValue,
+    Unlimited,
+    Unwatch,
+    Unwatched,
     Value,
+    Watch,
+    Watching,
+    Write,
 )
 from velis.core.store import SWEEP_LIMIT, Store, TtlStatus
 
@@ -34,14 +42,14 @@ def _ok_or_nil(found: bool) -> Ok | Nil:
     return OK if found else NIL
 
 
-def _ttl_reply(result: int | TtlStatus) -> Nil | Persistent | TTLValue:
+def _ttl_reply(result: int | TtlStatus) -> Nil | Unlimited | RemainingValue:
     match result:
         case TtlStatus.MISSING:
             return NIL
         case TtlStatus.PERSISTENT:
-            return PERSISTENT
+            return UNLIMITED
         case int(ms):
-            return TTLValue(ms)
+            return RemainingValue(ms)
         case _:
             assert_never(result)
 
@@ -59,30 +67,64 @@ class Engine:
         self._broker = broker
 
     def execute(self, command: Command, subscriber: Subscriber) -> Reply:
+        """Execute a typed command, allowing validation errors to propagate."""
+        if isinstance(command, Ping | Exists | Size | ListKeys):
+            return self._inspect(command)
+        return self._execute(command, subscriber)
+
+    def _inspect(self, command: Ping | Exists | Size | ListKeys) -> Reply:
+        """Inspect metadata without fetching values or touching eviction order."""
+        match command:
+            case Ping():
+                return Pong()
+            case Exists(key):
+                return Found() if self._store.exists(key) else NIL
+            case Size(key):
+                size = self._store.size(key)
+                return NIL if size is None else SizeValue(size)
+            case ListKeys(prefix, cursor, limit):
+                next_cursor, keys = self._store.list_keys(prefix, cursor, limit)
+                return KeyPage(next_cursor, keys)
+            case _:
+                assert_never(command)
+
+    def _execute(
+        self,
+        command: Read
+        | Write
+        | Lifetime
+        | Remove
+        | Remaining
+        | Keep
+        | Watch
+        | Unwatch
+        | Send,
+        subscriber: Subscriber,
+    ) -> Reply:
         """Execute a command for a subscriber, allowing command errors to propagate."""
         match command:
-            case Get(key):
+            case Read(key):
                 value = self._store.get(key)
                 return NIL if value is None else Value(value)
-            case Set(key, value):
+            case Write(key, value):
                 self._store.set(key, value)
                 return OK
-            case Expire(key, ms):
+            case Lifetime(key, ms):
                 return _ok_or_nil(self._store.expire(key, ms))
-            case Delete(key):
+            case Remove(key):
                 return _ok_or_nil(self._store.delete(key))
-            case Persist(key):
+            case Keep(key):
                 return _ok_or_nil(self._store.persist(key))
-            case TTL(key):
+            case Remaining(key):
                 return _ttl_reply(self._store.ttl(key))
-            case Subscribe(channel):
+            case Watch(channel):
                 self._broker.subscribe(channel, subscriber)
-                return Subscribed(channel)
-            case Unsubscribe(channel):
+                return Watching(channel)
+            case Unwatch(channel):
                 self._broker.unsubscribe(channel, subscriber)
-                return Unsubscribed(channel)
-            case Publish(channel, payload):
-                return Delivered(self._broker.publish(channel, payload))
+                return Unwatched(channel)
+            case Send(channel, payload):
+                return Sent(self._broker.publish(channel, payload))
             case _:
                 assert_never(command)
 

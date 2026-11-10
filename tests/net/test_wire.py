@@ -7,26 +7,34 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from velis.core.messages import (
-    TTL,
     Command,
-    Delete,
-    Delivered,
     Err,
-    Expire,
-    Get,
+    Exists,
+    Found,
+    Keep,
+    KeyPage,
+    Lifetime,
+    ListKeys,
     Message,
     Nil,
     Ok,
-    Persist,
-    Persistent,
-    Publish,
-    Set,
-    Subscribe,
-    Subscribed,
-    TTLValue,
-    Unsubscribe,
-    Unsubscribed,
+    Ping,
+    Pong,
+    Read,
+    Remaining,
+    RemainingValue,
+    Remove,
+    Send,
+    Sent,
+    Size,
+    SizeValue,
+    Unlimited,
+    Unwatch,
+    Unwatched,
     Value,
+    Watch,
+    Watching,
+    Write,
 )
 from velis.errors import ProtocolError
 from velis.net.limits import (
@@ -44,35 +52,51 @@ def prefixed(raw: bytes) -> bytes:
 
 
 COMMAND_FIXTURES = (
-    (Get("k"), b"\x00\x00\x00\x03GET\x00\x00\x00\x01k"),
+    (Ping(), b"\x00\x00\x00\x04PING"),
+    (Exists("k"), b"\x00\x00\x00\x06EXISTS\x00\x00\x00\x01k"),
+    (Size("k"), b"\x00\x00\x00\x04SIZE\x00\x00\x00\x01k"),
+    (ListKeys("", 0, 2), b"\x00\x00\x00\x04LIST" + b"\x00" * 12 + b"\x00\x00\x00\x02"),
+    (Read("k"), b"\x00\x00\x00\x04READ\x00\x00\x00\x01k"),
     (
-        Set("k", b"\x00\xff"),
-        b"\x00\x00\x00\x03SET\x00\x00\x00\x01k\x00\x00\x00\x02\x00\xff",
+        Write("k", b"\x00\xff"),
+        b"\x00\x00\x00\x05WRITE\x00\x00\x00\x01k\x00\x00\x00\x02\x00\xff",
     ),
     (
-        Expire("k", 258),
-        b"\x00\x00\x00\x06EXPIRE\x00\x00\x00\x01k\x00\x00\x00\x00\x00\x00\x01\x02",
+        Lifetime("k", 258),
+        b"\x00\x00\x00\x08LIFETIME\x00\x00\x00\x01k\x00\x00\x00\x00\x00\x00\x01\x02",
     ),
-    (Delete("k"), b"\x00\x00\x00\x03DEL\x00\x00\x00\x01k"),
-    (TTL("k"), b"\x00\x00\x00\x03TTL\x00\x00\x00\x01k"),
-    (Persist("k"), b"\x00\x00\x00\x07PERSIST\x00\x00\x00\x01k"),
-    (Subscribe("c"), b"\x00\x00\x00\x09SUBSCRIBE\x00\x00\x00\x01c"),
-    (Unsubscribe("c"), b"\x00\x00\x00\x0bUNSUBSCRIBE\x00\x00\x00\x01c"),
+    (Remove("k"), b"\x00\x00\x00\x06REMOVE\x00\x00\x00\x01k"),
+    (Remaining("k"), b"\x00\x00\x00\x09REMAINING\x00\x00\x00\x01k"),
+    (Keep("k"), b"\x00\x00\x00\x04KEEP\x00\x00\x00\x01k"),
+    (Watch("c"), b"\x00\x00\x00\x05WATCH\x00\x00\x00\x01c"),
+    (Unwatch("c"), b"\x00\x00\x00\x07UNWATCH\x00\x00\x00\x01c"),
     (
-        Publish("c", b"\xff"),
-        b"\x00\x00\x00\x07PUBLISH\x00\x00\x00\x01c\x00\x00\x00\x01\xff",
+        Send("c", b"\xff"),
+        b"\x00\x00\x00\x04SEND\x00\x00\x00\x01c\x00\x00\x00\x01\xff",
     ),
 )
 SERVER_FIXTURES = (
+    (Pong(), b"\x00\x00\x00\x04PONG"),
+    (Found(), b"\x00\x00\x00\x05FOUND"),
+    (SizeValue(258), b"\x00\x00\x00\x0aSIZE_VALUE\x00\x00\x00\x00\x00\x00\x01\x02"),
+    (
+        KeyPage(0, ("k",)),
+        b"\x00\x00\x00\x08KEY_PAGE"
+        + b"\x00" * 8
+        + b"\x00\x00\x00\x01\x00\x00\x00\x01k",
+    ),
     (Ok(), b"\x00\x00\x00\x02OK"),
     (Nil(), b"\x00\x00\x00\x03NIL"),
-    (Persistent(), b"\x00\x00\x00\x0aPERSISTENT"),
+    (Unlimited(), b"\x00\x00\x00\x09UNLIMITED"),
     (Value(b"\xff"), b"\x00\x00\x00\x05VALUE\x00\x00\x00\x01\xff"),
     (Err("bad"), b"\x00\x00\x00\x03ERR\x00\x00\x00\x03bad"),
-    (Subscribed("c"), b"\x00\x00\x00\x0aSUBSCRIBED\x00\x00\x00\x01c"),
-    (Unsubscribed("c"), b"\x00\x00\x00\x0cUNSUBSCRIBED\x00\x00\x00\x01c"),
-    (Delivered(258), b"\x00\x00\x00\x09DELIVERED\x00\x00\x01\x02"),
-    (TTLValue(258), b"\x00\x00\x00\x09TTL_VALUE\x00\x00\x00\x00\x00\x00\x01\x02"),
+    (Watching("c"), b"\x00\x00\x00\x08WATCHING\x00\x00\x00\x01c"),
+    (Unwatched("c"), b"\x00\x00\x00\x09UNWATCHED\x00\x00\x00\x01c"),
+    (Sent(258), b"\x00\x00\x00\x04SENT\x00\x00\x01\x02"),
+    (
+        RemainingValue(258),
+        b"\x00\x00\x00\x0fREMAINING_VALUE\x00\x00\x00\x00\x00\x00\x01\x02",
+    ),
     (
         Message("c", b"\x00"),
         b"\x00\x00\x00\x07MESSAGE\x00\x00\x00\x01c\x00\x00\x00\x01\x00",
@@ -81,6 +105,40 @@ SERVER_FIXTURES = (
 
 
 class WireTests(unittest.TestCase):
+    def test_legacy_command_tags_are_rejected(self) -> None:
+        """Only the current command vocabulary is accepted on the wire."""
+        for tag in (
+            b"GET",
+            b"SET",
+            b"EXPIRE",
+            b"DEL",
+            b"TTL",
+            b"PERSIST",
+            b"SUBSCRIBE",
+            b"UNSUBSCRIBE",
+            b"PUBLISH",
+        ):
+            with (
+                self.subTest(tag=tag),
+                self.assertRaisesRegex(ProtocolError, "unknown command"),
+            ):
+                COMMANDS.decode(prefixed(tag))
+
+    def test_legacy_reply_tags_are_rejected(self) -> None:
+        """Reply names follow the current command vocabulary exclusively."""
+        for tag in (
+            b"SUBSCRIBED",
+            b"UNSUBSCRIBED",
+            b"DELIVERED",
+            b"TTL_VALUE",
+            b"PERSISTENT",
+        ):
+            with (
+                self.subTest(tag=tag),
+                self.assertRaisesRegex(ProtocolError, "unknown server message"),
+            ):
+                SERVER_MESSAGES.decode(prefixed(tag))
+
     def test_noninteger_fields_raise_protocol_errors_before_packing(self) -> None:
         for field in (U32, U64):
             for value in (1.5, True, "2", float("nan"), float("inf")):
@@ -118,16 +176,16 @@ class WireTests(unittest.TestCase):
                             codec.decode(data, 6, len(data))
 
     def test_decoded_value_owns_its_bytes_and_does_not_pin_input(self) -> None:
-        body = bytearray(COMMANDS.encode(Set("key", b"original")))
+        body = bytearray(COMMANDS.encode(Write("key", b"original")))
         command = COMMANDS.decode(body)
         body[:] = b"changed"
         body.clear()
-        self.assertEqual(command, Set("key", b"original"))
-        self.assertIsInstance(command, Set)
-        self.assertIs(type(cast(Set, command).value), bytes)
+        self.assertEqual(command, Write("key", b"original"))
+        self.assertIsInstance(command, Write)
+        self.assertIs(type(cast(Write, command).value), bytes)
 
     def test_invalid_record_bounds_raise_protocol_errors(self) -> None:
-        body = COMMANDS.encode(Get("key"))
+        body = COMMANDS.encode(Read("key"))
         for start, end in ((-1, 0), (2, 1), (0, len(body) + 1)):
             with self.subTest(start=start, end=end), self.assertRaises(ProtocolError):
                 COMMANDS.decode(body, start, end)
@@ -160,16 +218,16 @@ class WireTests(unittest.TestCase):
 
     def test_key_limits_count_characters_and_accept_four_byte_utf8(self) -> None:
         key = "😀" * MAX_KEY_CHARS
-        self.assertEqual(COMMANDS.decode(COMMANDS.encode(Get(key))), Get(key))
+        self.assertEqual(COMMANDS.decode(COMMANDS.encode(Read(key))), Read(key))
         for invalid in ("", "a" * (MAX_KEY_CHARS + 1), "\ud800"):
             with self.subTest(invalid=repr(invalid)), self.assertRaises(ProtocolError):
-                COMMANDS.encode(Get(invalid))
+                COMMANDS.encode(Read(invalid))
         for raw in (b"", b"a" * (MAX_KEY_CHARS + 1), b"\xff"):
             with self.subTest(raw=raw), self.assertRaises(ProtocolError):
-                COMMANDS.decode(prefixed(b"GET") + prefixed(raw))
+                COMMANDS.decode(prefixed(b"READ") + prefixed(raw))
 
     def test_echoed_channels_allow_empty_text_but_obey_encoded_byte_limit(self) -> None:
-        for cls in (Subscribed, Unsubscribed):
+        for cls in (Watching, Unwatched):
             for channel in (
                 "",
                 "a" * MAX_CHANNEL_BYTES,
@@ -187,7 +245,7 @@ class WireTests(unittest.TestCase):
                     prefixed(b"MESSAGE") + prefixed(raw) + prefixed(b"")
                 )
         with self.assertRaises(ProtocolError):
-            COMMANDS.encode(Subscribe(""))
+            COMMANDS.encode(Watch(""))
 
     def test_blob_accepts_exact_limit_and_rejects_oversized_header_before_body(
         self,
@@ -240,7 +298,7 @@ class WireTests(unittest.TestCase):
     def test_unicode_keys_and_opaque_values_roundtrip(
         self, key: str, value: bytes
     ) -> None:
-        command = Set(key, value)
+        command = Write(key, value)
         self.assertEqual(COMMANDS.decode(COMMANDS.encode(command)), command)
         push = Message(key, value)
         self.assertEqual(SERVER_MESSAGES.decode(SERVER_MESSAGES.encode(push)), push)
@@ -280,7 +338,7 @@ class Pair:
     value: bytes
 
 
-type OneMessage = Get
+type OneMessage = Read
 type NestedMessages = OneMessage | Nil
 type PairMessage = Pair
 type NotDataclass = str
@@ -290,17 +348,17 @@ class CodecDeclarationTests(unittest.TestCase):
     def test_nested_aliases_are_covered_and_max_body_is_exact(self) -> None:
         codec = Codec(
             "test",
-            {Get: msg(b"G", key=text("key", 2)), Nil: msg(b"N")},
+            {Read: msg(b"G", key=text("key", 2)), Nil: msg(b"N")},
             covers=NestedMessages,
         )
         self.assertEqual(codec.max_body, 5 + 4 + 8)
-        self.assertEqual(codec.decode(codec.encode(Get("😀😀"))), Get("😀😀"))
+        self.assertEqual(codec.decode(codec.encode(Read("😀😀"))), Read("😀😀"))
 
     def test_missing_and_unexpected_union_members_are_rejected(self) -> None:
         for table in (
             {},
             {Nil: msg(b"N")},
-            {Get: msg(b"G", key=text("key", 2)), Nil: msg(b"N")},
+            {Read: msg(b"G", key=text("key", 2)), Nil: msg(b"N")},
         ):
             with (
                 self.subTest(table=table),
@@ -316,13 +374,13 @@ class CodecDeclarationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "duplicate"):
             Codec(
                 "test",
-                {Get: msg(b"G", key=text("key", 2)), Nil: msg(b"G")},
+                {Read: msg(b"G", key=text("key", 2)), Nil: msg(b"G")},
                 covers=NestedMessages,
             )
         with self.assertRaisesRegex(ValueError, "tag longer"):
             Codec(
                 "test",
-                {Get: msg(b"x" * (MAX_TAG_BYTES + 1), key=text("key", 2))},
+                {Read: msg(b"x" * (MAX_TAG_BYTES + 1), key=text("key", 2))},
                 covers=OneMessage,
             )
 

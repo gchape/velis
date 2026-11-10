@@ -29,13 +29,13 @@ Velis is a lightweight in-memory key-value store with TTL expiration, pub-sub an
 
 ## Features
 
-| Area | Description |
-| --- | --- |
-| **Store** | `GET` / `SET` / `DEL` / `EXPIRE` / `TTL` / `PERSIST` on opaque `bytes` values, with key-count and byte limits. Single-owner, so no locks. |
-| **TTL** | Exact monotonic deadlines, a heap-based expiry index, lazy read expiry and bounded background sweeps. |
-| **Pub-sub** | `SUBSCRIBE` / `UNSUBSCRIBE` / `PUBLISH`. At-most-once delivery to connected subscribers on one server. Slow network connections are disconnected when their server write buffer exceeds the configured limit. |
-| **Network** | Fixed binary protocol over TCP, ordered pipelining, an `asyncio.Protocol` server with batched replies, and an async `Client`. |
-| **Configuration** | CLI environment loading and frozen limits owned by each component. |
+| Area              | Description                                                                                                                                                                                                   |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Store**         | `GET` / `SET` / `DEL` / `EXPIRE` / `TTL` / `PERSIST` on opaque `bytes` values, with key-count and byte limits. Single-owner, so no locks.                                                                     |
+| **TTL**           | Exact monotonic deadlines, a heap-based expiry index, lazy read expiry and bounded background sweeps.                                                                                                         |
+| **Pub-sub**       | `SUBSCRIBE` / `UNSUBSCRIBE` / `PUBLISH`. At-most-once delivery to connected subscribers on one server. Slow network connections are disconnected when their server write buffer exceeds the configured limit. |
+| **Network**       | Fixed binary protocol over TCP, ordered pipelining, an `asyncio.Protocol` server with batched replies, and an async `Client`.                                                                                 |
+| **Configuration** | CLI environment loading and frozen limits owned by each component.                                                                                                                                            |
 
 ---
 
@@ -181,19 +181,15 @@ flowchart TB
 
 Commands, replies and publication pushes are frozen dataclasses in `velis.core.messages`. `net.wire` provides reusable field codecs and a table-driven message codec. `net.protocol` declares each tag and its fields once, frames encoded bodies, and exposes `encode_command()`, `encode_message()`, `iter_frames()` and `read_frame()`.
 
-The design uses a few patterns with specific responsibilities. The
-[design review](docs/design-review.md) explains which abstractions earn their
-place and records the library experiments, validation fixes, enforced complexity
-limits, the shutdown issue found during review, and the remaining measurement
-gaps.
+The design uses a few patterns with specific responsibilities.
 
-| Pattern | Where it applies | Purpose |
-| --- | --- | --- |
-| Composition root | `serve()` and `build_engine()` | Construct dependencies and give runtime resources one owner. |
-| Strategy | `Eviction` with LRU, LFU and S3-FIFO | Change victim selection while `Store` owns capacity and expiry invariants. |
-| Ports and adapters | `Session` and `Subscriber` interfaces, with TCP implementations | Keep client semantics and core delivery independent of transport details. |
-| Immutable value objects | Limits, commands and replies | Validate configuration once and share values without mutable global state. |
-| Table-driven codec | `COMMANDS` and `SERVER_MESSAGES` | Derive encoding, decoding and maximum body sizes from one field declaration. |
+| Pattern                 | Where it applies                                                | Purpose                                                                      |
+| ----------------------- | --------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| Composition root        | `serve()` and `build_engine()`                                  | Construct dependencies and give runtime resources one owner.                 |
+| Strategy                | `Eviction` with LRU, LFU and S3-FIFO                            | Change victim selection while `Store` owns capacity and expiry invariants.   |
+| Ports and adapters      | `Session` and `Subscriber` interfaces, with TCP implementations | Keep client semantics and core delivery independent of transport details.    |
+| Immutable value objects | Limits, commands and replies                                    | Validate configuration once and share values without mutable global state.   |
+| Table-driven codec      | `COMMANDS` and `SERVER_MESSAGES`                                | Derive encoding, decoding and maximum body sizes from one field declaration. |
 
 Concrete classes are constructed directly. Protocols mark the boundaries with interchangeable implementations, and async context managers own cleanup. Transport flow control stays in the network layer; cache consistency stays in the store.
 
@@ -214,7 +210,6 @@ Cache mutations only change memory. The store validates the TTL range and raises
 `await client.delete(key)` returns `True` when a live key was deleted, freeing its key and byte capacity; missing or expired keys return `False`. `await client.ttl(key)` returns remaining milliseconds, `-1` for a live key without expiry, or `-2` for a missing or expired key. TTL reads remove expired values without refreshing their deadlines. `await client.persist(key)` removes a live key's TTL while keeping its value and returns whether a deadline was removed. It returns `False` for missing, expired or already persistent keys. On the wire, `TTL` uses `TTL_VALUE` for remaining milliseconds, `PERSISTENT` for no expiry and `NIL` for missing keys; the client maps these to the integer API above. These commands use the same key validation as `GET`.
 
 Direct core callers use `Store.ttl(key)`, which returns remaining milliseconds, `TtlStatus.PERSISTENT` or `TtlStatus.MISSING`. Import `TtlStatus` from `velis.core.store`. The `Engine` translates these enum values into wire replies; the client's `-1` and `-2` sentinels remain unchanged.
-
 
 ```mermaid
 sequenceDiagram
@@ -365,17 +360,17 @@ The following tables describe the fixed command and server-message bodies (`COMM
 
 **Requests**
 
-| Command | Fields | Reply |
-| --- | --- | --- |
-| `GET` | `key: str` | `VALUE` or `NIL` |
-| `SET` | `key: str`, `value: bytes` | `OK` |
-| `EXPIRE` | `key: str`, `ms: u64` | `OK`, or `NIL` if the key doesn't exist |
-| `DEL` | `key: str` | `OK` if deleted, otherwise `NIL` |
-| `TTL` | `key: str` | `TTL_VALUE`, `PERSISTENT`, or `NIL` |
-| `PERSIST` | `key: str` | `OK` if a TTL was removed, otherwise `NIL` |
-| `SUBSCRIBE` | `channel: str` | `SUBSCRIBED` |
-| `UNSUBSCRIBE` | `channel: str` | `UNSUBSCRIBED` |
-| `PUBLISH` | `channel: str`, `payload: bytes` | `DELIVERED` |
+| Command       | Fields                           | Reply                                      |
+| ------------- | -------------------------------- | ------------------------------------------ |
+| `GET`         | `key: str`                       | `VALUE` or `NIL`                           |
+| `SET`         | `key: str`, `value: bytes`       | `OK`                                       |
+| `EXPIRE`      | `key: str`, `ms: u64`            | `OK`, or `NIL` if the key doesn't exist    |
+| `DEL`         | `key: str`                       | `OK` if deleted, otherwise `NIL`           |
+| `TTL`         | `key: str`                       | `TTL_VALUE`, `PERSISTENT`, or `NIL`        |
+| `PERSIST`     | `key: str`                       | `OK` if a TTL was removed, otherwise `NIL` |
+| `SUBSCRIBE`   | `channel: str`                   | `SUBSCRIBED`                               |
+| `UNSUBSCRIBE` | `channel: str`                   | `UNSUBSCRIBED`                             |
+| `PUBLISH`     | `channel: str`, `payload: bytes` | `DELIVERED`                                |
 
 The default encoded body is the command name as a string followed by its fields.
 
@@ -383,22 +378,22 @@ Request keys contain 1–512 characters and request channels contain 1–256 cha
 
 **Replies and pushes**
 
-| Server message | Fields |
-| --- | --- |
-| `OK` / `NIL` | none |
-| `VALUE` | `value: bytes` |
-| `TTL_VALUE` | `ms: u64` |
-| `PERSISTENT` | none; the key exists without a TTL |
-| `ERR` | `message: str` |
-| `SUBSCRIBED` / `UNSUBSCRIBED` | `channel: str` |
-| `DELIVERED` | `count: u32` |
-| `MESSAGE` *(server push, not a reply)* | `channel: str`, `payload: bytes` |
+| Server message                         | Fields                             |
+| -------------------------------------- | ---------------------------------- |
+| `OK` / `NIL`                           | none                               |
+| `VALUE`                                | `value: bytes`                     |
+| `TTL_VALUE`                            | `ms: u64`                          |
+| `PERSISTENT`                           | none; the key exists without a TTL |
+| `ERR`                                  | `message: str`                     |
+| `SUBSCRIBED` / `UNSUBSCRIBED`          | `channel: str`                     |
+| `DELIVERED`                            | `count: u32`                       |
+| `MESSAGE` _(server push, not a reply)_ | `channel: str`, `payload: bytes`   |
 
 **Errors**
 
-* `ERR` with the connection kept open: a valid command that cannot be honoured (for example a TTL out of range). The client raises `CommandError` for that request.
-* Best-effort `ERR`, followed by closure: the message violates the protocol (unknown tag, oversized field/frame, invalid UTF-8, truncated record, trailing bytes). An incomplete TCP frame at EOF closes without a reply. The server closes even when it cannot encode or send the error.
-* Admission rejection: an excess connection receives best-effort `ERR("connection limit exceeded")` before closure. An unsolicited `ERR` becomes `ConnectionError` with that reason. If a request is already pending, the ordered protocol delivers `ERR` as `CommandError` to the oldest request; EOF then fails the remaining requests with `ConnectionError`.
+- `ERR` with the connection kept open: a valid command that cannot be honoured (for example a TTL out of range). The client raises `CommandError` for that request.
+- Best-effort `ERR`, followed by closure: the message violates the protocol (unknown tag, oversized field/frame, invalid UTF-8, truncated record, trailing bytes). An incomplete TCP frame at EOF closes without a reply. The server closes even when it cannot encode or send the error.
+- Admission rejection: an excess connection receives best-effort `ERR("connection limit exceeded")` before closure. An unsolicited `ERR` becomes `ConnectionError` with that reason. If a request is already pending, the ordered protocol delivers `ERR` as `CommandError` to the oldest request; EOF then fails the remaining requests with `ConnectionError`.
 
 ---
 
@@ -410,11 +405,11 @@ The default store retains at most 100,000 keys and 64 MiB of UTF-8 key plus enco
 
 Select one of three eviction policies with `VELIS_EVICTION_POLICY` or `Store(limits=StoreLimits(eviction_policy=EvictionPolicy.LRU))` for direct embedding. `StoreLimits` lives in `velis.config` and is also exported by `velis.core.store`; import `EvictionPolicy` from `velis.core.eviction`. Policy strings are normalized to enum values:
 
-| Policy | Behavior when full |
-| --- | --- |
+| Policy              | Behavior when full                                                                                                                           |
+| ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
 | `s3-fifo` (default) | Filter new keys through a small FIFO; retain reused keys in a main FIFO and remember recent probationary evictions in a bounded ghost queue. |
-| `lru` | Evict the least recently used entry. |
-| `lfu` | Evict the least frequently accessed entry, breaking ties by least recent access. |
+| `lru`               | Evict the least recently used entry.                                                                                                         |
+| `lfu`               | Evict the least frequently accessed entry, breaking ties by least recent access.                                                             |
 
 S3-FIFO follows the [SOSP 2023 paper's queue and counter rules](https://www.cs.cmu.edu/~rvinayak/papers/s3-fifo-sosp-2023-fifo-queues-are-all-you-need-for-cache-eviction.pdf). New keys enter the small queue unless ghost history places them directly in the main queue. Resident accesses increment a counter capped at three without moving the key. Small-queue keys with more than one reuse are promoted, with their counters reset; others enter ghost history. Main-queue eviction reinserts keys with remaining credit, decrementing the counter each time.
 
@@ -444,24 +439,23 @@ Each component owns its validated limits: `StoreLimits` in `velis.core.store`, `
 
 Unknown log levels, ports outside `0–65535`, nonpositive limits or sweep intervals, and non-integer numeric settings raise `ValueError` before startup. Empty values are parsed and validated; only missing variables use defaults. Parsing errors include the environment variable name. Logging setup and signals belong to `__main__.py`; `velis.app` owns the runtime lifecycle.
 
-| Variable | Default | Description |
-| --- | --- | --- |
-| `VELIS_LOG_LEVEL` | `INFO` | Log level for the `velis` logger. |
-| `VELIS_HOST` | `127.0.0.1` | Interface to listen on. |
-| `VELIS_PORT` | `9000` | Port to listen on (`0` picks a free port). |
-| `VELIS_MAX_BUFFER` | `8388608` (8 MiB) | Server write buffer limit checked when pushing a message. Must be positive; allow room for both the channel and payload plus framing. |
-| `VELIS_MAX_KEYS` | `100000` | Maximum retained cache keys; the eviction policy controls behavior when full. |
-| `VELIS_MAX_BYTES` | `67108864` (64 MiB) | Maximum retained UTF-8 key plus encoded value bytes; excludes Python object overhead. |
-| `VELIS_EVICTION_POLICY` | `s3-fifo` | One of `s3-fifo`, `lru`, `lfu`; applies to both key-count and byte pressure. |
-| `VELIS_MAX_CONNECTIONS` | `1024` | Maximum admitted TCP connections; excess connections are closed after a best-effort error. |
-| `VELIS_MAX_SUBSCRIPTIONS` | `1024` | Maximum distinct channels per subscriber connection. |
-| `VELIS_SWEEP_MS` | `100` | Milliseconds between expiry sweeps; must be positive. |
-| `VELIS_MAX_PENDING_REQUESTS` | `64` | Maximum in-flight requests per client session. |
-| `VELIS_MAX_PENDING_MESSAGES` | `1024` | Maximum unread publications per client session. |
-| `VELIS_MAX_PENDING_BYTES` | `8388608` (8 MiB) | Maximum unread channel/payload bytes per client session. |
-| `VELIS_MAX_BATCH_BYTES` | `262144` (256 KiB) | Encoded bytes per batch write target, including framing; one larger valid command is sent alone. |
-| `VELIS_CLOSE_TIMEOUT_SECONDS` | `5` | Grace period for client/server write flushing during close; remaining transports are then aborted. Must be positive and finite; fractional seconds are accepted. |
-
+| Variable                      | Default             | Description                                                                                                                                                      |
+| ----------------------------- | ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `VELIS_LOG_LEVEL`             | `INFO`              | Log level for the `velis` logger.                                                                                                                                |
+| `VELIS_HOST`                  | `127.0.0.1`         | Interface to listen on.                                                                                                                                          |
+| `VELIS_PORT`                  | `9000`              | Port to listen on (`0` picks a free port).                                                                                                                       |
+| `VELIS_MAX_BUFFER`            | `8388608` (8 MiB)   | Server write buffer limit checked when pushing a message. Must be positive; allow room for both the channel and payload plus framing.                            |
+| `VELIS_MAX_KEYS`              | `100000`            | Maximum retained cache keys; the eviction policy controls behavior when full.                                                                                    |
+| `VELIS_MAX_BYTES`             | `67108864` (64 MiB) | Maximum retained UTF-8 key plus encoded value bytes; excludes Python object overhead.                                                                            |
+| `VELIS_EVICTION_POLICY`       | `s3-fifo`           | One of `s3-fifo`, `lru`, `lfu`; applies to both key-count and byte pressure.                                                                                     |
+| `VELIS_MAX_CONNECTIONS`       | `1024`              | Maximum admitted TCP connections; excess connections are closed after a best-effort error.                                                                       |
+| `VELIS_MAX_SUBSCRIPTIONS`     | `1024`              | Maximum distinct channels per subscriber connection.                                                                                                             |
+| `VELIS_SWEEP_MS`              | `100`               | Milliseconds between expiry sweeps; must be positive.                                                                                                            |
+| `VELIS_MAX_PENDING_REQUESTS`  | `64`                | Maximum in-flight requests per client session.                                                                                                                   |
+| `VELIS_MAX_PENDING_MESSAGES`  | `1024`              | Maximum unread publications per client session.                                                                                                                  |
+| `VELIS_MAX_PENDING_BYTES`     | `8388608` (8 MiB)   | Maximum unread channel/payload bytes per client session.                                                                                                         |
+| `VELIS_MAX_BATCH_BYTES`       | `262144` (256 KiB)  | Encoded bytes per batch write target, including framing; one larger valid command is sent alone.                                                                 |
+| `VELIS_CLOSE_TIMEOUT_SECONDS` | `5`                 | Grace period for client/server write flushing during close; remaining transports are then aborted. Must be positive and finite; fractional seconds are accepted. |
 
 The defaults balance bounded work with batching. The 64-request client window matches the server's 64-command turn; a 256 KiB target bounds typical write batches while still allowing one larger valid frame. The store's 64 MiB byte budget and 100,000-key limit bound different costs. Pub-sub uses both a 1,024-message count and an 8 MiB byte budget to accommodate bursts of different message sizes. Buffer and pending-message limits apply per connection, so capacity planning must account for their aggregate memory use. These are starting points, not workload-independent optimal values; the benchmark exposes the request and byte limits for comparison.
 
@@ -564,8 +558,6 @@ tests/
 benchmarks/
   bench.py — one script with tcp (localhost throughput), hot-paths (isolated
     encoding, dispatch and TTL) and expiry (index library comparison) commands
-docs/
-  design-review.md — architecture, performance and library review
 ```
 
 ---
@@ -575,13 +567,19 @@ docs/
 Tests use the standard library's `unittest` and Hypothesis. An independent LRU model checks generated cache operation sequences; policy tests cover LRU, LFU and S3-FIFO behavior and metadata bounds.
 
 ```bash
-make check
-make test
-make lint
-make fmt
+uv run ruff check .
+uv run ruff format --check .
+uv run ty check
+uv run pyright
+uv run python -X dev -W error -m unittest discover -s tests -v
 ```
 
-`make check` runs Ruff lint and formatting checks (including production complexity, branch and statement limits), ty, Pyright in strict mode for `src`, and tests with `python -X dev -W error`; it is also the default `make` target. `make fmt` applies supported lint fixes and formatting.
+These commands run Ruff lint and formatting checks (including production complexity, branch and statement limits), ty, Pyright in strict mode for `src`, and tests with `python -X dev -W error`. Apply supported lint fixes and formatting with:
+
+```bash
+uv run ruff check --fix .
+uv run ruff format .
+```
 
 `unittest discover` only descends into directories that contain an `__init__.py`, so every `tests/` subdirectory needs one.
 
@@ -611,11 +609,11 @@ disjoint prefix. Each submitted window is fully answered before the next.
 Cells show **median operations/s (minimum–maximum)** across three samples.
 Depth 1 measures sequential calls; depth 64 measures submitted pipeline windows.
 
-| Operation | Client.batch, depth 1 | Client.batch, depth 64 | Raw, depth 1 | Raw, depth 64 |
-| --- | ---: | ---: | ---: | ---: |
+| Operation     |  Client.batch, depth 1 |    Client.batch, depth 64 |           Raw, depth 1 |             Raw, depth 64 |
+| ------------- | ---------------------: | ------------------------: | ---------------------: | ------------------------: |
 | SET overwrite | 16,085 (10,186–17,161) | 123,681 (113,165–130,391) | 21,208 (14,698–22,428) | 188,820 (182,665–193,704) |
-| GET hit | 17,025 (16,771–17,341) | 144,491 (142,358–147,602) | 22,575 (22,432–23,232) | 246,634 (223,702–246,966) |
-| GET miss | 17,719 (17,593–18,464) | 178,872 (157,290–181,150) | 24,461 (23,411–25,285) | 333,165 (301,659–338,457) |
+| GET hit       | 17,025 (16,771–17,341) | 144,491 (142,358–147,602) | 22,575 (22,432–23,232) | 246,634 (223,702–246,966) |
+| GET miss      | 17,719 (17,593–18,464) | 178,872 (157,290–181,150) | 24,461 (23,411–25,285) | 333,165 (301,659–338,457) |
 
 The matching run before the composability refactor had median differences of
 −2.9% to +6.2% across these cases; this does not establish a material throughput
@@ -630,20 +628,20 @@ and encoding changes. This run preceded the latest composability refactor:
 values. Both snapshots already contained uncommitted changes; “before” does not
 mean git HEAD. Cells show **median operations/s (minimum–maximum)**.
 
-| Operation | Mode | Submitted depth | Before | After |
-| --- | --- | ---: | ---: | ---: |
-| SET overwrite | Client.batch | 1 | 1,377 (547–1,506) | 1,761 (1,505–1,793) |
-| SET overwrite | Client.batch | 8 | 1,028 (481–1,163) | 1,534 (847–1,593) |
-| SET overwrite | Raw | 1 | 1,683 (1,455–1,897) | 2,521 (2,497–2,594) |
-| SET overwrite | Raw | 8 | 2,144 (1,750–2,147) | 3,727 (3,424–3,799) |
-| GET hit | Client.batch | 1 | 1,326 (1,070–1,977) | 1,499 (1,407–1,661) |
-| GET hit | Client.batch | 8 | 1,572 (1,560–1,970) | 1,772 (1,692–1,793) |
-| GET hit | Raw | 1 | 1,691 (1,543–2,059) | 1,957 (1,826–2,055) |
-| GET hit | Raw | 8 | 896 (891–898) | 993 (868–1,260) |
-| GET miss | Client.batch | 1 | 16,253 (15,622–19,335) | 16,894 (16,691–17,984) |
-| GET miss | Client.batch | 8 | 87,101 (83,511–98,593) | 76,285 (69,401–82,539) |
-| GET miss | Raw | 1 | 23,597 (20,154–24,727) | 24,783 (23,101–26,023) |
-| GET miss | Raw | 8 | 133,687 (89,129–140,012) | 142,655 (138,313–144,336) |
+| Operation     | Mode         | Submitted depth |                   Before |                     After |
+| ------------- | ------------ | --------------: | -----------------------: | ------------------------: |
+| SET overwrite | Client.batch |               1 |        1,377 (547–1,506) |       1,761 (1,505–1,793) |
+| SET overwrite | Client.batch |               8 |        1,028 (481–1,163) |         1,534 (847–1,593) |
+| SET overwrite | Raw          |               1 |      1,683 (1,455–1,897) |       2,521 (2,497–2,594) |
+| SET overwrite | Raw          |               8 |      2,144 (1,750–2,147) |       3,727 (3,424–3,799) |
+| GET hit       | Client.batch |               1 |      1,326 (1,070–1,977) |       1,499 (1,407–1,661) |
+| GET hit       | Client.batch |               8 |      1,572 (1,560–1,970) |       1,772 (1,692–1,793) |
+| GET hit       | Raw          |               1 |      1,691 (1,543–2,059) |       1,957 (1,826–2,055) |
+| GET hit       | Raw          |               8 |            896 (891–898) |           993 (868–1,260) |
+| GET miss      | Client.batch |               1 |   16,253 (15,622–19,335) |    16,894 (16,691–17,984) |
+| GET miss      | Client.batch |               8 |   87,101 (83,511–98,593) |    76,285 (69,401–82,539) |
+| GET miss      | Raw          |               1 |   23,597 (20,154–24,727) |    24,783 (23,101–26,023) |
+| GET miss      | Raw          |               8 | 133,687 (89,129–140,012) | 142,655 (138,313–144,336) |
 
 Large SET medians improved about 28–49% through `Client.batch()` and 50–74% in
 raw mode. Sample variation was substantial, especially in the first samples;
@@ -658,14 +656,14 @@ per case. Setup is outside timing; result checks are inside timing. Values are
 median operations/s. Dispatch uses a checked in-memory transport, so these rates
 must not be presented as TCP throughput.
 
-| Operation | Before | After |
-| --- | ---: | ---: |
-| encode SET 64 B | 1,005,509 | 1,167,711 |
-| encode SET 1 MiB | 9,928 | 12,221 |
-| dispatch SET 64 B, depth 32 | 298,161 | 297,150 |
-| dispatch SET 1 MiB | 1,418 | 20,967 |
-| refresh unchanged TTL | 6,908,848 | 18,438,200 |
-| refresh changing TTL | 6,708,817 | 5,919,332 |
+| Operation                   |    Before |      After |
+| --------------------------- | --------: | ---------: |
+| encode SET 64 B             | 1,005,509 |  1,167,711 |
+| encode SET 1 MiB            |     9,928 |     12,221 |
+| dispatch SET 64 B, depth 32 |   298,161 |    297,150 |
+| dispatch SET 1 MiB          |     1,418 |     20,967 |
+| refresh unchanged TTL       | 6,908,848 | 18,438,200 |
+| refresh changing TTL        | 6,708,817 |  5,919,332 |
 
 The 1 MiB dispatch case's separately traced peak allocations fell from 4,195,300
 to 3,146,965 bytes, about 25%; this excludes prebuilt inputs and is not process RSS.
@@ -681,29 +679,27 @@ Rescheduling moves every deadline forward; cancellation and expiry process every
 timer. The readiness case probes after the old deadlines but before the new ones.
 Values are **median milliseconds**, so lower is better.
 
-| Operation | Current heap | SortedList 2.4.0 adapter | heapdict 1.0.1 adapter |
-| --- | ---: | ---: | ---: |
-| Reschedule 20,000 timers | 5.946 | 25.672 | 103.970 |
-| Cancel 20,000 timers | 5.276 | 14.817 | 82.986 |
-| Expire 20,000 timers | 11.294 | 13.117 | 80.813 |
-| Probe stale due timers once | 12.217 | 0.007 | 0.004 |
+| Operation                   | Current heap | SortedList 2.4.0 adapter | heapdict 1.0.1 adapter |
+| --------------------------- | -----------: | -----------------------: | ---------------------: |
+| Reschedule 20,000 timers    |        5.946 |                   25.672 |                103.970 |
+| Cancel 20,000 timers        |        5.276 |                   14.817 |                 82.986 |
+| Expire 20,000 timers        |       11.294 |                   13.117 |                 80.813 |
+| Probe stale due timers once |       12.217 |                    0.007 |                  0.004 |
 
 The indexed alternatives make stale-readiness checks much faster, with slower
 updates and cancellation. These synthetic results do not establish hard latency
-bounds. The [design review](docs/design-review.md#library-evaluation) explains
-the tradeoffs and compatibility findings, and records the implementation
-decisions and [remaining risks](docs/design-review.md#remaining-limitations-and-priorities).
+bounds.
 
 ### Reproduce the measurements
 
 All benchmarks are commands of `benchmarks/bench.py`: `tcp`, `hot-paths` and
 `expiry`. Run `uv run python benchmarks/bench.py <command> --help` for options.
-`make bench` runs the `tcp` command.
 
 Run the TCP benchmark from the repository root:
 
 ```bash
-make bench BENCH_ARGS="--requests 20000 --warmup 2000 --repeats 3 --mode batch raw --pipeline 1 64"
+uv run python benchmarks/bench.py tcp \
+  --requests 20000 --warmup 2000 --repeats 3 --mode batch raw --pipeline 1 64
 ```
 
 `batch` uses `Client.batch()`, `concurrent` uses `asyncio.gather()` on individual
@@ -714,7 +710,9 @@ that API. Override `--pending-requests`, `--batch-bytes`, `--pipeline` and
 Use `--keys` to keep large-value workloads within the store's capacity:
 
 ```bash
-make bench BENCH_ARGS="--keys 32 --value-bytes 1048576 --requests 1000 --warmup 100 --repeats 3 --pipeline 1 8 --mode batch raw"
+uv run python benchmarks/bench.py tcp \
+  --keys 32 --value-bytes 1048576 --requests 1000 --warmup 100 \
+  --repeats 3 --pipeline 1 8 --mode batch raw
 ```
 
 Raw mode retains pre-encoded requests and expected replies outside timing; its
@@ -741,11 +739,11 @@ Results are summarized here; the repository does not retain result JSON files.
 
 ## Design notes and limitations
 
-* **Single-threaded by design.** The event-loop thread owns the `Engine`, `Store` and `Broker`, which is why none of them take locks. Don't call them from other threads.
-* **TTLs use monotonic time.** Deadlines are internal to the running process and are discarded on restart.
-* **No auth or TLS.** Resource limits bound retained cache data, connection count, subscriptions and message buffers; they do not impose an exact process-memory ceiling. Don't expose it to untrusted networks.
-* **Bounded pipelining.** TCP sessions match replies to requests in arrival order and limit requests awaiting replies. Server commands execute sequentially in received order. Closing wakes every pending request, capacity waiter and message reader. Cancellation leaves the connection usable but does not cancel execution on the server.
-* **Separate buffer limits.** Server write buffers and client unread-message buffers have independent limits. Client byte budgets count UTF-8 channel bytes and payload bytes after wire decoding; application-held values and messages use additional memory.
+- **Single-threaded by design.** The event-loop thread owns the `Engine`, `Store` and `Broker`, which is why none of them take locks. Don't call them from other threads.
+- **TTLs use monotonic time.** Deadlines are internal to the running process and are discarded on restart.
+- **No auth or TLS.** Resource limits bound retained cache data, connection count, subscriptions and message buffers; they do not impose an exact process-memory ceiling. Don't expose it to untrusted networks.
+- **Bounded pipelining.** TCP sessions match replies to requests in arrival order and limit requests awaiting replies. Server commands execute sequentially in received order. Closing wakes every pending request, capacity waiter and message reader. Cancellation leaves the connection usable but does not cancel execution on the server.
+- **Separate buffer limits.** Server write buffers and client unread-message buffers have independent limits. Client byte budgets count UTF-8 channel bytes and payload bytes after wire decoding; application-held values and messages use additional memory.
 
 ---
 

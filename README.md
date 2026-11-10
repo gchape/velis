@@ -60,6 +60,23 @@ Start a server:
 uv run velis
 ```
 
+Open the terminal client in another terminal:
+
+```bash
+uv run python -m velis.tui
+```
+
+Use `--host`, `--port` or `--read-only` as needed. Press `:` to enter commands,
+`?` for help, and `t` or `:stats` for session statistics: uptime, operation counts,
+errors, latency, GET hits/misses and pub-sub activity. Operations include background
+TTL refreshes; hit/miss counters count GET replies only. Tracked keys and statistics
+describe this client session because the protocol has no key-listing or server-stats
+command. Clearing the activity log preserves the counters.
+
+The same purple mascot and wordmark appear at interactive server startup and in
+the TUI's empty value pane when there is room. A nonempty `NO_COLOR` environment
+variable disables their colors. Redirected logs stay plain.
+
 Use one connection for key/value commands and another for subscriptions:
 
 ```python
@@ -531,9 +548,17 @@ src/velis/
     client.py — opaque-byte command API, error translation and scoped cleanup
     session.py — Session interface and TCP request/message lifecycle
     pending.py — bounded FIFO reply slots, independent of transport I/O
+  tui/
+    app.py, __main__.py — terminal client options, connection and startup
+    commands.py — quoted command parsing, validation and help metadata
+    text.py — escaped text, terminal cell widths and value previews
+    models.py — tracked keys, activity records and session statistics
+    workspace.py — queued client operations, TTL refreshes and pub-sub delivery
+    view.py — screen state and rendering
+    ui.py — keyboard input, command history and task lifecycle
 tests/
   helpers.py — ManualClock and RecordingSubscriber test helpers
-  app/ — runtime cleanup and CLI signal ownership
+  app/ — runtime cleanup, CLI signals and terminal client behavior
   core/ — store, engine, broker and cache lifetime
   net/ — protocol, client lifecycle and TCP integration tests
 benchmarks/

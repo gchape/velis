@@ -4,6 +4,7 @@ import signal
 from contextlib import AbstractAsyncContextManager, ExitStack
 
 from velis.app import serve
+from velis.branding import show_banner
 from velis.config import Config, normalize_log_level
 from velis.net.server import TCPServer
 
@@ -51,6 +52,7 @@ def main() -> None:
     """Load validated environment settings, configure logging and start."""
     config = Config.from_env()
     configure_logging(config.log_level)
+    show_banner()
     asyncio.run(
         _main(
             serve(

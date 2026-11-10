@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from enum import Enum, auto
 
 from velis.core.clock import Clock, MonotonicClock
-from velis.core.eviction import EvictionPolicy
+from velis.core.eviction import Eviction, EvictionPolicy
 from velis.core.expiry_index import ExpiryIndex
 from velis.errors import CapacityError, CommandError
 from velis.validation import require_positive_int
@@ -91,6 +91,9 @@ class Store:
     Operations that check expiry sample the clock once. Reads and successful
     writes update the eviction policy; TTL inspection, expiry changes and
     persistence do not.
+
+    ``policy`` may supply any empty Eviction implementation; the store then
+    owns it and ``limits.eviction_policy`` is ignored.
     """
 
     def __init__(
@@ -98,12 +101,13 @@ class Store:
         clock: Clock | None = None,
         *,
         limits: StoreLimits = DEFAULT_STORE_LIMITS,
+        policy: Eviction | None = None,
     ) -> None:
         self._clock = MonotonicClock() if clock is None else clock
         self._limits = limits
         self._entries: dict[str, tuple[bytes, int]] = {}
         self._stored_bytes = 0
-        self._policy = limits.eviction_policy.create()
+        self._policy = limits.eviction_policy.create() if policy is None else policy
         self._expiry = ExpiryIndex()
         self._hits = 0
         self._misses = 0

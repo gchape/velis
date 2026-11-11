@@ -42,11 +42,11 @@ Velis is a lightweight in-memory key-value store with TTL expiration, pub-sub an
 
 ### Promo image
 
-<img width="1920" height="1080" alt="velis-promo-preview" src="https://github.com/user-attachments/assets/e30a9b63-454f-48bc-9198-bf339d23fca7" />
+
 
 ### Promo video
 
-https://github.com/user-attachments/assets/2515b04b-29a9-40f8-9317-42876c6e4c75
+
 
 ---
 
